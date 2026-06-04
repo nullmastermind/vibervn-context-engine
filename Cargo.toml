@@ -1,0 +1,9 @@
+[package]
+name = "context-engine-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ignore = "0.4"
+notify = "8"
+notify-debouncer-full = "0.6"
