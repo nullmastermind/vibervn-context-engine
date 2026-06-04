@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Context Engine Settings</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-white text-gray-900 min-h-screen">
+
+<div class="max-w-2xl mx-auto px-4 py-10">
+  <h1 class="text-2xl font-semibold mb-1">Context Engine</h1>
+  <p class="text-gray-500 text-sm mb-8">Settings</p>
+
+  <!-- Version-too-new banner (hidden by default) -->
+  <div id="banner-version" class="hidden mb-6 p-4 border border-red-300 bg-red-50 rounded-lg text-red-800 text-sm">
+    This config was written by a newer version of Context Engine. Upgrade the binary or
+    replace <code class="font-mono">settings.json</code> with an older backup.
+  </div>
+
+  <!-- Generic error banner -->
+  <div id="banner-error" class="hidden mb-6 p-4 border border-orange-300 bg-orange-50 rounded-lg text-sm">
+    <div class="flex items-center justify-between">
+      <span id="banner-error-msg" class="text-orange-800"></span>
+      <button id="btn-retry" class="ml-4 px-3 py-1 text-xs rounded border border-orange-400 text-orange-700
+             hover:bg-orange-100 focus:outline-none focus:ring-2 focus:ring-orange-400">
+        Retry
+      </button>
+    </div>
+  </div>
+
+  <!-- "Saved" toast -->
+  <div id="toast-saved" class="hidden fixed bottom-6 right-6 bg-gray-900 text-white text-sm px-4 py-2 rounded-lg shadow-lg
+       transition-opacity duration-300 opacity-0">
+    Saved
+  </div>
+
+  <!-- Loading skeleton -->
+  <div id="skeleton" class="space-y-3">
+    <div class="h-8 bg-gray-100 rounded w-64 animate-pulse"></div>
+    <div class="h-32 bg-gray-100 rounded animate-pulse"></div>
+  </div>
+
+  <!-- Main content (hidden until loaded) -->
+  <div id="main-content" class="hidden">
+    <!-- Tab bar -->
+    <div role="tablist" class="flex border-b border-gray-200 mb-6 gap-1">
+      <button role="tab" id="tab-repos" aria-selected="true" aria-controls="panel-repos"
+              class="tab-btn px-4 py-2 text-sm font-medium rounded-t border-b-2 border-gray-900 text-gray-900
+                     focus:outline-none focus:ring-2 focus:ring-gray-400">
+        Repositories
+      </button>
+      <button role="tab" id="tab-embedding" aria-selected="false" aria-controls="panel-embedding"
+              class="tab-btn px-4 py-2 text-sm font-medium rounded-t border-b-2 border-transparent text-gray-500
+                     hover:text-gray-900 focus:outline-none focus:ring-2 focus:ring-gray-400">
+        Embedding Providers
+      </button>
+      <button role="tab" id="tab-llm" aria-selected="false" aria-controls="panel-llm"
+              class="tab-btn px-4 py-2 text-sm font-medium rounded-t border-b-2 border-transparent text-gray-500
+                     hover:text-gray-900 focus:outline-none focus:ring-2 focus:ring-gray-400">
+        LLM Keys
+      </button>
+    </div>
+
+    <!-- Tab: Repositories -->
+    <div role="tabpanel" id="panel-repos">
+      <div id="repos-list" class="space-y-2 mb-4"></div>
+      <div id="repos-empty" class="hidden text-gray-400 text-sm mb-4">
+        No repositories configured. Add an absolute path below.
+      </div>
+      <form id="form-add-repo" class="flex gap-2" onsubmit="return false;">
+        <input id="input-repo" type="text" placeholder="/absolute/path/to/repo"
+               class="flex-1 border border-gray-200 rounded px-3 py-2 text-sm focus:outline-none
+                      focus:ring-2 focus:ring-gray-400" />
+        <button type="submit" id="btn-add-repo"
+                class="px-4 py-2 bg-gray-900 text-white text-sm rounded hover:bg-gray-700
+                       focus:outline-none focus:ring-2 focus:ring-gray-400">
+          Add
+        </button>
+      </form>
+      <p id="repo-warning" class="hidden text-amber-600 text-xs mt-1">
+        Warning: path does not look absolute. It will still be saved.
+      </p>
+    </div>
+
+    <!-- Tab: Embedding Providers -->
+    <div role="tabpanel" id="panel-embedding" class="hidden">
+      <div class="mb-4">
+        <label class="block text-xs font-medium text-gray-500 mb-1">Provider</label>
+        <select id="embedding-provider"
+                class="border border-gray-200 rounded px-3 py-2 text-sm focus:outline-none
+                       focus:ring-2 focus:ring-gray-400">
+          <option value="voyage">Voyage AI</option>
+        </select>
+      </div>
+      <div class="mb-4">
+        <label class="block text-xs font-medium text-gray-500 mb-1" for="embedding-model">
+          Embedding model
+        </label>
+        <input id="embedding-model" type="text" placeholder="e.g. voyage-4-lite"
+               class="w-full border border-gray-200 rounded px-3 py-2 text-sm focus:outline-none
+                      focus:ring-2 focus:ring-gray-400" />
+      </div>
+      <div class="mb-2">
+        <label class="block text-xs font-medium text-gray-500 mb-1">API keys</label>
+        <div id="embedding-keys-list" class="space-y-2 mb-2"></div>
+      </div>
+      <form id="form-add-embedding-key" class="flex gap-2" onsubmit="return false;">
+        <input id="input-embedding-key" type="text" placeholder="Paste API key"
+               class="flex-1 border border-gray-200 rounded px-3 py-2 text-sm font-mono
+                      focus:outline-none focus:ring-2 focus:ring-gray-400" />
+        <button type="submit"
+                class="px-4 py-2 bg-gray-900 text-white text-sm rounded hover:bg-gray-700
+                       focus:outline-none focus:ring-2 focus:ring-gray-400">
+          Add
+        </button>
+      </form>
+    </div>
+
+    <!-- Tab: LLM Keys -->
+    <div role="tabpanel" id="panel-llm" class="hidden">
+      <div class="mb-4">
+        <label class="block text-xs font-medium text-gray-500 mb-1">Provider</label>
+        <select id="llm-provider"
+                class="border border-gray-200 rounded px-3 py-2 text-sm focus:outline-none
+                       focus:ring-2 focus:ring-gray-400">
+          <option value="google">Google</option>
+        </select>
+      </div>
+      <div class="mb-4">
+        <label class="block text-xs font-medium text-gray-500 mb-1" for="llm-rerank-model">
+          Rerank model
+        </label>
+        <input id="llm-rerank-model" type="text" placeholder="e.g. gemini-3.1-flash-lite"
+               class="w-full border border-gray-200 rounded px-3 py-2 text-sm focus:outline-none
+                      focus:ring-2 focus:ring-gray-400" />
+      </div>
+      <div class="mb-2">
+        <label class="block text-xs font-medium text-gray-500 mb-1">API keys</label>
+        <div id="llm-keys-list" class="space-y-2 mb-2"></div>
+      </div>
+      <form id="form-add-llm-key" class="flex gap-2" onsubmit="return false;">
+        <input id="input-llm-key" type="text" placeholder="Paste API key"
+               class="flex-1 border border-gray-200 rounded px-3 py-2 text-sm font-mono
+                      focus:outline-none focus:ring-2 focus:ring-gray-400" />
+        <button type="submit"
+                class="px-4 py-2 bg-gray-900 text-white text-sm rounded hover:bg-gray-700
+                       focus:outline-none focus:ring-2 focus:ring-gray-400">
+          Add
+        </button>
+      </form>
+    </div>
+  </div><!-- /main-content -->
+</div><!-- /container -->
+
+<script>
+// ─── State ────────────────────────────────────────────────────────────────
+let cfg = null;       // current Settings object
+let saveTimer = null; // debounce handle
+
+// ─── Utility ──────────────────────────────────────────────────────────────
+function maskKey(k) {
+  if (!k) return '••••••••';
+  const last4 = k.slice(-4);
+  return '••••••••' + last4;
+}
+
+function showToast() {
+  const t = document.getElementById('toast-saved');
+  t.classList.remove('hidden');
+  requestAnimationFrame(() => { t.classList.remove('opacity-0'); t.classList.add('opacity-100'); });
+  setTimeout(() => {
+    t.classList.remove('opacity-100');
+    t.classList.add('opacity-0');
+    setTimeout(() => t.classList.add('hidden'), 300);
+  }, 1500);
+}
+
+function showError(msg) {
+  const el = document.getElementById('banner-error');
+  document.getElementById('banner-error-msg').textContent = msg;
+  el.classList.remove('hidden');
+}
+
+function hideError() {
+  document.getElementById('banner-error').classList.add('hidden');
+}
+
+function showVersionBanner() {
+  document.getElementById('main-content').classList.add('hidden');
+  document.getElementById('banner-version').classList.remove('hidden');
+}
+
+// ─── Tab switching ─────────────────────────────────────────────────────────
+const TABS = [
+  { btn: 'tab-repos',      panel: 'panel-repos' },
+  { btn: 'tab-embedding',  panel: 'panel-embedding' },
+  { btn: 'tab-llm',        panel: 'panel-llm' },
+];
+
+function activateTab(idx) {
+  TABS.forEach((t, i) => {
+    const btn = document.getElementById(t.btn);
+    const panel = document.getElementById(t.panel);
+    if (i === idx) {
+      btn.setAttribute('aria-selected', 'true');
+      btn.classList.remove('border-transparent', 'text-gray-500');
+      btn.classList.add('border-gray-900', 'text-gray-900');
+      panel.classList.remove('hidden');
+    } else {
+      btn.setAttribute('aria-selected', 'false');
+      btn.classList.add('border-transparent', 'text-gray-500');
+      btn.classList.remove('border-gray-900', 'text-gray-900');
+      panel.classList.add('hidden');
+    }
+  });
+}
+
+TABS.forEach((t, i) => {
+  document.getElementById(t.btn).addEventListener('click', () => activateTab(i));
+});
+
+// ─── Render ────────────────────────────────────────────────────────────────
+function renderRepos() {
+  const list = document.getElementById('repos-list');
+  const empty = document.getElementById('repos-empty');
+  list.innerHTML = '';
+  if (!cfg.repos || cfg.repos.length === 0) {
+    empty.classList.remove('hidden');
+    return;
+  }
+  empty.classList.add('hidden');
+  cfg.repos.forEach((repo, idx) => {
+    const row = document.createElement('div');
+    row.className = 'flex items-center justify-between border border-gray-200 rounded px-3 py-2 text-sm';
+    row.innerHTML = `
+      <span class="font-mono text-gray-800 truncate flex-1 mr-2">${escHtml(repo)}</span>
+      <button data-idx="${idx}" class="btn-remove-repo text-gray-400 hover:text-red-500 text-xs
+              focus:outline-none focus:ring-2 focus:ring-red-300 rounded px-2 py-1">Remove</button>
+    `;
+    list.appendChild(row);
+  });
+  list.querySelectorAll('.btn-remove-repo').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const i = parseInt(btn.dataset.idx, 10);
+      cfg.repos.splice(i, 1);
+      renderRepos();
+      saveNow();
+    });
+  });
+}
+
+function renderKeyList(containerId, keys, onRemove) {
+  const container = document.getElementById(containerId);
+  container.innerHTML = '';
+  (keys || []).forEach((key, idx) => {
+    const row = document.createElement('div');
+    row.className = 'flex items-center gap-2 border border-gray-200 rounded px-3 py-2 text-sm';
+    const display = document.createElement('span');
+    display.className = 'font-mono text-gray-800 flex-1 truncate';
+    display.textContent = maskKey(key);
+    let revealed = false;
+    const showBtn = document.createElement('button');
+    showBtn.textContent = 'Show';
+    showBtn.className = 'text-xs text-gray-400 hover:text-gray-700 focus:outline-none focus:ring-2 focus:ring-gray-300 rounded px-2 py-1';
+    showBtn.addEventListener('click', () => {
+      revealed = !revealed;
+      display.textContent = revealed ? key : maskKey(key);
+      showBtn.textContent = revealed ? 'Hide' : 'Show';
+    });
+    const removeBtn = document.createElement('button');
+    removeBtn.textContent = 'Remove';
+    removeBtn.className = 'text-xs text-gray-400 hover:text-red-500 focus:outline-none focus:ring-2 focus:ring-red-300 rounded px-2 py-1';
+    removeBtn.addEventListener('click', () => {
+      onRemove(idx);
+    });
+    row.appendChild(display);
+    row.appendChild(showBtn);
+    row.appendChild(removeBtn);
+    container.appendChild(row);
+  });
+}
+
+function renderAll() {
+  renderRepos();
+
+  // Embedding
+  document.getElementById('embedding-provider').value = cfg.embedding.provider || 'voyage';
+  document.getElementById('embedding-model').value = cfg.embedding.model || '';
+  renderKeyList('embedding-keys-list', cfg.embedding.api_keys, (idx) => {
+    cfg.embedding.api_keys.splice(idx, 1);
+    renderAll();
+    saveNow();
+  });
+
+  // LLM
+  document.getElementById('llm-provider').value = cfg.llm.provider || 'google';
+  document.getElementById('llm-rerank-model').value = cfg.llm.rerank_model || '';
+  renderKeyList('llm-keys-list', cfg.llm.api_keys, (idx) => {
+    cfg.llm.api_keys.splice(idx, 1);
+    renderAll();
+    saveNow();
+  });
+}
+
+function escHtml(str) {
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// ─── Save ──────────────────────────────────────────────────────────────────
+async function saveNow() {
+  clearTimeout(saveTimer);
+  hideError();
+  const payload = JSON.parse(JSON.stringify(cfg)); // deep clone
+  try {
+    const res = await fetch('/api/config', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (res.status === 409) { showVersionBanner(); return; }
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      showError(data.error || `Save failed (HTTP ${res.status})`);
+      return;
+    }
+    const saved = await res.json();
+    cfg = saved;
+    showToast();
+  } catch (err) {
+    showError('Network error: ' + err.message);
+  }
+}
+
+function saveDebounced() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveNow, 400);
+}
+
+// ─── Load ──────────────────────────────────────────────────────────────────
+async function loadConfig() {
+  try {
+    const res = await fetch('/api/config');
+    if (res.status === 409) { showVersionBanner(); return; }
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      showError(data.error || `Load failed (HTTP ${res.status})`);
+      document.getElementById('skeleton').classList.add('hidden');
+      document.getElementById('main-content').classList.remove('hidden');
+      return;
+    }
+    cfg = await res.json();
+    document.getElementById('skeleton').classList.add('hidden');
+    document.getElementById('main-content').classList.remove('hidden');
+    renderAll();
+  } catch (err) {
+    document.getElementById('skeleton').classList.add('hidden');
+    document.getElementById('main-content').classList.remove('hidden');
+    showError('Could not reach server: ' + err.message);
+  }
+}
+
+// ─── Event wiring ─────────────────────────────────────────────────────────
+
+// Retry button
+document.getElementById('btn-retry').addEventListener('click', () => {
+  hideError();
+  loadConfig();
+});
+
+// Add repo
+function handleAddRepo() {
+  const input = document.getElementById('input-repo');
+  const val = input.value.trim();
+  if (!val) return;
+  const warning = document.getElementById('repo-warning');
+  const isAbsolute = val.startsWith('/') || /^[A-Za-z]:[\\\/]/.test(val);
+  if (!isAbsolute) { warning.classList.remove('hidden'); } else { warning.classList.add('hidden'); }
+  if (!cfg.repos) cfg.repos = [];
+  cfg.repos.push(val);
+  input.value = '';
+  renderRepos();
+  saveNow();
+}
+
+document.getElementById('form-add-repo').addEventListener('submit', handleAddRepo);
+document.getElementById('btn-add-repo').addEventListener('click', handleAddRepo);
+document.getElementById('input-repo').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); handleAddRepo(); }
+});
+
+// Add embedding key
+function handleAddEmbeddingKey() {
+  const input = document.getElementById('input-embedding-key');
+  const val = input.value.trim();
+  if (!val) return;
+  if (!cfg.embedding.api_keys) cfg.embedding.api_keys = [];
+  cfg.embedding.api_keys.push(val);
+  input.value = '';
+  renderAll();
+  saveNow();
+}
+
+document.getElementById('form-add-embedding-key').addEventListener('submit', handleAddEmbeddingKey);
+document.getElementById('input-embedding-key').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); handleAddEmbeddingKey(); }
+});
+
+// Add LLM key
+function handleAddLlmKey() {
+  const input = document.getElementById('input-llm-key');
+  const val = input.value.trim();
+  if (!val) return;
+  if (!cfg.llm.api_keys) cfg.llm.api_keys = [];
+  cfg.llm.api_keys.push(val);
+  input.value = '';
+  renderAll();
+  saveNow();
+}
+
+document.getElementById('form-add-llm-key').addEventListener('submit', handleAddLlmKey);
+document.getElementById('input-llm-key').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); handleAddLlmKey(); }
+});
+
+// Debounced text inputs
+document.getElementById('embedding-model').addEventListener('input', (e) => {
+  if (cfg) { cfg.embedding.model = e.target.value; saveDebounced(); }
+});
+
+document.getElementById('llm-rerank-model').addEventListener('input', (e) => {
+  if (cfg) { cfg.llm.rerank_model = e.target.value; saveDebounced(); }
+});
+
+// Provider dropdowns (no save needed now — single option, but wire for forward compat)
+document.getElementById('embedding-provider').addEventListener('change', (e) => {
+  if (cfg) { cfg.embedding.provider = e.target.value; saveNow(); }
+});
+
+document.getElementById('llm-provider').addEventListener('change', (e) => {
+  if (cfg) { cfg.llm.provider = e.target.value; saveNow(); }
+});
+
+// ─── Init ─────────────────────────────────────────────────────────────────
+loadConfig();
+</script>
+</body>
+</html>
