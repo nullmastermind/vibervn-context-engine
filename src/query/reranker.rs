@@ -7,6 +7,7 @@ use crate::query::merger::MergeChunk;
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RerankOutput {
     pub reranked_indices: Vec<usize>,
+    pub raw_request: String,
     pub raw_response: String,
     pub elapsed_ms: u64,
     pub fallback_used: bool,
@@ -25,6 +26,7 @@ pub async fn rerank(
         Some(c) => c,
         None => return RerankOutput {
             reranked_indices: all_indices,
+            raw_request: String::new(),
             raw_response: String::new(),
             elapsed_ms: 0,
             fallback_used: false,
@@ -35,6 +37,7 @@ pub async fn rerank(
     if chunks.is_empty() {
         return RerankOutput {
             reranked_indices: vec![],
+            raw_request: String::new(),
             raw_response: String::new(),
             elapsed_ms: 0,
             fallback_used: false,
@@ -80,16 +83,23 @@ pub async fn rerank(
          from most to least relevant, then the closing tag </ranked_indices>."
     );
 
+    let raw_request = format!("[System]\n{system}\n\n[User]\n{user_prompt}");
+
     let start = Instant::now();
     let result = client.complete(system, &user_prompt, 0.0).await;
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
     match result {
-        Ok(response) => parse_rerank_response(&response, n, elapsed_ms),
+        Ok(response) => {
+            let mut output = parse_rerank_response(&response, n, elapsed_ms);
+            output.raw_request = raw_request;
+            output
+        }
         Err(e) => {
             warn!(error = %e, "LLM rerank call failed, using fallback order");
             RerankOutput {
                 reranked_indices: all_indices,
+                raw_request,
                 raw_response: String::new(),
                 elapsed_ms,
                 fallback_used: true,
@@ -131,6 +141,7 @@ fn parse_rerank_response(response: &str, n: usize, elapsed_ms: u64) -> RerankOut
             warn!(raw = %response, "failed to parse rerank response as JSON array");
             return RerankOutput {
                 reranked_indices: all_indices,
+                raw_request: String::new(),
                 raw_response: response.to_owned(),
                 elapsed_ms,
                 fallback_used: true,
@@ -142,6 +153,7 @@ fn parse_rerank_response(response: &str, n: usize, elapsed_ms: u64) -> RerankOut
     if indices.is_empty() {
         return RerankOutput {
             reranked_indices: all_indices,
+            raw_request: String::new(),
             raw_response: response.to_owned(),
             elapsed_ms,
             fallback_used: true,
@@ -151,6 +163,7 @@ fn parse_rerank_response(response: &str, n: usize, elapsed_ms: u64) -> RerankOut
 
     RerankOutput {
         reranked_indices: indices,
+        raw_request: String::new(),
         raw_response: response.to_owned(),
         elapsed_ms,
         fallback_used: false,

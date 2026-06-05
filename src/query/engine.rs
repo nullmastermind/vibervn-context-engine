@@ -42,6 +42,7 @@ pub struct QueryTiming {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RerankInfo {
+    pub raw_request: String,
     pub raw_response: String,
     pub fallback_used: bool,
     pub skip_reason: Option<String>,
@@ -226,6 +227,7 @@ pub async fn run_query(
     let total_ms = total_start.elapsed().as_millis() as u64;
 
     let rerank_info = RerankInfo {
+        raw_request: rerank_output.raw_request,
         raw_response: rerank_output.raw_response,
         fallback_used: rerank_output.fallback_used,
         skip_reason: rerank_output.skip_reason,

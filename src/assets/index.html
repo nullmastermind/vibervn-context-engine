@@ -467,6 +467,12 @@
                          focus:outline-none focus:ring-2 focus:ring-blue-400">
             Pre-rerank
           </button>
+          <button role="tab" id="rtab-llm-request" aria-selected="false" aria-controls="rpanel-llm-request"
+                  class="rtab-btn px-3 py-1.5 text-xs border-b-2 border-transparent text-gray-500 dark:text-wiki-text-muted
+                         hover:text-gray-900 dark:hover:text-wiki-heading hover:border-gray-300 dark:hover:border-wiki-border
+                         focus:outline-none focus:ring-2 focus:ring-blue-400">
+            LLM Request
+          </button>
           <button role="tab" id="rtab-llm" aria-selected="false" aria-controls="rpanel-llm"
                   class="rtab-btn px-3 py-1.5 text-xs border-b-2 border-transparent text-gray-500 dark:text-wiki-text-muted
                          hover:text-gray-900 dark:hover:text-wiki-heading hover:border-gray-300 dark:hover:border-wiki-border
@@ -486,6 +492,14 @@
         <div role="tabpanel" id="rpanel-prererank" class="hidden">
           <div id="search-prererank-results" class="space-y-4"></div>
           <div id="search-prererank-empty" class="hidden text-gray-400 dark:text-wiki-text-muted text-sm">No results found.</div>
+        </div>
+
+        <!-- LLM Request tab -->
+        <div role="tabpanel" id="rpanel-llm-request" class="hidden">
+          <pre id="search-llm-request"
+               class="text-xs p-3 border border-gray-200 dark:border-wiki-border rounded bg-white dark:bg-wiki-surface
+                      text-gray-800 dark:text-wiki-text font-mono leading-relaxed overflow-x-auto whitespace-pre-wrap max-h-[600px] overflow-y-auto"></pre>
+          <div id="search-llm-request-empty" class="hidden text-gray-400 dark:text-wiki-text-muted text-sm">No LLM request available.</div>
         </div>
 
         <!-- LLM Response tab -->
@@ -1190,6 +1204,19 @@ async function runSearch() {
     // Render pre-rerank results
     renderSearchResults(data.pre_rerank_results, 'search-prererank-results', 'search-prererank-empty');
 
+    // Render LLM request
+    const llmReqPre = document.getElementById('search-llm-request');
+    const llmReqEmpty = document.getElementById('search-llm-request-empty');
+    if (data.rerank && data.rerank.raw_request) {
+      llmReqPre.textContent = data.rerank.raw_request;
+      llmReqPre.classList.remove('hidden');
+      llmReqEmpty.classList.add('hidden');
+    } else {
+      llmReqPre.textContent = '';
+      llmReqPre.classList.add('hidden');
+      llmReqEmpty.classList.remove('hidden');
+    }
+
     // Render LLM response
     const llmPre = document.getElementById('search-llm-response');
     const llmEmpty = document.getElementById('search-llm-empty');
@@ -1244,6 +1271,7 @@ async function runSearch() {
 const RESULT_TABS = [
   { btn: 'rtab-results',   panel: 'rpanel-results' },
   { btn: 'rtab-prererank', panel: 'rpanel-prererank' },
+  { btn: 'rtab-llm-request', panel: 'rpanel-llm-request' },
   { btn: 'rtab-llm',       panel: 'rpanel-llm' },
 ];
 
