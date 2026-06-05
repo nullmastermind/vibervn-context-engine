@@ -555,7 +555,7 @@
     </div>
     <!-- Overview stats -->
     <div id="index-modal-stats" class="px-4 py-2 border-b border-gray-100 dark:border-wiki-border text-xs text-gray-500 dark:text-wiki-text-muted flex gap-4 flex-wrap">
-      <span id="index-stat-active-calls">API calls: 0</span>
+      <span id="index-stat-active-calls">Embed: —</span>
       <span id="index-stat-progress">Progress: —</span>
     </div>
     <!-- Terminal output -->
@@ -2055,7 +2055,7 @@ function openIndexModal(repo) {
   const terminal = document.getElementById('index-modal-terminal');
   modal.classList.remove('hidden');
   terminal.innerHTML = '';
-  document.getElementById('index-stat-active-calls').textContent = 'API calls: 0';
+  document.getElementById('index-stat-active-calls').textContent = 'Embed: —';
   document.getElementById('index-stat-progress').textContent = 'Progress: —';
   connectIndexSSE(repo);
 }
@@ -2097,7 +2097,7 @@ function connectIndexSSE(repo) {
 
 function handleIndexEvent(event) {
   const terminal = document.getElementById('index-modal-terminal');
-  const statsActive = document.getElementById('index-stat-active-calls');
+  const statsEmbed = document.getElementById('index-stat-active-calls');
   const statsProgress = document.getElementById('index-stat-progress');
 
   let line = '';
@@ -2109,24 +2109,34 @@ function handleIndexEvent(event) {
       statsProgress.textContent = 'Progress: 0 / ' + event.total_files;
       break;
 
-    case 'embed_call_start':
-      line = `<span class="text-blue-400">[${ts}]</span> <span class="text-yellow-400">→ embed</span> ${shortPath(event.file)} (${event.chunks} chunks) key: <span class="text-purple-400">${escHtml(event.key_hint)}</span>`;
-      statsActive.textContent = 'API calls: ' + event.active_calls;
+    case 'file_parsed':
+      line = `<span class="text-blue-400">[${ts}]</span> <span class="text-gray-400">parse</span> ${shortPath(event.file)} — ${event.parse_ms}ms (${event.chunks} chunks, ${event.symbols} syms, wait ${event.queue_wait_ms}ms)`;
       break;
 
-    case 'embed_call_done':
+    case 'file_skipped':
+      line = `<span class="text-blue-400">[${ts}]</span> <span class="text-yellow-400">skip</span> ${shortPath(event.file)} — ${escHtml(event.reason)}`;
+      break;
+
+    case 'file_embedded':
       if (event.cached) {
-        line = `<span class="text-blue-400">[${ts}]</span> <span class="text-gray-400">✓ cached</span> ${shortPath(event.file)} — ${event.elapsed_ms}ms (${event.chunks} chunks)`;
+        line = `<span class="text-blue-400">[${ts}]</span> <span class="text-gray-400">cached</span> ${shortPath(event.file)} — ${event.elapsed_ms}ms (${event.chunks} chunks)`;
+        statsEmbed.textContent = 'Embed: cached';
       } else {
-        line = `<span class="text-blue-400">[${ts}]</span> <span class="text-green-400">✓ embed</span> ${shortPath(event.file)} — ${event.elapsed_ms}ms (${event.chunks} chunks)`;
+        line = `<span class="text-blue-400">[${ts}]</span> <span class="text-green-400">embed</span> ${shortPath(event.file)} — ${event.elapsed_ms}ms (${event.chunks} chunks) key: <span class="text-purple-400">${escHtml(event.key_hint)}</span>`;
+        statsEmbed.textContent = 'Embed: api';
       }
-      statsActive.textContent = 'API calls: ' + event.active_calls;
       break;
 
-    case 'file_indexed':
-      line = `<span class="text-blue-400">[${ts}]</span> <span class="text-cyan-400">indexed</span> ${shortPath(event.file)} <span class="text-gray-500">[${event.indexed}/${event.total}]</span> ${event.elapsed_ms}ms`;
+    case 'file_stored':
+      line = `<span class="text-blue-400">[${ts}]</span> <span class="text-blue-300">stored</span> ${shortPath(event.file)} — db ${event.elapsed_ms}ms, wait ${event.queue_wait_ms}ms`;
+      break;
+
+    case 'file_indexed': {
+      const statusWarn = event.status === 'no_embeddings' ? ' <span class="text-yellow-400">[no embeddings]</span>' : '';
+      line = `<span class="text-blue-400">[${ts}]</span> <span class="text-cyan-400">indexed</span> ${shortPath(event.file)} <span class="text-gray-500">[${event.indexed}/${event.total}]</span> ${event.total_elapsed_ms}ms${statusWarn}`;
       statsProgress.textContent = 'Progress: ' + event.indexed + ' / ' + event.total;
       break;
+    }
 
     case 'phase2_start':
       line = `<span class="text-blue-400">[${ts}]</span> <span class="text-yellow-400">Phase 2</span> resolving call graph edges…`;

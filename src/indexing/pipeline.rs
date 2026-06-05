@@ -81,6 +81,12 @@ struct RawEdgeRecord {
     import_path: Option<String>,
 }
 
+/// Output of parse_one_file — either a successfully parsed file or a skip record.
+enum ParseOutput {
+    Parsed(ParsedFile),
+    Skipped { file: String, reason: String },
+}
+
 /// A parsed file result ready for the embed stage.
 struct ParsedFile {
     path: String,
@@ -89,6 +95,11 @@ struct ParsedFile {
     raw_edges: Vec<RawEdgeRecord>,
     mtime: i64,
     size: i64,
+    /// How long the parse took (for FileParsed event).
+    parse_elapsed_ms: u64,
+    /// When this ParsedFile was created (to measure queue wait in Stage 2).
+    /// Not serialized — internal pipeline field only.
+    created_at: Instant,
 }
 
 /// An embedded file result ready for the writer.
@@ -100,6 +111,14 @@ struct EmbeddedFile {
     raw_edges: Vec<RawEdgeRecord>,
     mtime: i64,
     size: i64,
+    /// True if the API returned all-empty embeddings due to an error.
+    embed_failed: bool,
+    /// When this EmbeddedFile was created (to measure queue wait in Stage 3).
+    /// Not serialized — internal pipeline field only.
+    created_at: Instant,
+    /// When Stage 1 started for this file (for total_elapsed_ms in FileIndexed).
+    /// Not serialized — internal pipeline field only.
+    pipeline_start: Instant,
 }
 
 pub struct IndexPipelineStats {
@@ -479,19 +498,17 @@ impl IndexPipeline {
         let key_hints_owned: Vec<String> = key_hints.to_vec();
 
         // ── Stage 1: parallel parse (rayon), feed into bounded channel ────
-        let (parse_tx, parse_rx) = mpsc::channel::<ParsedFile>(PARSE_CHANNEL_CAP);
+        let (parse_tx, parse_rx) = mpsc::channel::<ParseOutput>(PARSE_CHANNEL_CAP);
         {
             let files_owned: Vec<String> = files.to_vec();
             tokio::task::spawn_blocking(move || {
                 use rayon::prelude::*;
                 // Par-iterate, but channel send must be blocking.
                 files_owned.par_iter().for_each(|file| {
-                    let pf = parse_one_file(file);
-                    if let Some(pf) = pf {
-                        // Blocking send — applies backpressure when embed is slow.
-                        if parse_tx.blocking_send(pf).is_err() {
-                            // Receiver dropped (pipeline cancelled) — stop.
-                        }
+                    let output = parse_one_file(file);
+                    // Blocking send — applies backpressure when embed is slow.
+                    if parse_tx.blocking_send(output).is_err() {
+                        // Receiver dropped (pipeline cancelled) — stop.
                     }
                 });
                 // parse_tx dropped here, closing the channel.
@@ -504,7 +521,7 @@ impl IndexPipeline {
 
         let (embed_tx, mut embed_rx) = mpsc::channel::<EmbeddedFile>(EMBED_CHANNEL_CAP);
 
-        // Wrap the parse receiver as a stream of parsed files, embed each
+        // Wrap the parse receiver as a stream of ParseOutput, embed each
         // concurrently up to `embed_concurrency` at a time.
         {
             let voyage_clone = voyage.clone();
@@ -522,7 +539,7 @@ impl IndexPipeline {
                 });
 
                 stream
-                    .map(|pf| {
+                    .map(|output| {
                         let voyage_ref = voyage_clone.clone();
                         let cache_ref = cache_clone.clone();
                         let done_ref = done_counter_clone.clone();
@@ -530,67 +547,89 @@ impl IndexPipeline {
                         let bus_ref = bus_clone.clone();
                         let hints_ref = hints_clone.clone();
                         async move {
-                            let chunk_count = pf.chunks.len();
-                            let file_path = pf.path.clone();
-                            let embed_start = Instant::now();
+                            match output {
+                                ParseOutput::Skipped { file, reason } => {
+                                    // Emit skip event and count it — no EmbeddedFile produced.
+                                    if let Some(ref bus) = bus_ref {
+                                        bus.emit(IndexEvent::FileSkipped {
+                                            file: file.clone(),
+                                            reason,
+                                        });
+                                    }
+                                    let done = done_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                                    if let Some(ph) = &progress_ref {
+                                        ph.set_processed(done).await;
+                                    }
+                                    None
+                                }
+                                ParseOutput::Parsed(pf) => {
+                                    // Measure queue wait: time from when pf was created in rayon
+                                    // to when Stage 2 picks it up.
+                                    let queue_wait_ms = pf.created_at.elapsed().as_millis() as u64;
+                                    let chunk_count = pf.chunks.len();
+                                    let symbol_count = pf.symbols.len();
+                                    let file_path = pf.path.clone();
 
-                            // Emit embed start event.
-                            if let Some(ref bus) = bus_ref {
-                                let key_hint = hints_ref.first().cloned().unwrap_or_default();
-                                let active = bus.inc_api_calls();
-                                bus.emit(IndexEvent::EmbedCallStart {
-                                    file: file_path.clone(),
-                                    chunks: chunk_count,
-                                    key_hint,
-                                    active_calls: active,
-                                });
-                            }
+                                    // Emit FileParsed event.
+                                    if let Some(ref bus) = bus_ref {
+                                        bus.emit(IndexEvent::FileParsed {
+                                            file: file_path.clone(),
+                                            chunks: chunk_count,
+                                            symbols: symbol_count,
+                                            parse_ms: pf.parse_elapsed_ms,
+                                            queue_wait_ms,
+                                        });
+                                    }
 
-                            let embed_result = embed_parsed_file(&pf, voyage_ref.as_ref(), cache_ref.as_deref()).await;
+                                    let key_hint = hints_ref.first().cloned().unwrap_or_default();
+                                    let embed_start = Instant::now();
 
-                            // Emit embed done event.
-                            if let Some(ref bus) = bus_ref {
-                                let active = bus.dec_api_calls();
-                                bus.emit(IndexEvent::EmbedCallDone {
-                                    file: file_path.clone(),
-                                    chunks: chunk_count,
-                                    elapsed_ms: embed_start.elapsed().as_millis() as u64,
-                                    active_calls: active,
-                                    cached: embed_result.fully_cached,
-                                });
-                            }
+                                    let embed_result = embed_parsed_file(&pf, voyage_ref.as_ref(), cache_ref.as_deref()).await;
 
-                            let done = done_ref.fetch_add(1, Ordering::Relaxed) + 1;
-                            if let Some(ph) = &progress_ref {
-                                ph.set_processed(done).await;
-                            }
+                                    let embed_elapsed_ms = embed_start.elapsed().as_millis() as u64;
 
-                            if let Some(ref bus) = bus_ref {
-                                bus.emit(IndexEvent::FileIndexed {
-                                    file: file_path,
-                                    indexed: done,
-                                    total: total_files,
-                                    elapsed_ms: embed_start.elapsed().as_millis() as u64,
-                                });
-                            }
+                                    // Detect embed failure: all embeddings empty and chunks non-zero
+                                    // indicates an API error path.
+                                    let embed_failed = !pf.chunks.is_empty()
+                                        && embed_result.embeddings.iter().all(|e| e.is_empty());
 
-                            EmbeddedFile {
-                                path: pf.path,
-                                symbols: pf.symbols,
-                                chunks: pf.chunks,
-                                embeddings: embed_result.embeddings,
-                                raw_edges: pf.raw_edges,
-                                mtime: pf.mtime,
-                                size: pf.size,
+                                    // Emit FileEmbedded event.
+                                    if let Some(ref bus) = bus_ref {
+                                        bus.emit(IndexEvent::FileEmbedded {
+                                            file: file_path.clone(),
+                                            chunks: chunk_count,
+                                            elapsed_ms: embed_elapsed_ms,
+                                            cached: embed_result.fully_cached,
+                                            key_hint,
+                                        });
+                                    }
+
+                                    let pipeline_start = pf.created_at;
+
+                                    Some(EmbeddedFile {
+                                        path: pf.path,
+                                        symbols: pf.symbols,
+                                        chunks: pf.chunks,
+                                        embeddings: embed_result.embeddings,
+                                        raw_edges: pf.raw_edges,
+                                        mtime: pf.mtime,
+                                        size: pf.size,
+                                        embed_failed,
+                                        created_at: Instant::now(),
+                                        pipeline_start,
+                                    })
+                                }
                             }
                         }
                     })
                     .buffer_unordered(embed_concurrency)
-                    .for_each(|ef| {
+                    .for_each(|opt_ef| {
                         let tx = embed_tx_clone.clone();
                         async move {
-                            // If writer is slow, this blocks (bounded channel backpressure).
-                            let _ = tx.send(ef).await;
+                            if let Some(ef) = opt_ef {
+                                // If writer is slow, this blocks (bounded channel backpressure).
+                                let _ = tx.send(ef).await;
+                            }
                         }
                     })
                     .await;
@@ -604,6 +643,11 @@ impl IndexPipeline {
         let mut all_chunk_vectors: Vec<(ChunkId, Vec<f32>)> = Vec::new();
 
         while let Some(ef) = embed_rx.recv().await {
+            // Measure queue wait: time from when EmbeddedFile was created in Stage 2
+            // to when Stage 3 picks it up.
+            let queue_wait_ms = ef.created_at.elapsed().as_millis() as u64;
+            let store_start = Instant::now();
+
             // Write symbols for this file (native-bind).
             flush_symbol_batch_native(db, &ef.symbols)
                 .await
@@ -632,6 +676,34 @@ impl IndexPipeline {
             })
             .await
             .context("streaming_index: upsert_file_meta")?;
+
+            let store_elapsed_ms = store_start.elapsed().as_millis() as u64;
+            let total_elapsed_ms = ef.pipeline_start.elapsed().as_millis() as u64;
+
+            // Emit FileStored event.
+            if let Some(bus) = event_bus {
+                bus.emit(IndexEvent::FileStored {
+                    file: ef.path.clone(),
+                    elapsed_ms: store_elapsed_ms,
+                    queue_wait_ms,
+                });
+            }
+
+            // Increment done counter and emit FileIndexed.
+            let done = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            if let Some(ph) = progress {
+                ph.set_processed(done).await;
+            }
+            if let Some(bus) = event_bus {
+                let status = if ef.embed_failed { "no_embeddings" } else { "ok" };
+                bus.emit(IndexEvent::FileIndexed {
+                    file: ef.path.clone(),
+                    indexed: done,
+                    total: total_files,
+                    total_elapsed_ms,
+                    status: status.to_string(),
+                });
+            }
         }
 
         Ok(all_chunk_vectors)
@@ -971,14 +1043,19 @@ impl IndexPipeline {
     }
 }
 
-// ─── Parse one file (returns None on read/parse failure) ─────────────────
+// ─── Parse one file (returns ParseOutput — always returns, never drops silently) ─
 
-fn parse_one_file(file: &str) -> Option<ParsedFile> {
+fn parse_one_file(file: &str) -> ParseOutput {
+    let parse_start = Instant::now();
+
     let source = match std::fs::read_to_string(file) {
         Ok(s) => s,
         Err(e) => {
             warn!(file = %file, error = %e, "failed to read file");
-            return None;
+            return ParseOutput::Skipped {
+                file: file.to_string(),
+                reason: format!("read error: {e}"),
+            };
         }
     };
 
@@ -986,7 +1063,10 @@ fn parse_one_file(file: &str) -> Option<ParsedFile> {
         Some(s) => (s.mtime, s.size),
         None => {
             warn!(file = %file, "failed to stat file");
-            return None;
+            return ParseOutput::Skipped {
+                file: file.to_string(),
+                reason: "stat failed".to_string(),
+            };
         }
     };
 
@@ -1019,13 +1099,17 @@ fn parse_one_file(file: &str) -> Option<ParsedFile> {
         })
         .collect();
 
-    Some(ParsedFile {
+    let parse_elapsed_ms = parse_start.elapsed().as_millis() as u64;
+
+    ParseOutput::Parsed(ParsedFile {
         path: file.to_string(),
         symbols: result.symbols,
         chunks: result.chunks,
         raw_edges,
         mtime,
         size,
+        parse_elapsed_ms,
+        created_at: Instant::now(),
     })
 }
 

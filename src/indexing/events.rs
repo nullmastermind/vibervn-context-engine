@@ -1,6 +1,4 @@
 use serde::Serialize;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use tokio::sync::broadcast;
 
 /// Events streamed to the frontend during indexing.
@@ -16,29 +14,37 @@ pub enum IndexEvent {
     /// A file was parsed (stage 1 complete for this file).
     FileParsed {
         file: String,
-        elapsed_ms: u64,
+        chunks: usize,
+        symbols: usize,
+        parse_ms: u64,
+        queue_wait_ms: u64,
     },
-    /// An embedding API call is starting.
-    EmbedCallStart {
+    /// A file was skipped during parsing (read/stat failure).
+    FileSkipped {
+        file: String,
+        reason: String,
+    },
+    /// A file's chunks were embedded (stage 2 complete for this file).
+    FileEmbedded {
         file: String,
         chunks: usize,
-        key_hint: String,
-        active_calls: u64,
-    },
-    /// An embedding API call finished.
-    EmbedCallDone {
-        file: String,
-        chunks: usize,
         elapsed_ms: u64,
-        active_calls: u64,
         cached: bool,
+        key_hint: String,
     },
-    /// A file completed the full embed+write cycle.
+    /// A file was written to the DB (stage 3 complete for this file).
+    FileStored {
+        file: String,
+        elapsed_ms: u64,
+        queue_wait_ms: u64,
+    },
+    /// A file completed the full parse+embed+write cycle.
     FileIndexed {
         file: String,
         indexed: u64,
         total: u64,
-        elapsed_ms: u64,
+        total_elapsed_ms: u64,
+        status: String,
     },
     /// Phase 2 edge resolution started.
     Phase2Start { repo: String },
@@ -59,7 +65,6 @@ pub enum IndexEvent {
 #[derive(Clone)]
 pub struct IndexEventBus {
     tx: broadcast::Sender<IndexEvent>,
-    pub active_api_calls: Arc<AtomicU64>,
 }
 
 impl Default for IndexEventBus {
@@ -71,10 +76,7 @@ impl Default for IndexEventBus {
 impl IndexEventBus {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(1024);
-        Self {
-            tx,
-            active_api_calls: Arc::new(AtomicU64::new(0)),
-        }
+        Self { tx }
     }
 
     pub fn emit(&self, event: IndexEvent) {
@@ -83,18 +85,5 @@ impl IndexEventBus {
 
     pub fn subscribe(&self) -> broadcast::Receiver<IndexEvent> {
         self.tx.subscribe()
-    }
-
-    pub fn inc_api_calls(&self) -> u64 {
-        self.active_api_calls.fetch_add(1, Ordering::Relaxed) + 1
-    }
-
-    pub fn dec_api_calls(&self) -> u64 {
-        let prev = self.active_api_calls.fetch_sub(1, Ordering::Relaxed);
-        prev.saturating_sub(1)
-    }
-
-    pub fn active_calls(&self) -> u64 {
-        self.active_api_calls.load(Ordering::Relaxed)
     }
 }

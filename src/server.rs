@@ -695,8 +695,9 @@ async fn get_index_events(
                     let matches = match &event {
                         crate::indexing::events::IndexEvent::Started { repo, .. } => *repo == repo_filter,
                         crate::indexing::events::IndexEvent::FileParsed { .. } => true,
-                        crate::indexing::events::IndexEvent::EmbedCallStart { .. } => true,
-                        crate::indexing::events::IndexEvent::EmbedCallDone { .. } => true,
+                        crate::indexing::events::IndexEvent::FileSkipped { .. } => true,
+                        crate::indexing::events::IndexEvent::FileEmbedded { .. } => true,
+                        crate::indexing::events::IndexEvent::FileStored { .. } => true,
                         crate::indexing::events::IndexEvent::FileIndexed { .. } => true,
                         crate::indexing::events::IndexEvent::Phase2Start { repo } => *repo == repo_filter,
                         crate::indexing::events::IndexEvent::Phase2Done { repo, .. } => *repo == repo_filter,
