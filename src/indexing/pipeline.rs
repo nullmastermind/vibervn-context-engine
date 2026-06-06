@@ -1483,16 +1483,18 @@ impl IndexPipeline {
                 Some(b) => b,
                 None => continue,
             };
-            let in_name = re.from_fqn.rsplit("::").next().unwrap_or("").to_string();
-            let out_name = best.name.clone();
+            // in_name/out_name must store the FULL FQN (file::scope::name), matching
+            // the DB-scan path (positions 5/6 at the resolved-edge push below) and the
+            // node IDs consumed by call_graph (meta::id(id)) and query_callers/callees.
+            // Writing leaf names here desyncs both the UI graph and search-time expansion.
             edge_batch.push((
                 re.from_fqn.clone(),
                 best.fqn.clone(),
                 re.line,
                 re.from_file.clone(),
                 best.file.clone(),
-                in_name,
-                out_name,
+                re.from_fqn.clone(),
+                best.fqn.clone(),
             ));
 
             if edge_batch.len() >= EDGE_RELATE_BATCH_SIZE {
@@ -3814,6 +3816,91 @@ mod perf_fix_tests {
         assert_eq!(
             a_meta_stored.mtime, a_stat.mtime,
             "file_a mtime must be updated after watcher-path re-index"
+        );
+    }
+}
+
+// ─── RAM-path edge resolution FQN test ────────────────────────────────────
+//
+// Regression for the "0 edges after index" bug: the full-rebuild RAM fast-path
+// (`resolve_edges_from_ram`) wrote LEAF names into calls.in_name/out_name, while
+// the DB-scan path writes full FQNs. Consumers (call_graph node ids = meta::id(id),
+// and query_callers/callees `WHERE out_name = $fqn`) match on full FQNs, so the
+// leaf-name rows silently failed every match → empty UI graph + broken search
+// expansion. This test pins in_name/out_name to full FQNs on the RAM path, using
+// a METHOD symbol whose FQN (file::scope::name) differs from its leaf name —
+// the leaf-name bug would pass a free-function assertion but fail this one.
+#[cfg(test)]
+mod ram_path_fqn_tests {
+    use super::*;
+    use crate::store::open_db;
+    use serde::Deserialize;
+    use tempfile::TempDir;
+
+    /// Insert a (possibly scoped) symbol whose record id IS the full FQN.
+    async fn insert_symbol_fqn(db: &Surreal<Db>, fqn: &str, file: &str, name: &str) {
+        db.query(format!(
+            "UPSERT symbol:`⟨{fqn}⟩` SET \
+             name = '{name}', kind = 'method', file = '{file}', \
+             line_start = 1, line_end = 10, signature = NONE, parent = NONE"
+        ))
+        .await
+        .expect("insert symbol");
+    }
+
+    /// resolve_edges_from_ram must write the FULL FQN (file::scope::name) into
+    /// calls.in_name and calls.out_name — never the leaf name.
+    #[tokio::test]
+    async fn ram_path_writes_full_fqn_in_call_names() {
+        let home = TempDir::new().unwrap();
+        let repo = "/test/ram_fqn";
+        let db = open_db(home.path(), repo).await.unwrap();
+
+        // Caller: method `caller` inside class `Foo` in /a.cpp → FQN /a.cpp::Foo::caller
+        // Callee: method `callee` inside class `Bar` in /b.cpp → FQN /b.cpp::Bar::callee
+        insert_symbol_fqn(&db, "/a.cpp::Foo::caller", "/a.cpp", "caller").await;
+        insert_symbol_fqn(&db, "/b.cpp::Bar::callee", "/b.cpp", "callee").await;
+
+        // One RAM raw edge: caller calls `callee` (unresolved leaf name, as parsed).
+        let raw_edges = vec![RawEdgeRecord {
+            from_file: "/a.cpp".to_string(),
+            from_name: "caller".to_string(),
+            from_fqn: "/a.cpp::Foo::caller".to_string(),
+            to_name: "callee".to_string(),
+            kind: "calls".to_string(),
+            line: 7,
+            import_path: None,
+        }];
+
+        let pipeline = IndexPipeline::new(repo.to_string(), None);
+        pipeline
+            .resolve_edges_from_ram(&db, raw_edges)
+            .await
+            .expect("resolve_edges_from_ram");
+
+        #[derive(Deserialize, Debug)]
+        struct EdgeRow {
+            in_name: Option<String>,
+            out_name: Option<String>,
+        }
+        let rows: Vec<EdgeRow> = db
+            .query("SELECT in_name, out_name FROM calls")
+            .await
+            .unwrap()
+            .take(0)
+            .unwrap();
+
+        assert_eq!(rows.len(), 1, "exactly one calls edge expected, got {rows:?}");
+        let row = &rows[0];
+        assert_eq!(
+            row.in_name.as_deref(),
+            Some("/a.cpp::Foo::caller"),
+            "in_name must be the full FQN, not the leaf name 'caller'"
+        );
+        assert_eq!(
+            row.out_name.as_deref(),
+            Some("/b.cpp::Bar::callee"),
+            "out_name must be the full FQN, not the leaf name 'callee'"
         );
     }
 }

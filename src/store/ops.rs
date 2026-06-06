@@ -696,38 +696,101 @@ pub struct CallGraph {
 
 /// Build a bounded node-link view of the `calls` relation.
 ///
-/// Strategy: take up to `edge_limit` call edges, collect the symbols they touch
-/// (capped at `node_limit`), then emit the induced subgraph. Edges referencing a
-/// symbol that was dropped by the node cap are themselves dropped, so the graph
-/// is always internally consistent.
+/// Strategy: degree-seeded hub subgraph. The prior approach took an arbitrary
+/// `LIMIT node_limit` slice of symbols and an arbitrary `LIMIT edge_limit` slice
+/// of edges, then kept only edges whose BOTH endpoints fell in the random node
+/// slice. For a large repo (e.g. 25K symbols) the expected number of surviving
+/// edges is ~edge_limit × (node_limit/total)² ≈ 0 — hence "0 edges" on the UI.
+///
+/// Instead we pick the structurally important symbols: rank by total degree
+/// (caller count + callee count) using GROUP BY on the indexed `in_name` /
+/// `out_name` columns, take the top `node_limit` as the hub set, then emit only
+/// the edges whose both endpoints are hubs. This is non-arbitrary (degree =
+/// centrality), connected by construction (hubs call each other), and bounded.
+///
+/// All sizes are O(hub set) or O(edges among hubs) — no full symbol scan, safe
+/// at large-repo scale.
 pub async fn call_graph(
     db: &Surreal<Db>,
     edge_limit: usize,
     node_limit: usize,
 ) -> Result<CallGraph> {
-    // Symbol endpoints: in_name and out_name now store full FQNs (file::scope::name),
-    // matching the node IDs produced by meta::id(id) below.
+    // ── Step 1: rank symbols by total degree (caller + callee count) ──────
+    // GROUP BY on the indexed in_name / out_name columns. Each query returns
+    // per-endpoint counts; we sum them per FQN to get total degree.
+    //
+    // Two SurrealDB 2.6.5 quirks, both verified empirically against this DB:
+    //   1. An alias literally named `count` collides with the count() function
+    //      in ORDER BY and collapses the result to a single aggregate row. Use
+    //      a different alias (`c`).
+    //   2. When a column is aliased (`out_name AS name`), the GROUP BY must
+    //      reference the ALIAS (`GROUP BY name`), not the original column
+    //      (`GROUP BY out_name`). Grouping by the original column while an alias
+    //      is projected collapses every group into a single row carrying the
+    //      grand-total count — which degenerated the hub set to ~1 symbol and
+    //      produced the "0 edges" UI. With `GROUP BY name`, ORDER BY c also sorts
+    //      correctly without needing a subquery wrapper.
     #[derive(Deserialize)]
-    struct EdgeRow {
-        #[serde(rename = "in_name")]
-        in_name: Option<String>,
-        #[serde(rename = "out_name")]
-        out_name: Option<String>,
+    struct DegreeRow {
+        name: Option<String>,
+        c: i64,
     }
 
-    let edge_rows: Vec<EdgeRow> = db
+    // Fetch generously (node_limit * 4) from each side so that summing in+out
+    // and truncating to node_limit still reflects true top-degree hubs.
+    let fetch = (node_limit as i64) * 4;
+
+    let out_deg: Vec<DegreeRow> = db
         .query(
-            "SELECT in_name, out_name \
-             FROM calls LIMIT $limit",
+            "SELECT out_name AS name, count() AS c FROM calls \
+             GROUP BY name ORDER BY c DESC LIMIT $f",
         )
-        .bind(("limit", edge_limit as i64))
+        .bind(("f", fetch))
         .await
-        .context("call_graph: edges")?
+        .context("call_graph: callee degree")?
+        .take(0)?;
+    let in_deg: Vec<DegreeRow> = db
+        .query(
+            "SELECT in_name AS name, count() AS c FROM calls \
+             GROUP BY name ORDER BY c DESC LIMIT $f",
+        )
+        .bind(("f", fetch))
+        .await
+        .context("call_graph: caller degree")?
         .take(0)?;
 
-    let total_edges = edge_rows.len();
+    let mut degree: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for row in out_deg.into_iter().chain(in_deg) {
+        if let Some(n) = row.name {
+            *degree.entry(n).or_insert(0) += row.c;
+        }
+    }
 
-    // Pull symbol metadata for nodes (bounded). Keyed by FQN from meta::id.
+    // Top node_limit FQNs by total degree → the hub set.
+    let mut ranked: Vec<(String, i64)> = degree.into_iter().collect();
+    ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked.truncate(node_limit);
+    let hub_fqns: Vec<String> = ranked.into_iter().map(|(fqn, _)| fqn).collect();
+
+    if hub_fqns.is_empty() {
+        return Ok(CallGraph { nodes: vec![], edges: vec![], truncated: false });
+    }
+    let hub_set: std::collections::HashSet<String> = hub_fqns.iter().cloned().collect();
+
+    // ── Step 2: fetch node metadata for the hub set by record id ──────────
+    // The symbol record id IS the FQN; in_name/out_name store the plain FQN, so
+    // build `symbol:⟨fqn⟩` Things and select `FROM $ids` (record array as the
+    // query source). Bounded by hub count — no full symbol-table scan.
+    //
+    // SurrealDB 2.6.5 note (verified empirically): `WHERE id IN $things` and
+    // `WHERE meta::id(id) IN $fqns` both return ZERO rows for complex string
+    // record ids. The working idiom is `SELECT ... FROM $ids` with a bound
+    // Vec<Thing>; it also returns meta::id already unbracketed.
+    let things: Vec<surrealdb::sql::Thing> = hub_fqns
+        .iter()
+        .map(|fqn| surrealdb::sql::Thing::from(("symbol", surrealdb::sql::Id::String(fqn.clone()))))
+        .collect();
+
     #[derive(Deserialize)]
     struct SymRow {
         fqn: String,
@@ -739,11 +802,11 @@ pub async fn call_graph(
     }
     let sym_rows: Vec<SymRow> = db
         .query(
-            "SELECT meta::id(id) AS fqn, name, kind, file, line_start, line_end FROM symbol LIMIT $limit",
+            "SELECT meta::id(id) AS fqn, name, kind, file, line_start, line_end FROM $ids",
         )
-        .bind(("limit", node_limit as i64))
+        .bind(("ids", things))
         .await
-        .context("call_graph: symbols")?
+        .context("call_graph: hub symbols")?
         .take(0)?;
 
     let mut nodes: Vec<GraphNode> = Vec::with_capacity(sym_rows.len());
@@ -763,21 +826,50 @@ pub async fn call_graph(
         }
     }
 
+    // ── Step 3: fetch edges among the hub set ─────────────────────────────
+    // `calls` stores one row per call SITE (the same caller→callee pair repeats
+    // once per source line), so a bare `LIMIT $limit` on raw rows would spend the
+    // budget on duplicates — for notepad-ade, 600 raw rows collapsed to only ~260
+    // distinct edges after dedup, leaving the graph far sparser than the hub set
+    // can support. `GROUP BY in_name, out_name` deduplicates at the DB so the
+    // LIMIT counts DISTINCT edges, filling the view with real inter-hub structure.
+    #[derive(Deserialize)]
+    struct EdgeRow {
+        in_name: Option<String>,
+        out_name: Option<String>,
+    }
+    let edge_rows: Vec<EdgeRow> = db
+        .query(
+            "SELECT in_name, out_name FROM calls \
+             WHERE in_name IN $hubs AND out_name IN $hubs \
+             GROUP BY in_name, out_name LIMIT $limit",
+        )
+        .bind(("hubs", hub_fqns.clone()))
+        .bind(("limit", edge_limit as i64))
+        .await
+        .context("call_graph: hub edges")?
+        .take(0)?;
+
+    let total_edges = edge_rows.len();
+
     let mut edges: Vec<GraphEdge> = Vec::new();
+    let mut seen_edges: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     for e in edge_rows {
-        let (in_name, out_name) = match (e.in_name, e.out_name) {
+        let (source, target) = match (e.in_name, e.out_name) {
             (Some(i), Some(o)) => (i, o),
             _ => continue,
         };
-        // in_name and out_name now store full FQNs, matching node_ids keyed by FQN.
-        let source = in_name;
-        let target = out_name;
-        if node_ids.contains(&source) && node_ids.contains(&target) {
+        // Both endpoints are guaranteed hubs by the WHERE clause, but a node may
+        // be missing if its symbol row was absent; guard against dangling edges.
+        if node_ids.contains(&source)
+            && node_ids.contains(&target)
+            && seen_edges.insert((source.clone(), target.clone()))
+        {
             edges.push(GraphEdge { source, target });
         }
     }
 
-    let truncated = total_edges >= edge_limit || nodes.len() >= node_limit;
+    let truncated = total_edges >= edge_limit || hub_set.len() >= node_limit;
     Ok(CallGraph { nodes, edges, truncated })
 }
 
@@ -1030,5 +1122,145 @@ mod null_chunk_count_deserialization {
         assert_eq!(rows[0].chunk_count, 42, "real chunk_count must round-trip correctly");
         assert_eq!(rows[0].mtime, 999);
         assert_eq!(rows[0].size, 4096);
+    }
+}
+
+// ─── call_graph degree-seeded hub subgraph tests ──────────────────────────
+//
+// Regression for the "0 edges" UI symptom. Two latent defects this pins:
+//   1. The degree query must actually GROUP and SORT. SurrealDB 2.6.5 collapses
+//      `count() AS count … ORDER BY count` to one row, and same-level ORDER BY
+//      doesn't sort — so the hub set degenerated to ~1 symbol → ~0 edges.
+//   2. Hub matching is by full FQN (in_name/out_name), so edges among hubs must
+//      survive into the result.
+#[cfg(test)]
+mod call_graph_tests {
+    use super::*;
+    use crate::store::open_db;
+    use tempfile::TempDir;
+
+    async fn insert_symbol(db: &Surreal<Db>, fqn: &str, file: &str, name: &str) {
+        // Insert via bound Thing — mirrors how the real pipeline writes symbols
+        // (flush_symbol_batch_native). NOTE: do NOT use `UPSERT symbol:⟨fqn⟩` with
+        // backtick-bracket string interpolation in tests — that bakes literal ⟨⟩
+        // into the stored id (id becomes "⟨fqn⟩"), which does not match the clean
+        // ids the pipeline produces and breaks `FROM $ids` record lookup.
+        let thing = surrealdb::sql::Thing::from((
+            "symbol",
+            surrealdb::sql::Id::String(fqn.to_string()),
+        ));
+        db.query(
+            "CREATE $t SET name = $n, kind = 'function', file = $f, \
+             line_start = 1, line_end = 5, signature = NONE, parent = NONE",
+        )
+        .bind(("t", thing))
+        .bind(("n", name.to_string()))
+        .bind(("f", file.to_string()))
+        .await
+        .expect("insert symbol");
+    }
+
+    async fn insert_call(db: &Surreal<Db>, from_fqn: &str, to_fqn: &str) {
+        db.query(format!(
+            "INSERT RELATION INTO calls {{ in: symbol:`⟨{from_fqn}⟩`, out: symbol:`⟨{to_fqn}⟩`, \
+             line: 1, in_file: 'f', out_file: 'f', in_name: '{from_fqn}', out_name: '{to_fqn}' }}"
+        ))
+        .await
+        .expect("insert call");
+    }
+
+    /// A hub called by many callers must be selected, and edges among the hub
+    /// set must appear. The degenerate-degree-query bug would yield ~1 node / 0 edges.
+    #[tokio::test]
+    async fn degree_seeded_hub_subgraph_returns_edges() {
+        let home = TempDir::new().unwrap();
+        let db = open_db(home.path(), "/test/call_graph").await.unwrap();
+
+        // hub <- c0..c9 (10 callers all calling the hub), plus c0 -> c1 (an
+        // edge between two non-hub callers to test induced edges among hubs).
+        insert_symbol(&db, "/a.cpp::hub", "/a.cpp", "hub").await;
+        for i in 0..10 {
+            let caller = format!("/a.cpp::c{i}");
+            insert_symbol(&db, &caller, "/a.cpp", &format!("c{i}")).await;
+            insert_call(&db, &caller, "/a.cpp::hub").await;
+        }
+        // Extra edge among callers so a hub set that includes c0 and c1 has an
+        // internal edge regardless of the hub itself.
+        insert_call(&db, "/a.cpp::c0", "/a.cpp::c1").await;
+
+        let graph = call_graph(&db, 100, 50).await.expect("call_graph");
+
+        // The hub (degree 10) must be a node.
+        assert!(
+            graph.nodes.iter().any(|n| n.id == "/a.cpp::hub"),
+            "highest-degree symbol 'hub' must be in the node set; got {:?}",
+            graph.nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
+        );
+        // Edges must be non-empty (the core regression: 0 edges).
+        assert!(
+            !graph.edges.is_empty(),
+            "degree-seeded subgraph must yield edges, got 0"
+        );
+        // Every edge endpoint must be a node in the graph (internal consistency).
+        let ids: std::collections::HashSet<&String> = graph.nodes.iter().map(|n| &n.id).collect();
+        for e in &graph.edges {
+            assert!(ids.contains(&e.source), "edge source {} not in nodes", e.source);
+            assert!(ids.contains(&e.target), "edge target {} not in nodes", e.target);
+        }
+        // The 10 caller->hub edges must be present.
+        let hub_in_edges = graph.edges.iter().filter(|e| e.target == "/a.cpp::hub").count();
+        assert_eq!(hub_in_edges, 10, "all 10 caller->hub edges must appear");
+    }
+
+    /// Empty `calls` table → empty graph, not an error.
+    #[tokio::test]
+    async fn empty_calls_yields_empty_graph() {
+        let home = TempDir::new().unwrap();
+        let db = open_db(home.path(), "/test/call_graph_empty").await.unwrap();
+        let graph = call_graph(&db, 100, 50).await.expect("call_graph");
+        assert!(graph.nodes.is_empty() && graph.edges.is_empty());
+        assert!(!graph.truncated);
+    }
+
+    /// Multiple call SITES for the same caller→callee pair (one row per source
+    /// line) must collapse to a SINGLE graph edge. Regression for the LIMIT-on-raw
+    /// -rows defect: the `calls` relation stores one row per call site, so without
+    /// `GROUP BY in_name, out_name` the edge_limit budget was spent on duplicate
+    /// rows and the visible distinct-edge count fell far below the cap.
+    #[tokio::test]
+    async fn duplicate_call_sites_collapse_to_one_edge() {
+        let home = TempDir::new().unwrap();
+        let db = open_db(home.path(), "/test/call_graph_dup").await.unwrap();
+
+        insert_symbol(&db, "/a.cpp::caller", "/a.cpp", "caller").await;
+        insert_symbol(&db, "/a.cpp::callee", "/a.cpp", "callee").await;
+        // Make both qualify as hubs by giving them several distinct partners,
+        // then add 5 duplicate caller->callee SITES at different lines.
+        for i in 0..3 {
+            let other = format!("/a.cpp::o{i}");
+            insert_symbol(&db, &other, "/a.cpp", &format!("o{i}")).await;
+            insert_call(&db, &other, "/a.cpp::caller").await;
+            insert_call(&db, "/a.cpp::callee", &other).await;
+        }
+        for line in 1..=5 {
+            db.query(format!(
+                "INSERT RELATION INTO calls {{ in: symbol:`⟨/a.cpp::caller⟩`, \
+                 out: symbol:`⟨/a.cpp::callee⟩`, line: {line}, in_file: 'f', out_file: 'f', \
+                 in_name: '/a.cpp::caller', out_name: '/a.cpp::callee' }}"
+            ))
+            .await
+            .expect("insert dup call site");
+        }
+
+        let graph = call_graph(&db, 600, 50).await.expect("call_graph");
+        let caller_callee = graph
+            .edges
+            .iter()
+            .filter(|e| e.source == "/a.cpp::caller" && e.target == "/a.cpp::callee")
+            .count();
+        assert_eq!(
+            caller_callee, 1,
+            "5 duplicate call sites must collapse to exactly 1 edge, got {caller_callee}"
+        );
     }
 }

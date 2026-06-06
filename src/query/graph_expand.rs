@@ -23,6 +23,10 @@ pub struct ExpandedChunk {
 
 #[derive(Deserialize)]
 struct SymbolRow {
+    /// Full FQN from `meta::id(id)` (file::scope::name), used as the BFS seed key.
+    /// Matches the stored `calls.in_name` / `out_name` form so methods resolve.
+    #[serde(default)]
+    fqn: String,
     file: String,
     name: String,
     line_start: i64,
@@ -97,7 +101,7 @@ pub async fn graph_expand(
 
         let mut queue: Vec<(String, f32, usize)> = overlapping
             .iter()
-            .map(|s| (build_fqn(&s.file, &s.name), base_chunk.score, 0))
+            .map(|s| (strip_id_brackets(&s.fqn), base_chunk.score, 0))
             .collect();
 
         while let Some((fqn, score, depth)) = queue.pop() {
@@ -155,8 +159,14 @@ pub async fn graph_expand(
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
-fn build_fqn(file: &str, name: &str) -> String {
-    format!("{}::{}", file, name)
+/// Strip the SurrealDB complex-ID wrapper `⟨…⟩` returned by `meta::id(id)`.
+/// A record id `symbol:⟨/foo.cpp::Bar::baz⟩` projects as `⟨/foo.cpp::Bar::baz⟩`;
+/// this recovers the plain FQN that `calls.in_name` / `out_name` store.
+fn strip_id_brackets(id: &str) -> String {
+    id.strip_prefix("⟨")
+        .and_then(|s| s.strip_suffix("⟩"))
+        .unwrap_or(id)
+        .to_string()
 }
 
 async fn query_overlapping_symbols(
@@ -167,7 +177,7 @@ async fn query_overlapping_symbols(
 ) -> Result<Vec<SymbolRow>> {
     let rows: Vec<SymbolRow> = db
         .query(
-            "SELECT file, name, line_start, line_end FROM symbol \
+            "SELECT meta::id(id) AS fqn, file, name, line_start, line_end FROM symbol \
              WHERE file = $file AND line_start <= $chunk_end AND line_end >= $chunk_start",
         )
         .bind(("file", file.to_string()))
@@ -258,16 +268,21 @@ async fn fetch_chunk_for_fqn(
     score: f32,
     base_keys: &HashSet<(String, u32, u32)>,
 ) -> Option<ExpandedChunk> {
-    let name = fqn.rsplit("::").next().unwrap_or(fqn);
-    let file_prefix = &fqn[..fqn.rfind("::").unwrap_or(fqn.len())];
+    // Resolve by full record id (the symbol id IS the FQN). This avoids the old
+    // `rfind("::")` split, which mis-derived file_prefix for methods/namespaced
+    // symbols (e.g. "x.cpp::Foo::bar" → file "x.cpp::Foo", matching no file) and
+    // silently dropped every method-target expansion.
+    let thing = surrealdb::sql::Thing::from((
+        "symbol",
+        surrealdb::sql::Id::String(fqn.to_string()),
+    ));
 
     let sym_rows: Vec<SymbolRow> = db
         .query(
-            "SELECT file, name, line_start, line_end FROM symbol \
-             WHERE name = $name AND file = $file LIMIT 1",
+            "SELECT meta::id(id) AS fqn, file, name, line_start, line_end FROM symbol \
+             WHERE id = $thing LIMIT 1",
         )
-        .bind(("name", name.to_string()))
-        .bind(("file", file_prefix.to_string()))
+        .bind(("thing", thing))
         .await
         .ok()?
         .take(0)
