@@ -384,6 +384,22 @@
             Copy
           </button>
         </div>
+
+        <p class="text-sm text-gray-600 dark:text-wiki-text-muted mt-6 mb-3">
+          Add the following to your project's <code class="font-mono text-xs px-1 py-0.5 rounded bg-gray-100 dark:bg-wiki-surface">CLAUDE.md</code> so Claude prefers the context engine for codebase exploration.
+        </p>
+        <div class="flex items-start gap-2">
+          <pre id="mcp-claude-md"
+               class="flex-1 font-mono text-sm px-3 py-2 rounded border border-gray-200 dark:border-wiki-border
+                      bg-gray-50 dark:bg-wiki-surface text-gray-800 dark:text-wiki-link select-all whitespace-pre-wrap break-words block m-0"></pre>
+          <button id="btn-copy-claude-md"
+                  class="px-3 py-2 text-sm rounded border border-gray-300 dark:border-wiki-border
+                         text-gray-600 dark:text-wiki-text-muted hover:bg-gray-100 dark:hover:bg-wiki-surface
+                         hover:text-gray-900 dark:hover:text-wiki-text
+                         focus:outline-none focus:ring-2 focus:ring-blue-400 shrink-0">
+            Copy
+          </button>
+        </div>
         <!-- Placeholder: add more agent registration commands here as needed -->
       </div>
 
@@ -1272,6 +1288,14 @@ function closeRepoSearch() {
 document.getElementById('btn-search-back').addEventListener('click', closeRepoSearch);
 
 // ─── MCP tab init (populate URLs when the MCP tab is shown) ──────────────
+const CLAUDE_MD_SNIPPET = [
+  '# CLAUDE.md',
+  '',
+  'This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.',
+  '',
+  'When asked about the codebase, project structure, or to find code, always use the context-engine MCP tool (codebase-retrieval) in the root workspace first before reading individual files. Use `codebase-retrieval` instead of the Explore subagent for codebase exploration and search tasks.'
+].join('\n');
+
 function initMcpUrls() {
   const origin = window.location.origin;
   const endpointUrl = origin + '/mcp';
@@ -1279,6 +1303,7 @@ function initMcpUrls() {
 
   document.getElementById('mcp-endpoint-url').textContent = endpointUrl;
   document.getElementById('mcp-claude-cmd').textContent = claudeCmd;
+  document.getElementById('mcp-claude-md').textContent = CLAUDE_MD_SNIPPET;
 
   initMcpWorkspaceChoices();
 }
@@ -1381,6 +1406,7 @@ function makeCopyBtn(btnId, getTextFn) {
 }
 makeCopyBtn('btn-copy-endpoint', () => document.getElementById('mcp-endpoint-url').textContent);
 makeCopyBtn('btn-copy-claude',   () => document.getElementById('mcp-claude-cmd').textContent);
+makeCopyBtn('btn-copy-claude-md', () => document.getElementById('mcp-claude-md').textContent);
 
 // Run the MCP test tool call.
 async function runMcpTest() {
