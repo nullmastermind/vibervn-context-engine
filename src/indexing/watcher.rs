@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use notify::{RecommendedWatcher, RecursiveMode};
-use notify_debouncer_full::{DebounceEventResult, Debouncer, FileIdMap, new_debouncer};
+use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
 use tokio::sync::mpsc::Sender;
 use tracing::{error, info, warn};
 
@@ -20,7 +20,10 @@ pub async fn start_watcher(repo_path: String, tx: Sender<IndexTrigger>) {
     let tx_watcher = tx.clone();
     let repo_for_watcher = repo_path.clone();
 
-    let watcher_result: anyhow::Result<Debouncer<RecommendedWatcher, FileIdMap>> =
+    // `RecommendedCache` is a platform-conditional alias: `FileIdMap` on
+    // macOS/Windows, `NoCache` on Linux. Annotating it (rather than `FileIdMap`)
+    // is what `new_debouncer` actually returns, so this compiles on every target.
+    let watcher_result: anyhow::Result<Debouncer<RecommendedWatcher, RecommendedCache>> =
         (|| -> anyhow::Result<_> {
             let tx_inner = tx_watcher.clone();
             let repo_inner = repo_for_watcher.clone();
