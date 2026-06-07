@@ -27,8 +27,10 @@ async fn start_server(home: &TempDir) -> SocketAddr {
     // and the data files (rocksdb/, embeddings/) all live under it. Production
     // splits them, but the test harness only cares that data_dir is honored.
     let data_dir = home.path().to_path_buf();
+    let embeddings_dir = data_dir.join("embeddings");
     let index_engine = IndexEngine::start(
         data_dir.clone(),
+        embeddings_dir.clone(),
         &settings,
         repo_dbs.clone(),
         settings_handle.clone(),
@@ -37,6 +39,7 @@ async fn start_server(home: &TempDir) -> SocketAddr {
     let app = build_router(
         home.path().to_path_buf(),
         data_dir,
+        embeddings_dir,
         index_engine,
         repo_dbs,
         settings_handle,
@@ -69,8 +72,8 @@ async fn test_get_creates_default() {
 
     let body: serde_json::Value = res.json().await.expect("parse json");
 
-    // version should be CURRENT_VERSION (= 2 after the data_dir migration)
-    assert_eq!(body["version"], 2);
+    // version should be CURRENT_VERSION (= 3 after the data_dir + embeddings_dir migrations)
+    assert_eq!(body["version"], 3);
 
     // repos should be an empty array
     assert!(body["repos"].as_array().map(|a| a.is_empty()).unwrap_or(false));
@@ -145,7 +148,7 @@ async fn test_put_round_trips() {
     assert_eq!(get_body.repos, vec!["/home/user/myproject", "/home/user/other"]);
     assert_eq!(get_body.embedding.model, "voyage-code-3");
     assert_eq!(get_body.llm.rerank_model, "gemini-2.0-flash");
-    assert_eq!(get_body.version, 2);
+    assert_eq!(get_body.version, 3);
 }
 
 // ─── Test 3 (Unix only): file mode bits should be 0o600 ───────────────────

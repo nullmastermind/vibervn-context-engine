@@ -9,14 +9,14 @@ use serde_json::Value;
 use tempfile::NamedTempFile;
 
 /// Bump this when a new migration is appended to MIGRATIONS.
-pub const CURRENT_VERSION: u32 = 2;
+pub const CURRENT_VERSION: u32 = 3;
 
 /// Migration function type: transforms a JSON Value from version N to version N+1.
 pub type MigrationFn = fn(Value) -> Result<Value, ConfigError>;
 
 /// Ordered list of migration functions. Each entry migrates from version N to N+1,
 /// where N is the index into this slice (0-based, so index 0 = v1→v2, etc.).
-pub const MIGRATIONS: &[MigrationFn] = &[migrate_v1_to_v2];
+pub const MIGRATIONS: &[MigrationFn] = &[migrate_v1_to_v2, migrate_v2_to_v3];
 
 /// v1→v2: introduce `data_dir` (Option<PathBuf>). The body is a no-op stamp —
 /// `serde(default)` already handles missing fields on deserialize, but we
@@ -26,6 +26,20 @@ pub const MIGRATIONS: &[MigrationFn] = &[migrate_v1_to_v2];
 fn migrate_v1_to_v2(mut value: Value) -> Result<Value, ConfigError> {
     if let Value::Object(ref mut obj) = value {
         obj.entry("data_dir".to_string()).or_insert(Value::Null);
+    }
+    Ok(value)
+}
+
+/// v2→v3: introduce `embeddings_dir` (Option<PathBuf>). Same no-op stamp +
+/// forward-incompat tripwire rationale as v1→v2. `embeddings_dir` lets the
+/// content-addressed embedding cache live at its own location — typically a
+/// SHARED path across multiple instances, so identical code chunks are embedded
+/// once (the cache is concurrency-safe; only RocksDB needs per-instance
+/// isolation). `None` means the builtin default
+/// `~/.vibervn/context-engine/embeddings` (anchored to home, not `data_dir`).
+fn migrate_v2_to_v3(mut value: Value) -> Result<Value, ConfigError> {
+    if let Value::Object(ref mut obj) = value {
+        obj.entry("embeddings_dir".to_string()).or_insert(Value::Null);
     }
     Ok(value)
 }
@@ -143,8 +157,9 @@ pub struct Settings {
     #[serde(default = "default_vector_resident_cap_mb")]
     pub vector_resident_cap_mb: usize,
     /// User's preferred data directory base. RocksDB lives at
-    /// `<data_dir>/rocksdb/`, embedding cache at `<data_dir>/embeddings/`.
-    /// `settings.json` itself ALWAYS lives at
+    /// `<data_dir>/rocksdb/`. The embedding cache defaults to
+    /// `<data_dir>/embeddings/` but can be relocated independently via
+    /// `embeddings_dir`. `settings.json` itself ALWAYS lives at
     /// `~/.vibervn/context-engine/settings.json` regardless of this value.
     ///
     /// `None` means "use the builtin default" (`~/.vibervn/context-engine`),
@@ -157,6 +172,22 @@ pub struct Settings {
     /// consistent.
     #[serde(default)]
     pub data_dir: Option<PathBuf>,
+    /// Location of the content-addressed embedding cache root. The cache is
+    /// keyed by `md5(text) + model` (NOT by repo), is concurrency-safe (atomic
+    /// tempfile+rename writes), and therefore can be SHARED across multiple
+    /// instances so identical chunks are embedded once — unlike RocksDB, which
+    /// needs per-instance isolation.
+    ///
+    /// `None` means "use the builtin default" —
+    /// `~/.vibervn/context-engine/embeddings`, anchored to home (NOT to
+    /// `data_dir`) so multiple instances with different `--data-dir` values
+    /// share ONE cache by default.
+    /// Boot precedence: CLI flag > env `CONTEXT_ENGINE_EMBEDDINGS_DIR` >
+    /// `Settings.embeddings_dir` > `~/.vibervn/context-engine/embeddings`.
+    /// Like `data_dir`, this is boot-frozen: a PUT change persists for the next
+    /// launch only.
+    #[serde(default)]
+    pub embeddings_dir: Option<PathBuf>,
 }
 
 impl Default for Settings {
@@ -170,6 +201,7 @@ impl Default for Settings {
             mcp_stale_after_days: default_mcp_stale_after_days(),
             vector_resident_cap_mb: default_vector_resident_cap_mb(),
             data_dir: None,
+            embeddings_dir: None,
         }
     }
 }
@@ -231,6 +263,21 @@ pub fn config_path(home_dir: &Path) -> PathBuf {
 /// env var, or persisted `Settings.data_dir` is set.
 pub fn default_data_dir(home_dir: &Path) -> PathBuf {
     home_dir.join(".vibervn").join("context-engine")
+}
+
+/// Return the default embedding-cache root under `home_dir`
+/// (`~/.vibervn/context-engine/embeddings`).
+///
+/// Used as the lowest-precedence fallback in boot resolution when no CLI flag,
+/// env var, or persisted `Settings.embeddings_dir` is set. Anchored to
+/// `home_dir` (NOT the resolved `data_dir`) on purpose: the content-addressed
+/// cache is concurrency-safe and meant to be shared, so multiple instances
+/// running with different `--data-dir` values share ONE cache by default —
+/// identical chunks are embedded once. A pure default install (no flags) still
+/// lands at `~/.vibervn/context-engine/embeddings`, byte-identical to the
+/// historical layout, because `default_data_dir(home)` is the same base.
+pub fn default_embeddings_dir(home_dir: &Path) -> PathBuf {
+    default_data_dir(home_dir).join("embeddings")
 }
 
 // ─── Atomic write ──────────────────────────────────────────────────────────
@@ -419,26 +466,28 @@ mod tests {
         }
     }
 
-    /// Default Settings carries `data_dir == None`, signalling "use the builtin
-    /// default at boot". An explicit `Some(path)` represents a frozen user
-    /// choice and changes the lowest-precedence fallback in main.rs.
+    /// Default Settings carries `data_dir == None` and `embeddings_dir == None`,
+    /// signalling "use the builtin defaults at boot". An explicit `Some(path)`
+    /// represents a frozen user choice and changes boot resolution in main.rs.
     #[test]
     fn test_data_dir_default_is_none() {
         let s = Settings::default();
         assert!(s.data_dir.is_none(), "default data_dir must be None");
+        assert!(s.embeddings_dir.is_none(), "default embeddings_dir must be None");
         assert_eq!(s.version, CURRENT_VERSION);
     }
 
-    /// v1 → v2 migration: stamps an explicit `null` for the new `data_dir`
-    /// field and bumps the version, so an old v1 binary refuses the file
-    /// (VersionTooNew) instead of silently dropping the field on the next save.
+    /// v1 → … → CURRENT migration starting from a v1 file: stamps explicit
+    /// `null` for every field added since v1 (`data_dir`, `embeddings_dir`) and
+    /// advances the version, so an old binary refuses the file (VersionTooNew)
+    /// instead of silently dropping fields on the next save.
     #[test]
     fn test_v1_to_v2_migration_stamps_null_data_dir() {
         let home = TempDir::new().expect("tempdir");
         let path = config_path(home.path());
         fs::create_dir_all(path.parent().expect("has parent")).expect("create dirs");
 
-        // Write a valid v1 settings.json (no data_dir field).
+        // Write a valid v1 settings.json (no data_dir / embeddings_dir fields).
         let v1 = r#"{
             "version": 1,
             "repos": [],
@@ -447,26 +496,66 @@ mod tests {
         }"#;
         fs::write(&path, v1).expect("write v1 settings.json");
 
-        // Load: should run the v1→v2 migration.
+        // Load: should run the full migration chain (v1→v2→v3).
         let loaded = ensure_dir_and_load(home.path()).expect("load v1");
         assert_eq!(loaded.version, CURRENT_VERSION);
         assert!(loaded.data_dir.is_none(), "data_dir should be None after migration");
+        assert!(loaded.embeddings_dir.is_none(), "embeddings_dir should be None after migration");
 
-        // The on-disk file must now report version 2 with an explicit data_dir
-        // field set to null — the tripwire that prevents an older binary from
-        // silently re-reading and re-saving without the new field.
+        // The on-disk file must now report CURRENT_VERSION with explicit null
+        // fields — the tripwire that prevents an older binary from silently
+        // re-reading and re-saving without the new fields.
         let raw = fs::read_to_string(&path).expect("re-read");
         let v: Value = serde_json::from_str(&raw).expect("parse re-read");
-        assert_eq!(v.get("version").and_then(|x| x.as_u64()), Some(2));
+        assert_eq!(v.get("version").and_then(|x| x.as_u64()), Some(CURRENT_VERSION as u64));
         assert!(
             v.get("data_dir").map(|x| x.is_null()).unwrap_or(false),
             "on-disk data_dir should be explicit null after migration, got: {:?}",
             v.get("data_dir")
         );
+        assert!(
+            v.get("embeddings_dir").map(|x| x.is_null()).unwrap_or(false),
+            "on-disk embeddings_dir should be explicit null after migration, got: {:?}",
+            v.get("embeddings_dir")
+        );
     }
 
-    /// Round-trip: an explicit `data_dir` value survives serialize+deserialize
-    /// and is preserved on subsequent loads (no spurious migration).
+    /// v2 → v3 migration in isolation: a v2 file (already has `data_dir`, lacks
+    /// `embeddings_dir`) gains an explicit `embeddings_dir: null` and bumps to v3.
+    #[test]
+    fn test_v2_to_v3_migration_stamps_null_embeddings_dir() {
+        let home = TempDir::new().expect("tempdir");
+        let path = config_path(home.path());
+        fs::create_dir_all(path.parent().expect("has parent")).expect("create dirs");
+
+        // Valid v2 file: data_dir present (explicit value), no embeddings_dir.
+        let v2 = r#"{
+            "version": 2,
+            "repos": [],
+            "embedding": {"provider":"voyage","model":"voyage-4-lite","api_keys":[]},
+            "llm": {"provider":"google","rerank_model":"gemini-3.1-flash-lite","api_keys":[]},
+            "data_dir": "/var/data/instance-A"
+        }"#;
+        fs::write(&path, v2).expect("write v2 settings.json");
+
+        let loaded = ensure_dir_and_load(home.path()).expect("load v2");
+        assert_eq!(loaded.version, CURRENT_VERSION);
+        // v2→v3 must NOT disturb the existing data_dir value.
+        assert_eq!(loaded.data_dir, Some(PathBuf::from("/var/data/instance-A")));
+        assert!(loaded.embeddings_dir.is_none(), "embeddings_dir should be None (null) after v2→v3");
+
+        let raw = fs::read_to_string(&path).expect("re-read");
+        let v: Value = serde_json::from_str(&raw).expect("parse re-read");
+        assert_eq!(v.get("version").and_then(|x| x.as_u64()), Some(3));
+        assert!(
+            v.get("embeddings_dir").map(|x| x.is_null()).unwrap_or(false),
+            "on-disk embeddings_dir should be explicit null after v2→v3, got: {:?}",
+            v.get("embeddings_dir")
+        );
+    }
+
+    /// Round-trip: explicit `data_dir` and `embeddings_dir` values survive
+    /// serialize+deserialize and are preserved on subsequent loads.
     #[test]
     fn test_data_dir_explicit_value_round_trips() {
         let home = TempDir::new().expect("tempdir");
@@ -474,14 +563,17 @@ mod tests {
         fs::create_dir_all(path.parent().expect("has parent")).expect("create dirs");
 
         let custom = PathBuf::from("/var/data/instance-A");
+        let custom_emb = PathBuf::from("/shared/embeddings");
         let s = Settings {
             data_dir: Some(custom.clone()),
+            embeddings_dir: Some(custom_emb.clone()),
             ..Settings::default()
         };
         write_settings_atomic(&path, &s).expect("write");
 
         let loaded = ensure_dir_and_load(home.path()).expect("load");
         assert_eq!(loaded.data_dir, Some(custom));
+        assert_eq!(loaded.embeddings_dir, Some(custom_emb));
         assert_eq!(loaded.version, CURRENT_VERSION);
     }
 
@@ -496,6 +588,21 @@ mod tests {
             dd,
             home.path().join(".vibervn").join("context-engine"),
             "default data_dir must match historical layout for byte-identical default install"
+        );
+    }
+
+    /// `default_embeddings_dir` is anchored to `home_dir`
+    /// (`~/.vibervn/context-engine/embeddings`), NOT to the resolved data_dir,
+    /// so instances with different data dirs share one cache by default. A pure
+    /// default install still matches the historical layout.
+    #[test]
+    fn test_default_embeddings_dir_layout() {
+        let home = TempDir::new().expect("tempdir");
+        let ed = default_embeddings_dir(home.path());
+        assert_eq!(
+            ed,
+            home.path().join(".vibervn").join("context-engine").join("embeddings"),
+            "default embeddings_dir must match historical layout for byte-identical default install"
         );
     }
 }

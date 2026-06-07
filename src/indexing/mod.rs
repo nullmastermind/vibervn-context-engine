@@ -98,11 +98,17 @@ impl ProgressHandle {
 /// Stored in `AppState` and shared via `Arc`.
 pub struct IndexEngine {
     /// Boot-resolved data directory base (CLI > env > `Settings.data_dir` >
-    /// builtin default). Captured ONCE at startup; the indexer/store/cache
-    /// paths are derived from this. **Never re-read from `Settings` mid-run** —
+    /// builtin default). Captured ONCE at startup; the indexer/store paths are
+    /// derived from this. **Never re-read from `Settings` mid-run** —
     /// already-open RocksDB handles in `repo_dbs` and resident vector shards
     /// are bound to this path; switching would split-brain reads against writes.
     pub data_dir: PathBuf,
+    /// Boot-resolved embedding-cache root (precedence: CLI, env
+    /// `CONTEXT_ENGINE_EMBEDDINGS_DIR`, `Settings.embeddings_dir`, then
+    /// `<data_dir>/embeddings`). Separate from `data_dir` because the cache is
+    /// content-addressed and concurrency-safe, so it can be SHARED across
+    /// instances (only RocksDB needs per-instance isolation). Boot-frozen.
+    pub embeddings_dir: PathBuf,
     /// Per-repo status map, keyed by repo path string.
     /// Wrapped in Arc so `ProgressHandle` can hold a reference without borrowing self.
     pub statuses: Arc<RwLock<HashMap<String, RepoStatus>>>,
@@ -242,6 +248,7 @@ impl IndexEngine {
     /// and other config added after boot are picked up on the next run.
     pub async fn start(
         data_dir: PathBuf,
+        embeddings_dir: PathBuf,
         settings: &Settings,
         repo_dbs: RepoDbMap,
         settings_handle: Arc<RwLock<Settings>>,
@@ -267,6 +274,7 @@ impl IndexEngine {
 
         let engine = Arc::new(IndexEngine {
             data_dir: data_dir.clone(),
+            embeddings_dir,
             statuses: Arc::new(RwLock::new(HashMap::new())),
             repo_locks: Mutex::new(HashMap::new()),
             trigger_tx: trigger_tx.clone(),
@@ -703,7 +711,7 @@ async fn run_consumer(
             // different model configurations get isolated cache directories.
             let embed_cache = if let Some(ref client) = voyage_client {
                 crate::embedding::cache::EmbeddingCache::new(
-                    &engine_ref.data_dir,
+                    &engine_ref.embeddings_dir,
                     client.model(),
                 )
             } else {
@@ -924,6 +932,7 @@ mod load_repos_tests {
         let settings_handle = Arc::new(RwLock::new(settings.clone()));
         let engine = IndexEngine::start(
             home.path().to_path_buf(),
+            home.path().join("embeddings"),
             &settings,
             repo_dbs.clone(),
             settings_handle,

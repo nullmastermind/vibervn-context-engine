@@ -79,12 +79,17 @@ pub struct AppState {
     /// the bootstrap notes on `Settings.data_dir`).
     pub home_dir: PathBuf,
     /// Boot-resolved data directory (CLI > env > `Settings.data_dir` > builtin
-    /// default). Used for store + embedding cache + defender paths. Captured
-    /// once at startup; **never re-read from `Settings` at runtime** so
-    /// already-open RocksDB handles in `repo_dbs` and resident vector shards
-    /// stay consistent. PUT /api/config that changes `data_dir` only affects
-    /// the next launch.
+    /// default). Used for store + defender paths. Captured once at startup;
+    /// **never re-read from `Settings` at runtime** so already-open RocksDB
+    /// handles in `repo_dbs` and resident vector shards stay consistent. PUT
+    /// /api/config that changes `data_dir` only affects the next launch.
     pub data_dir: PathBuf,
+    /// Boot-resolved embedding-cache root (precedence: CLI, env
+    /// `CONTEXT_ENGINE_EMBEDDINGS_DIR`, `Settings.embeddings_dir`, then
+    /// `<data_dir>/embeddings`). Used for the cache-purge endpoint. Separate
+    /// from `data_dir` so the content-addressed cache can be shared across
+    /// instances. Boot-frozen, like `data_dir`.
+    pub embeddings_dir: PathBuf,
     /// Shared index engine.
     pub index_engine: Arc<IndexEngine>,
     /// Per-repo SurrealDB handles, keyed by repo path.
@@ -99,6 +104,7 @@ pub struct AppState {
 pub fn build_router(
     home_dir: PathBuf,
     data_dir: PathBuf,
+    embeddings_dir: PathBuf,
     index_engine: Arc<IndexEngine>,
     repo_dbs: Arc<RwLock<HashMap<String, Surreal<Db>>>>,
     settings: Arc<RwLock<crate::config::Settings>>,
@@ -107,6 +113,7 @@ pub fn build_router(
     let state = AppState {
         home_dir: home_dir.clone(),
         data_dir: data_dir.clone(),
+        embeddings_dir,
         index_engine: index_engine.clone(),
         repo_dbs: repo_dbs.clone(),
         settings: settings.clone(),
@@ -322,6 +329,25 @@ async fn put_config(
             active = %state.data_dir.display(),
             "data_dir change persisted to settings.json; takes effect on next launch \
              (current process continues using the boot-resolved path)"
+        );
+    }
+
+    // (4b) Same boot-frozen treatment for embeddings_dir. The default is
+    // anchored to home (`~/.vibervn/context-engine/embeddings`), matching how
+    // boot resolution computes it — NOT derived from the configured data_dir.
+    // A mismatch is lower-risk than data_dir (a cache-root switch only causes
+    // cache misses, not split-brain), but the running process still keeps its
+    // boot path, so we log it for parity and operator clarity.
+    let configured_emb = saved
+        .embeddings_dir
+        .clone()
+        .unwrap_or_else(|| crate::config::default_embeddings_dir(&state.home_dir));
+    if configured_emb != state.embeddings_dir {
+        tracing::warn!(
+            requested = %configured_emb.display(),
+            active = %state.embeddings_dir.display(),
+            "embeddings_dir change persisted to settings.json; takes effect on next launch \
+             (current process continues using the boot-resolved cache root)"
         );
     }
 
@@ -872,9 +898,9 @@ async fn delete_embedding_cache(
         }
     };
 
-    let data_dir = state.data_dir.clone();
+    let embeddings_dir = state.embeddings_dir.clone();
     let result = tokio::task::spawn_blocking(move || {
-        crate::embedding::cache::EmbeddingCache::purge_global(&data_dir, older_than)
+        crate::embedding::cache::EmbeddingCache::purge_global(&embeddings_dir, older_than)
     })
     .await;
 

@@ -19,20 +19,21 @@ pub struct EmbeddingCache {
 }
 
 impl EmbeddingCache {
-    /// Construct a new cache rooted at `data_dir/embeddings/{model}/`.
+    /// Construct a new cache rooted at `embeddings_dir/{model}/`.
     ///
-    /// `data_dir` is the boot-resolved data directory (CLI > env >
-    /// `Settings.data_dir` > builtin default). Captured once at startup —
-    /// MUST NOT be re-derived from `Settings` mid-run.
+    /// `embeddings_dir` is the boot-resolved embedding-cache root (CLI > env >
+    /// `Settings.embeddings_dir` > `<data_dir>/embeddings`) — the FULL root, not
+    /// a base to append `embeddings` to. Captured once at startup; MUST NOT be
+    /// re-derived from `Settings` mid-run.
     ///
     /// Returns `None` if the directory cannot be created, so callers can
     /// degrade gracefully (pipeline still works, just with no cache).
-    pub fn new(data_dir: &Path, model: &str) -> Option<Self> {
+    pub fn new(embeddings_dir: &Path, model: &str) -> Option<Self> {
         let sanitized: String = model
             .chars()
             .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
             .collect();
-        let cache_dir = data_dir.join("embeddings").join(&sanitized);
+        let cache_dir = embeddings_dir.join(&sanitized);
 
         if let Err(e) = std::fs::create_dir_all(&cache_dir) {
             warn!(path = %cache_dir.display(), error = %e, "embedding cache: failed to create cache dir; disabling cache");
@@ -176,10 +177,10 @@ impl EmbeddingCache {
     }
 
     /// Purge cache entries across ALL model subdirectories under
-    /// `data_dir/embeddings/`.
+    /// `embeddings_dir/`.
     ///
-    /// `data_dir` is the boot-resolved data directory (CLI > env >
-    /// `Settings.data_dir` > builtin default).
+    /// `embeddings_dir` is the boot-resolved embedding-cache root (CLI > env >
+    /// `Settings.embeddings_dir` > `<data_dir>/embeddings`) — the FULL root.
     ///
     /// - `older_than = None`  → delete all `.bin` files.
     /// - `older_than = Some(d)` → delete `.bin` files whose mtime is older than
@@ -187,8 +188,8 @@ impl EmbeddingCache {
     ///
     /// Empty shard directories are removed after file deletion (best-effort).
     /// Returns the count of deleted files and the count of errors.
-    pub fn purge_global(data_dir: &Path, older_than: Option<std::time::Duration>) -> PurgeResult {
-        let root = data_dir.join("embeddings");
+    pub fn purge_global(embeddings_dir: &Path, older_than: Option<std::time::Duration>) -> PurgeResult {
+        let root = embeddings_dir.to_path_buf();
 
         if !root.exists() {
             return PurgeResult { deleted: 0, errors: 0 };

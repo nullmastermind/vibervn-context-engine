@@ -7,7 +7,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use context_engine_rs::{
-    config::{default_data_dir, ensure_dir_and_load},
+    config::{default_data_dir, default_embeddings_dir, ensure_dir_and_load},
     indexing::IndexEngine,
     server, store,
 };
@@ -37,6 +37,18 @@ struct Cli {
     /// collision.
     #[arg(long, env = "CONTEXT_ENGINE_DATA_DIR")]
     data_dir: Option<PathBuf>,
+
+    /// Embedding-cache root. The content-addressed cache (keyed by chunk text +
+    /// model, NOT by repo) is concurrency-safe, so multiple instances can SHARE
+    /// one cache and avoid re-embedding identical chunks — only RocksDB needs
+    /// per-instance isolation.
+    ///
+    /// Boot precedence: this flag > env `CONTEXT_ENGINE_EMBEDDINGS_DIR` >
+    /// `Settings.embeddings_dir` > `~/.vibervn/context-engine/embeddings`
+    /// (anchored to home, so instances with different `--data-dir` share one
+    /// cache by default).
+    #[arg(long, env = "CONTEXT_ENGINE_EMBEDDINGS_DIR")]
+    embeddings_dir: Option<PathBuf>,
 }
 
 /// Pin bounded RocksDB memory settings unless the operator has overridden them.
@@ -142,6 +154,35 @@ async fn main() {
     }
     info!(data_dir = %data_dir.display(), "data_dir resolved");
 
+    // Resolve embeddings_dir with its own precedence:
+    //   CLI flag > env CONTEXT_ENGINE_EMBEDDINGS_DIR > Settings.embeddings_dir
+    //   > ~/.vibervn/context-engine/embeddings (anchored to HOME, not data_dir).
+    // Anchoring the default to home — not the resolved data_dir — means multiple
+    // instances launched with different --data-dir values share ONE cache by
+    // default: the content-addressed cache is concurrency-safe, so sharing it
+    // avoids re-embedding identical chunks (only RocksDB needs per-instance
+    // isolation). A pure default install still lands at
+    // ~/.vibervn/context-engine/embeddings, byte-identical to before.
+    // Also boot-frozen. We do NOT fail-fast on a create_dir_all error here: the
+    // cache degrades gracefully (EmbeddingCache::new returns None and the
+    // pipeline runs without a cache), unlike RocksDB which must open — so a
+    // non-writable cache root should not block startup.
+    let embeddings_dir = cli
+        .embeddings_dir
+        .clone()
+        .or_else(|| settings.embeddings_dir.clone())
+        .unwrap_or_else(|| default_embeddings_dir(&home_dir));
+    if let Err(e) = std::fs::create_dir_all(&embeddings_dir) {
+        // Non-fatal: log and continue. The cache will retry create on first use
+        // and disable itself if it still cannot create the directory.
+        tracing::warn!(
+            embeddings_dir = %embeddings_dir.display(),
+            error = %e,
+            "could not pre-create embeddings dir; cache will retry lazily / degrade"
+        );
+    }
+    info!(embeddings_dir = %embeddings_dir.display(), "embeddings_dir resolved");
+
     // Wrap the loaded settings in a shared live handle so IndexEngine and the
     // HTTP server share a single source of truth that mutates on every PUT /api/config.
     let settings_handle = Arc::new(RwLock::new(settings));
@@ -161,6 +202,7 @@ async fn main() {
     // It receives the shared settings handle so the consumer picks up post-boot changes.
     let index_engine = IndexEngine::start(
         data_dir.clone(),
+        embeddings_dir.clone(),
         &boot_settings,
         repo_dbs.clone(),
         settings_handle.clone(),
@@ -178,6 +220,7 @@ async fn main() {
     let app = server::build_router(
         home_dir,
         data_dir,
+        embeddings_dir,
         index_engine,
         repo_dbs,
         settings_handle,
