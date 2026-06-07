@@ -32,6 +32,11 @@
   </script>
   <style>
     .font-wiki { font-family: 'Linux Libertine', 'Georgia', 'Times', serif; }
+    /* Suppress focus ring on mouse/touch interaction; keep it for keyboard nav (a11y). */
+    *:focus:not(:focus-visible) {
+      box-shadow: none !important;
+      outline: none !important;
+    }
     .cancel-state {
       border-color: #ef4444 !important;
       color: #ef4444 !important;
