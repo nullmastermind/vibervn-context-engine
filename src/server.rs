@@ -74,8 +74,17 @@ impl IntoResponse for ConfigError {
 
 #[derive(Clone)]
 pub struct AppState {
-    /// Resolved home directory, used to locate settings.json.
+    /// Resolved home directory. Used ONLY for `settings.json` access (its
+    /// location is fixed at `~/.vibervn/context-engine/settings.json` — see
+    /// the bootstrap notes on `Settings.data_dir`).
     pub home_dir: PathBuf,
+    /// Boot-resolved data directory (CLI > env > `Settings.data_dir` > builtin
+    /// default). Used for store + embedding cache + defender paths. Captured
+    /// once at startup; **never re-read from `Settings` at runtime** so
+    /// already-open RocksDB handles in `repo_dbs` and resident vector shards
+    /// stay consistent. PUT /api/config that changes `data_dir` only affects
+    /// the next launch.
+    pub data_dir: PathBuf,
     /// Shared index engine.
     pub index_engine: Arc<IndexEngine>,
     /// Per-repo SurrealDB handles, keyed by repo path.
@@ -89,16 +98,24 @@ pub struct AppState {
 
 pub fn build_router(
     home_dir: PathBuf,
+    data_dir: PathBuf,
     index_engine: Arc<IndexEngine>,
     repo_dbs: Arc<RwLock<HashMap<String, Surreal<Db>>>>,
     settings: Arc<RwLock<crate::config::Settings>>,
     bind_host: &str,
 ) -> Router {
-    let state = AppState { home_dir: home_dir.clone(), index_engine: index_engine.clone(), repo_dbs: repo_dbs.clone(), settings: settings.clone() };
+    let state = AppState {
+        home_dir: home_dir.clone(),
+        data_dir: data_dir.clone(),
+        index_engine: index_engine.clone(),
+        repo_dbs: repo_dbs.clone(),
+        settings: settings.clone(),
+    };
 
     // Build the StreamableHttpService for the /mcp endpoint.
     // The factory closure must return a fresh McpHandler per session.
     let mcp_home = home_dir.clone();
+    let mcp_data = data_dir.clone();
     let mcp_engine = index_engine.clone();
     let mcp_dbs = repo_dbs.clone();
     let mcp_settings = settings.clone();
@@ -123,6 +140,7 @@ pub fn build_router(
         move || {
             Ok(McpHandler::new(
                 mcp_home.clone(),
+                mcp_data.clone(),
                 mcp_engine.clone(),
                 mcp_dbs.clone(),
                 mcp_settings.clone(),
@@ -179,7 +197,7 @@ async fn acquire_repo_db_if_indexed(
     state: &AppState,
     repo: &str,
 ) -> Result<Option<Surreal<Db>>, Response> {
-    store::open_if_indexed(&state.repo_dbs, &state.home_dir, repo)
+    store::open_if_indexed(&state.repo_dbs, &state.data_dir, repo)
         .await
         .map_err(|e| {
             let body = json!({ "error": format!("failed to open index DB: {e}") });
@@ -287,6 +305,26 @@ async fn put_config(
         }
     }
 
+    // (4a) If the request changed `data_dir` to a value different from the
+    // boot-resolved path the running process is using, log a warning. The
+    // running process is INTENTIONALLY pinned to its boot path: open RocksDB
+    // handles in `repo_dbs` and resident vector shards are bound to it, so
+    // re-pointing mid-run would split-brain reads against writes (writes land
+    // in OLD DBs while a fresh `get_or_open` would land in NEW DBs). The new
+    // value is persisted for the next launch's boot resolution.
+    let configured = saved
+        .data_dir
+        .clone()
+        .unwrap_or_else(|| crate::config::default_data_dir(&state.home_dir));
+    if configured != state.data_dir {
+        tracing::warn!(
+            requested = %configured.display(),
+            active = %state.data_dir.display(),
+            "data_dir change persisted to settings.json; takes effect on next launch \
+             (current process continues using the boot-resolved path)"
+        );
+    }
+
     // (5) Return the saved settings JSON — same as before.
     Json(saved).into_response()
 }
@@ -370,7 +408,7 @@ async fn delete_repo_index(
     // detached cleaner could delete files out from under a freshly opened RocksDB
     // (or collide with the still-draining async LOCK release), producing the
     // repeating `open surrealdb` errors seen on re-index after "Remove Indexes".
-    let removed = store::remove_index_dir(&state.home_dir, &repo).await;
+    let removed = store::remove_index_dir(&state.data_dir, &repo).await;
 
     if removed {
         Json(json!({ "status": "ok" })).into_response()
@@ -437,7 +475,7 @@ async fn get_index_stats(
         // from index status), and no phantom DB is created by a read.
         Ok(None) => {
             let embedding_model = state.settings.read().await.embedding.model.clone();
-            let db_dir = store::db_path(&state.home_dir, &repo);
+            let db_dir = store::db_path(&state.data_dir, &repo);
             return Json(json!({
                 "repo": repo,
                 "files": 0,
@@ -480,7 +518,7 @@ async fn get_index_stats(
         None => (None, None),
     };
 
-    let db_dir = store::db_path(&state.home_dir, &repo);
+    let db_dir = store::db_path(&state.data_dir, &repo);
 
     // Take an owned snapshot of only what's needed — guard dropped before the Json call.
     let embedding_model = state.settings.read().await.embedding.model.clone();
@@ -735,6 +773,7 @@ async fn post_mcp_tool(
     let settings = state.settings.read().await.clone();
     let result = run_codebase_retrieval(
         &state.home_dir,
+        &state.data_dir,
         &state.index_engine,
         &state.repo_dbs,
         &settings,
@@ -833,9 +872,9 @@ async fn delete_embedding_cache(
         }
     };
 
-    let home_dir = state.home_dir.clone();
+    let data_dir = state.data_dir.clone();
     let result = tokio::task::spawn_blocking(move || {
-        crate::embedding::cache::EmbeddingCache::purge_global(&home_dir, older_than)
+        crate::embedding::cache::EmbeddingCache::purge_global(&data_dir, older_than)
     })
     .await;
 
@@ -851,12 +890,7 @@ async fn delete_embedding_cache(
 // ─── Windows Defender exclusion management ────────────────────────────────
 
 async fn get_defender_status(State(state): State<AppState>) -> Response {
-    let data_dir = state
-        .home_dir
-        .join(".vibervn")
-        .join("context-engine")
-        .to_string_lossy()
-        .to_string();
+    let data_dir = state.data_dir.to_string_lossy().to_string();
 
     let status =
         tokio::task::spawn_blocking(move || defender::check_status(&data_dir)).await;
@@ -871,12 +905,7 @@ async fn get_defender_status(State(state): State<AppState>) -> Response {
 }
 
 async fn post_defender_exclude(State(state): State<AppState>) -> Response {
-    let data_dir = state
-        .home_dir
-        .join(".vibervn")
-        .join("context-engine")
-        .to_string_lossy()
-        .to_string();
+    let data_dir = state.data_dir.to_string_lossy().to_string();
 
     let result =
         tokio::task::spawn_blocking(move || defender::add_exclusions(&data_dir)).await;

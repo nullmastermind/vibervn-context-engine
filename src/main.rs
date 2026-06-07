@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -5,7 +6,11 @@ use tokio::sync::RwLock;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use context_engine_rs::{config::ensure_dir_and_load, indexing::IndexEngine, server, store};
+use context_engine_rs::{
+    config::{default_data_dir, ensure_dir_and_load},
+    indexing::IndexEngine,
+    server, store,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "context-engine", about = "Context Engine settings server")]
@@ -17,6 +22,21 @@ struct Cli {
     /// Bind address [env: CONTEXT_ENGINE_BIND]
     #[arg(long, env = "CONTEXT_ENGINE_BIND")]
     bind: Option<String>,
+
+    /// Data directory base. RocksDB lives at `<data_dir>/rocksdb/`, embedding
+    /// cache at `<data_dir>/embeddings/`. settings.json itself stays at
+    /// `~/.vibervn/context-engine/settings.json` regardless of this value.
+    ///
+    /// Boot precedence: this flag > env `CONTEXT_ENGINE_DATA_DIR` >
+    /// `Settings.data_dir` (in settings.json) > builtin default
+    /// (`~/.vibervn/context-engine`).
+    ///
+    /// Use this to run multiple isolated instances simultaneously: RocksDB
+    /// takes an exclusive per-directory lock, so two instances sharing one
+    /// data dir will fail to open. Pointing each at its own dir avoids the
+    /// collision.
+    #[arg(long, env = "CONTEXT_ENGINE_DATA_DIR")]
+    data_dir: Option<PathBuf>,
 }
 
 /// Pin bounded RocksDB memory settings unless the operator has overridden them.
@@ -100,6 +120,28 @@ async fn main() {
         }
     };
 
+    // Resolve data_dir with the documented precedence:
+    //   CLI flag > env CONTEXT_ENGINE_DATA_DIR > Settings.data_dir > builtin default.
+    // (clap collapses CLI > env into `cli.data_dir`.) The resolved value is
+    // captured ONCE here and threaded into IndexEngine + AppState; it is never
+    // re-read from `Settings` at runtime, so a PUT /api/config that changes
+    // data_dir mid-run does NOT close existing RocksDB handles or evict warmed
+    // shards — that change takes effect on the next launch.
+    let data_dir = cli
+        .data_dir
+        .clone()
+        .or_else(|| settings.data_dir.clone())
+        .unwrap_or_else(|| default_data_dir(&home_dir));
+
+    if let Err(e) = std::fs::create_dir_all(&data_dir) {
+        eprintln!(
+            "error: could not create data directory {}: {e}",
+            data_dir.display()
+        );
+        std::process::exit(2);
+    }
+    info!(data_dir = %data_dir.display(), "data_dir resolved");
+
     // Wrap the loaded settings in a shared live handle so IndexEngine and the
     // HTTP server share a single source of truth that mutates on every PUT /api/config.
     let settings_handle = Arc::new(RwLock::new(settings));
@@ -118,7 +160,7 @@ async fn main() {
     // It shares `repo_dbs` so indexer writes land in the handles the server reads.
     // It receives the shared settings handle so the consumer picks up post-boot changes.
     let index_engine = IndexEngine::start(
-        home_dir.clone(),
+        data_dir.clone(),
         &boot_settings,
         repo_dbs.clone(),
         settings_handle.clone(),
@@ -133,7 +175,14 @@ async fn main() {
             std::process::exit(2);
         });
 
-    let app = server::build_router(home_dir, index_engine, repo_dbs, settings_handle, &bind);
+    let app = server::build_router(
+        home_dir,
+        data_dir,
+        index_engine,
+        repo_dbs,
+        settings_handle,
+        &bind,
+    );
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await

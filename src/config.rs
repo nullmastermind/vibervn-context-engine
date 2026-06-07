@@ -9,15 +9,26 @@ use serde_json::Value;
 use tempfile::NamedTempFile;
 
 /// Bump this when a new migration is appended to MIGRATIONS.
-pub const CURRENT_VERSION: u32 = 1;
+pub const CURRENT_VERSION: u32 = 2;
 
 /// Migration function type: transforms a JSON Value from version N to version N+1.
 pub type MigrationFn = fn(Value) -> Result<Value, ConfigError>;
 
 /// Ordered list of migration functions. Each entry migrates from version N to N+1,
 /// where N is the index into this slice (0-based, so index 0 = v1→v2, etc.).
-/// Currently empty because CURRENT_VERSION == 1 and no prior versions exist.
-pub const MIGRATIONS: &[MigrationFn] = &[];
+pub const MIGRATIONS: &[MigrationFn] = &[migrate_v1_to_v2];
+
+/// v1→v2: introduce `data_dir` (Option<PathBuf>). The body is a no-op stamp —
+/// `serde(default)` already handles missing fields on deserialize, but we
+/// persist an explicit `null` and bump the file's `version` so that an older
+/// v1 binary refuses to read this file (VersionTooNew) instead of silently
+/// dropping the new field on the next save.
+fn migrate_v1_to_v2(mut value: Value) -> Result<Value, ConfigError> {
+    if let Value::Object(ref mut obj) = value {
+        obj.entry("data_dir".to_string()).or_insert(Value::Null);
+    }
+    Ok(value)
+}
 
 // ─── Settings ──────────────────────────────────────────────────────────────
 
@@ -131,6 +142,21 @@ pub struct Settings {
     /// repos when exceeded. 0 disables the cap. Defaults to 2048 (~2 GB).
     #[serde(default = "default_vector_resident_cap_mb")]
     pub vector_resident_cap_mb: usize,
+    /// User's preferred data directory base. RocksDB lives at
+    /// `<data_dir>/rocksdb/`, embedding cache at `<data_dir>/embeddings/`.
+    /// `settings.json` itself ALWAYS lives at
+    /// `~/.vibervn/context-engine/settings.json` regardless of this value.
+    ///
+    /// `None` means "use the builtin default" (`~/.vibervn/context-engine`),
+    /// distinguishing an unset preference from an explicit choice.
+    /// Boot precedence: CLI flag > env `CONTEXT_ENGINE_DATA_DIR` >
+    /// `Settings.data_dir` > builtin default.
+    /// Changes via PUT /api/config persist to disk and take effect on the
+    /// NEXT launch only — the running process keeps using its boot-resolved
+    /// path so already-open RocksDB handles and warmed vector shards stay
+    /// consistent.
+    #[serde(default)]
+    pub data_dir: Option<PathBuf>,
 }
 
 impl Default for Settings {
@@ -143,6 +169,7 @@ impl Default for Settings {
             mcp_index_wait_secs: default_mcp_index_wait_secs(),
             mcp_stale_after_days: default_mcp_stale_after_days(),
             vector_resident_cap_mb: default_vector_resident_cap_mb(),
+            data_dir: None,
         }
     }
 }
@@ -185,11 +212,25 @@ impl std::error::Error for ConfigError {}
 // ─── Path helpers ──────────────────────────────────────────────────────────
 
 /// Return the path of `settings.json` under `home_dir`.
+///
+/// settings.json's location is intentionally fixed (NOT controlled by
+/// `Settings.data_dir`): the data_dir field itself lives inside settings.json,
+/// so deriving its location from the field would be circular. See the bootstrap
+/// notes on `Settings.data_dir`.
 pub fn config_path(home_dir: &Path) -> PathBuf {
     home_dir
         .join(".vibervn")
         .join("context-engine")
         .join("settings.json")
+}
+
+/// Return the builtin-default data directory under `home_dir`
+/// (`~/.vibervn/context-engine`).
+///
+/// Used as the lowest-precedence fallback in boot resolution when no CLI flag,
+/// env var, or persisted `Settings.data_dir` is set.
+pub fn default_data_dir(home_dir: &Path) -> PathBuf {
+    home_dir.join(".vibervn").join("context-engine")
 }
 
 // ─── Atomic write ──────────────────────────────────────────────────────────
@@ -330,7 +371,14 @@ pub fn ensure_dir_and_load(home_dir: &Path) -> Result<Settings, ConfigError> {
             })?;
         }
 
-        let s = serde_json::from_value::<Settings>(value).map_err(ConfigError::Parse)?;
+        let mut s = serde_json::from_value::<Settings>(value).map_err(ConfigError::Parse)?;
+        // Stamp the migrated content with CURRENT_VERSION before persisting —
+        // otherwise the file's `version` field still reads as the OLD version
+        // and the next load would re-run the migration. Each migration
+        // function focuses on field-shape changes only; the version bump is
+        // applied here so it stays in lockstep with CURRENT_VERSION even when
+        // a migration is a no-op stamp like v1→v2.
+        s.version = CURRENT_VERSION;
         // Re-save with the migrated content.
         write_settings_atomic(&path, &s)?;
         s
@@ -369,5 +417,85 @@ mod tests {
             Err(other) => panic!("expected MigrationFailed, got: {other}"),
             Ok(_) => panic!("expected Err, got Ok"),
         }
+    }
+
+    /// Default Settings carries `data_dir == None`, signalling "use the builtin
+    /// default at boot". An explicit `Some(path)` represents a frozen user
+    /// choice and changes the lowest-precedence fallback in main.rs.
+    #[test]
+    fn test_data_dir_default_is_none() {
+        let s = Settings::default();
+        assert!(s.data_dir.is_none(), "default data_dir must be None");
+        assert_eq!(s.version, CURRENT_VERSION);
+    }
+
+    /// v1 → v2 migration: stamps an explicit `null` for the new `data_dir`
+    /// field and bumps the version, so an old v1 binary refuses the file
+    /// (VersionTooNew) instead of silently dropping the field on the next save.
+    #[test]
+    fn test_v1_to_v2_migration_stamps_null_data_dir() {
+        let home = TempDir::new().expect("tempdir");
+        let path = config_path(home.path());
+        fs::create_dir_all(path.parent().expect("has parent")).expect("create dirs");
+
+        // Write a valid v1 settings.json (no data_dir field).
+        let v1 = r#"{
+            "version": 1,
+            "repos": [],
+            "embedding": {"provider":"voyage","model":"voyage-4-lite","api_keys":[]},
+            "llm": {"provider":"google","rerank_model":"gemini-3.1-flash-lite","api_keys":[]}
+        }"#;
+        fs::write(&path, v1).expect("write v1 settings.json");
+
+        // Load: should run the v1→v2 migration.
+        let loaded = ensure_dir_and_load(home.path()).expect("load v1");
+        assert_eq!(loaded.version, CURRENT_VERSION);
+        assert!(loaded.data_dir.is_none(), "data_dir should be None after migration");
+
+        // The on-disk file must now report version 2 with an explicit data_dir
+        // field set to null — the tripwire that prevents an older binary from
+        // silently re-reading and re-saving without the new field.
+        let raw = fs::read_to_string(&path).expect("re-read");
+        let v: Value = serde_json::from_str(&raw).expect("parse re-read");
+        assert_eq!(v.get("version").and_then(|x| x.as_u64()), Some(2));
+        assert!(
+            v.get("data_dir").map(|x| x.is_null()).unwrap_or(false),
+            "on-disk data_dir should be explicit null after migration, got: {:?}",
+            v.get("data_dir")
+        );
+    }
+
+    /// Round-trip: an explicit `data_dir` value survives serialize+deserialize
+    /// and is preserved on subsequent loads (no spurious migration).
+    #[test]
+    fn test_data_dir_explicit_value_round_trips() {
+        let home = TempDir::new().expect("tempdir");
+        let path = config_path(home.path());
+        fs::create_dir_all(path.parent().expect("has parent")).expect("create dirs");
+
+        let custom = PathBuf::from("/var/data/instance-A");
+        let s = Settings {
+            data_dir: Some(custom.clone()),
+            ..Settings::default()
+        };
+        write_settings_atomic(&path, &s).expect("write");
+
+        let loaded = ensure_dir_and_load(home.path()).expect("load");
+        assert_eq!(loaded.data_dir, Some(custom));
+        assert_eq!(loaded.version, CURRENT_VERSION);
+    }
+
+    /// `default_data_dir` is the documented fallback used by boot resolution
+    /// when no CLI/env/persisted value is set. Pinning it as a public helper
+    /// guarantees the same path is used everywhere it's needed.
+    #[test]
+    fn test_default_data_dir_layout() {
+        let home = TempDir::new().expect("tempdir");
+        let dd = default_data_dir(home.path());
+        assert_eq!(
+            dd,
+            home.path().join(".vibervn").join("context-engine"),
+            "default data_dir must match historical layout for byte-identical default install"
+        );
     }
 }

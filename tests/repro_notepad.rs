@@ -129,7 +129,12 @@ async fn insert_with_duplicate_id_merges_instead_of_failing() {
 async fn count_real_db_rows() {
     let repo = "D:/projects/Cpp/notepad-ade".to_string();
     let home_dir = dirs::home_dir().expect("home dir");
-    let db = open_db(&home_dir, &repo).await.expect("open real db");
+    // Diagnostic against the real on-disk index — its base is the builtin
+    // default data dir (`~/.vibervn/context-engine`). Constructed locally so
+    // the test continues to inspect the real index regardless of any
+    // `Settings.data_dir` override (this binary is NOT booting the server).
+    let data_dir = home_dir.join(".vibervn").join("context-engine");
+    let db = open_db(&data_dir, &repo).await.expect("open real db");
 
     #[derive(serde::Deserialize)]
     struct C { count: i64 }
@@ -237,6 +242,8 @@ async fn inspect_real_calls_indexes() {
     }
 
     let home_dir = dirs::home_dir().expect("dirs::home_dir() must return a value on this platform");
+    // Real-data-dir base for diagnostic open_db; matches builtin default.
+    let data_dir = home_dir.join(".vibervn").join("context-engine");
 
     let surreal_dir = home_dir
         .join(".vibervn")
@@ -248,7 +255,7 @@ async fn inspect_real_calls_indexes() {
         return;
     }
 
-    let db = open_db(&home_dir, &repo)
+    let db = open_db(&data_dir, &repo)
         .await
         .expect("open real surreal db");
 
@@ -385,14 +392,12 @@ async fn repro_full_rebuild_notepad_ade_warm_cache() {
     }
 
     let home_dir = dirs::home_dir().expect("dirs::home_dir() must return a value on this platform");
+    // Real-data-dir base for diagnostic open_db / EmbeddingCache; matches builtin default.
+    let data_dir = home_dir.join(".vibervn").join("context-engine");
 
     // Guard: confirm the embedding cache exists (otherwise the test would just benchmark
     // empty-embedding writes, not the warm-cache-read path the user cares about).
-    let cache_dir = home_dir
-        .join(".vibervn")
-        .join("context-engine")
-        .join("embeddings")
-        .join("voyage-4-lite");
+    let cache_dir = data_dir.join("embeddings").join("voyage-4-lite");
     if !cache_dir.exists() {
         eprintln!(
             "SKIP: embedding cache dir not found at {}",
@@ -403,7 +408,7 @@ async fn repro_full_rebuild_notepad_ade_warm_cache() {
 
     // Build EmbeddingCache pointed at the real on-disk cache.
     use context_engine_rs::embedding::cache::EmbeddingCache;
-    let cache = match EmbeddingCache::new(&home_dir, "voyage-4-lite") {
+    let cache = match EmbeddingCache::new(&data_dir, "voyage-4-lite") {
         Some(c) => c,
         None => {
             eprintln!("SKIP: could not open EmbeddingCache (new returned None)");
@@ -411,10 +416,10 @@ async fn repro_full_rebuild_notepad_ade_warm_cache() {
         }
     };
 
-    // Open (or create) the real SurrealDB at ~/.vibervn/context-engine/surreal/…
-    // Note: the surreal dir should be deleted before running this test so the
+    // Open (or create) the real SurrealDB at ~/.vibervn/context-engine/rocksdb/…
+    // Note: the rocksdb dir should be deleted before running this test so the
     // rebuild is genuinely forced from scratch, but open_db handles both cases.
-    let db = open_db(&home_dir, &repo)
+    let db = open_db(&data_dir, &repo)
         .await
         .expect("open real surreal db");
 

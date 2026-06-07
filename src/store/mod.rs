@@ -45,18 +45,21 @@ pub fn sanitize_repo_name(repo_path: &str) -> String {
 
 /// Return the SurrealDB data directory for a given repo.
 ///
-/// Namespaced under `rocksdb/` (not the legacy `surreal/` SurrealKV path). The
-/// backend swap from SurrealKV to RocksDB changes the on-disk format, so the old
-/// `surreal/<name>` directories are intentionally left untouched for rollback; a
-/// repo opened here for the first time has no file_meta and triggers a full
-/// rebuild via the pipeline's is_first_run path (embedding cache makes it API-free).
-pub fn db_path(home_dir: &Path, repo_path: &str) -> PathBuf {
+/// Namespaced under `<data_dir>/rocksdb/<sanitized-repo-name>/` (not the legacy
+/// `surreal/` SurrealKV path). The backend swap from SurrealKV to RocksDB
+/// changes the on-disk format, so the old `surreal/<name>` directories are
+/// intentionally left untouched for rollback; a repo opened here for the first
+/// time has no file_meta and triggers a full rebuild via the pipeline's
+/// is_first_run path (embedding cache makes it API-free).
+///
+/// `data_dir` is the boot-resolved data directory (CLI > env >
+/// `Settings.data_dir` > builtin default). It is captured once at startup and
+/// MUST NOT be re-read from `Settings` mid-run — open RocksDB handles in
+/// `repo_dbs` and resident vector shards are bound to the boot path; switching
+/// would split-brain reads against writes.
+pub fn db_path(data_dir: &Path, repo_path: &str) -> PathBuf {
     let name = sanitize_repo_name(repo_path);
-    home_dir
-        .join(".vibervn")
-        .join("context-engine")
-        .join("rocksdb")
-        .join(name)
+    data_dir.join("rocksdb").join(name)
 }
 
 /// Read the stored db_schema_version from index_meta, defaulting to 1
@@ -71,8 +74,8 @@ pub async fn read_db_schema_version(db: &Surreal<Db>) -> u32 {
 /// Open (or create) a SurrealDB database for the given repo.
 /// Runs schema DDL to ensure all tables/indexes exist.
 /// Returns the db handle; the caller is responsible for triggering migrations.
-pub async fn open_db(home_dir: &Path, repo_path: &str) -> Result<Surreal<Db>> {
-    let path = db_path(home_dir, repo_path);
+pub async fn open_db(data_dir: &Path, repo_path: &str) -> Result<Surreal<Db>> {
+    let path = db_path(data_dir, repo_path);
     std::fs::create_dir_all(&path).with_context(|| format!("create db dir {:?}", path))?;
 
     let db = Surreal::new::<RocksDb>(path.to_str().unwrap())
@@ -612,8 +615,8 @@ fn open_gate(repo: &str) -> Arc<Mutex<()>> {
 /// The caller MUST have already dropped the cached handle (`close_repo_db`) so
 /// the only thing keeping the LOCK alive is the async shutdown, which the retry
 /// loop waits out. Returns `true` if the directory is gone on return.
-pub async fn remove_index_dir(home_dir: &Path, repo: &str) -> bool {
-    let path = db_path(home_dir, repo);
+pub async fn remove_index_dir(data_dir: &Path, repo: &str) -> bool {
+    let path = db_path(data_dir, repo);
 
     // Serialize against open_db for this repo. Held across every retry so no
     // re-index can recreate/open the directory mid-removal.
@@ -649,7 +652,7 @@ pub async fn remove_index_dir(home_dir: &Path, repo: &str) -> bool {
 
 pub async fn get_or_open(
     repo_dbs: &RepoDbMap,
-    home_dir: &Path,
+    data_dir: &Path,
     repo: &str,
 ) -> Result<Surreal<Db>> {
     // Fast path: already cached.
@@ -669,7 +672,7 @@ pub async fn get_or_open(
         return Ok(db.clone());
     }
 
-    let db = open_db(home_dir, repo).await?;
+    let db = open_db(data_dir, repo).await?;
 
     // Check schema version and spawn migration if needed (non-blocking).
     let stored_version = read_db_schema_version(&db).await;
@@ -700,17 +703,17 @@ pub async fn get_or_open(
 /// (or is mid-indexing) the directory exists and this behaves like `get_or_open`.
 pub async fn open_if_indexed(
     repo_dbs: &RepoDbMap,
-    home_dir: &Path,
+    data_dir: &Path,
     repo: &str,
 ) -> Result<Option<Surreal<Db>>> {
     // A cached handle means it's open regardless of the on-disk check below.
     if let Some(db) = repo_dbs.read().await.get(repo) {
         return Ok(Some(db.clone()));
     }
-    if !db_path(home_dir, repo).exists() {
+    if !db_path(data_dir, repo).exists() {
         return Ok(None);
     }
-    get_or_open(repo_dbs, home_dir, repo).await.map(Some)
+    get_or_open(repo_dbs, data_dir, repo).await.map(Some)
 }
 
 

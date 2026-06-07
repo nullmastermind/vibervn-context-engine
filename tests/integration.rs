@@ -23,9 +23,20 @@ async fn start_server(home: &TempDir) -> SocketAddr {
     let settings = Settings::default();
     let settings_handle = Arc::new(RwLock::new(settings.clone()));
     let repo_dbs: RepoDbMap = Arc::new(RwLock::new(HashMap::new()));
-    let index_engine = IndexEngine::start(home.path().to_path_buf(), &settings, repo_dbs.clone(), settings_handle.clone()).await;
+    // Tests pass the same TempDir as both home_dir and data_dir — settings.json
+    // and the data files (rocksdb/, embeddings/) all live under it. Production
+    // splits them, but the test harness only cares that data_dir is honored.
+    let data_dir = home.path().to_path_buf();
+    let index_engine = IndexEngine::start(
+        data_dir.clone(),
+        &settings,
+        repo_dbs.clone(),
+        settings_handle.clone(),
+    )
+    .await;
     let app = build_router(
         home.path().to_path_buf(),
+        data_dir,
         index_engine,
         repo_dbs,
         settings_handle,
@@ -58,8 +69,8 @@ async fn test_get_creates_default() {
 
     let body: serde_json::Value = res.json().await.expect("parse json");
 
-    // version should be 1
-    assert_eq!(body["version"], 1);
+    // version should be CURRENT_VERSION (= 2 after the data_dir migration)
+    assert_eq!(body["version"], 2);
 
     // repos should be an empty array
     assert!(body["repos"].as_array().map(|a| a.is_empty()).unwrap_or(false));
@@ -134,7 +145,7 @@ async fn test_put_round_trips() {
     assert_eq!(get_body.repos, vec!["/home/user/myproject", "/home/user/other"]);
     assert_eq!(get_body.embedding.model, "voyage-code-3");
     assert_eq!(get_body.llm.rerank_model, "gemini-2.0-flash");
-    assert_eq!(get_body.version, 1);
+    assert_eq!(get_body.version, 2);
 }
 
 // ─── Test 3 (Unix only): file mode bits should be 0o600 ───────────────────
@@ -576,4 +587,125 @@ async fn test_delete_repo_index_removes_directory() {
         assert_eq!(s["state"].as_str(), Some("idle"));
         assert_eq!(s["indexed_files"].as_u64(), Some(0));
     }
+}
+
+// ─── Test 8: PUT data_dir persists but does NOT relocate the running process ─
+//
+// PUT /api/config with a new `data_dir` must:
+//   1. Persist the value to settings.json (round-trips on a subsequent GET).
+//   2. NOT close cached RocksDB handles in repo_dbs (they're bound to the
+//      boot-resolved path; switching mid-run would split-brain).
+//   3. NOT create the new path's directory tree as a side effect.
+//   4. Subsequent indexing operations (which open DBs via get_or_open) still
+//      land at the boot-resolved path, NOT the newly persisted one.
+//
+// Confirms the boot-frozen contract from the design plan.
+#[tokio::test]
+async fn test_put_data_dir_persists_but_does_not_relocate() {
+    use context_engine_rs::store;
+
+    let boot_home = TempDir::new().expect("boot tempdir");
+    // The "new" data_dir the user wants for *next* launch — never touched here.
+    let next_launch_dir = TempDir::new().expect("next-launch tempdir");
+
+    let addr = start_server(&boot_home).await;
+    let client = Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("client");
+
+    // Seed via GET so settings.json exists on disk.
+    let initial = client
+        .get(format!("http://{addr}/api/config"))
+        .send()
+        .await
+        .expect("initial GET");
+    assert_eq!(initial.status().as_u16(), 200);
+
+    // Pre-PUT: data_dir is None on disk.
+    let body: Settings = client
+        .get(format!("http://{addr}/api/config"))
+        .send()
+        .await
+        .expect("get pre-put")
+        .json()
+        .await
+        .expect("parse pre-put");
+    assert!(body.data_dir.is_none(), "fresh install: data_dir should be None");
+
+    // PUT a config with a new data_dir.
+    let new_data_dir = next_launch_dir.path().to_path_buf();
+    let payload = serde_json::json!({
+        "version": 2,
+        "repos": [],
+        "embedding": {"provider": "voyage", "model": "voyage-4-lite", "api_keys": []},
+        "llm": {"provider": "google", "rerank_model": "gemini-3.1-flash-lite", "api_keys": []},
+        "data_dir": new_data_dir.to_string_lossy(),
+    });
+    let put_res = client
+        .put(format!("http://{addr}/api/config"))
+        .json(&payload)
+        .send()
+        .await
+        .expect("put");
+    assert_eq!(put_res.status().as_u16(), 200, "PUT must succeed");
+
+    // (1) GET round-trips the new value.
+    let after: Settings = client
+        .get(format!("http://{addr}/api/config"))
+        .send()
+        .await
+        .expect("get after put")
+        .json()
+        .await
+        .expect("parse after put");
+    assert_eq!(after.data_dir.as_ref(), Some(&new_data_dir));
+
+    // (3) The PUT must NOT have created the rocksdb tree at the new path.
+    let new_rocksdb_root = new_data_dir.join("rocksdb");
+    assert!(
+        !new_rocksdb_root.exists(),
+        "PUT must not create the new data_dir's rocksdb tree (boot-frozen)"
+    );
+
+    // (4) Trigger an indexing operation on a fake repo. The DB directory must
+    // appear under the BOOT path (boot_home), not the newly persisted path.
+    let repo_path = "D:/fake/repo/for_data_dir_test";
+    let repo_id = encode_repo_id(repo_path);
+    let put_repo = serde_json::json!({
+        "version": 2,
+        "repos": [repo_path],
+        "embedding": {"provider": "voyage", "model": "voyage-4-lite", "api_keys": []},
+        "llm": {"provider": "google", "rerank_model": "gemini-3.1-flash-lite", "api_keys": []},
+        "data_dir": new_data_dir.to_string_lossy(),
+    });
+    client
+        .put(format!("http://{addr}/api/config"))
+        .json(&put_repo)
+        .send()
+        .await
+        .expect("put repo");
+
+    client
+        .post(format!("http://{addr}/api/repos/{repo_id}/index"))
+        .send()
+        .await
+        .expect("trigger index");
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // boot path: data_dir == boot_home.path() per start_server.
+    let boot_db = store::db_path(boot_home.path(), repo_path);
+    let new_db = store::db_path(&new_data_dir, repo_path);
+    assert!(
+        boot_db.exists(),
+        "DB must materialize under the BOOT data_dir, not the persisted one. \
+         expected: {boot_db:?}"
+    );
+    assert!(
+        !new_db.exists(),
+        "DB must NOT materialize under the newly persisted data_dir (would mean \
+         the running process honored the PUT — split-brain). \
+         unexpected: {new_db:?}"
+    );
 }

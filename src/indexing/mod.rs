@@ -97,7 +97,12 @@ impl ProgressHandle {
 /// Central orchestrator for all indexing operations.
 /// Stored in `AppState` and shared via `Arc`.
 pub struct IndexEngine {
-    pub home_dir: PathBuf,
+    /// Boot-resolved data directory base (CLI > env > `Settings.data_dir` >
+    /// builtin default). Captured ONCE at startup; the indexer/store/cache
+    /// paths are derived from this. **Never re-read from `Settings` mid-run** —
+    /// already-open RocksDB handles in `repo_dbs` and resident vector shards
+    /// are bound to this path; switching would split-brain reads against writes.
+    pub data_dir: PathBuf,
     /// Per-repo status map, keyed by repo path string.
     /// Wrapped in Arc so `ProgressHandle` can hold a reference without borrowing self.
     pub statuses: Arc<RwLock<HashMap<String, RepoStatus>>>,
@@ -149,11 +154,11 @@ pub struct IndexTrigger {
 pub(crate) async fn warm_repo_shard(
     vector_index: &Arc<RwLock<ShardedVectorIndex>>,
     repo_dbs: &RepoDbMap,
-    home_dir: &std::path::Path,
+    data_dir: &std::path::Path,
     repo: &str,
     active: &[String],
 ) -> usize {
-    let db = match store::get_or_open(repo_dbs, home_dir, repo).await {
+    let db = match store::get_or_open(repo_dbs, data_dir, repo).await {
         Ok(db) => db,
         Err(e) => {
             warn!(repo = %repo, error = %e, "warm: failed to open DB; skipping repo");
@@ -189,11 +194,11 @@ pub(crate) async fn warm_repo_shard(
 pub(crate) async fn seed_statuses_from_db(
     statuses: &Arc<RwLock<HashMap<String, RepoStatus>>>,
     repo_dbs: &RepoDbMap,
-    home_dir: &std::path::Path,
+    data_dir: &std::path::Path,
     repos: &[String],
 ) {
     for repo in repos {
-        let db = match store::get_or_open(repo_dbs, home_dir, repo).await {
+        let db = match store::get_or_open(repo_dbs, data_dir, repo).await {
             Ok(db) => db,
             Err(e) => {
                 warn!(repo = %repo, error = %format!("{e:#}"), "failed to open DB for status seed; skipping repo");
@@ -236,7 +241,7 @@ impl IndexEngine {
     /// task takes a fresh snapshot at the top of each trigger iteration so API keys
     /// and other config added after boot are picked up on the next run.
     pub async fn start(
-        home_dir: PathBuf,
+        data_dir: PathBuf,
         settings: &Settings,
         repo_dbs: RepoDbMap,
         settings_handle: Arc<RwLock<Settings>>,
@@ -257,11 +262,11 @@ impl IndexEngine {
         // Clone handles needed by the background vector-load task BEFORE they
         // are moved into the engine struct.
         let repo_dbs_bg = repo_dbs.clone();
-        let home_dir_bg = home_dir.clone();
+        let data_dir_bg = data_dir.clone();
         let repos_bg = settings.repos.clone();
 
         let engine = Arc::new(IndexEngine {
-            home_dir: home_dir.clone(),
+            data_dir: data_dir.clone(),
             statuses: Arc::new(RwLock::new(HashMap::new())),
             repo_locks: Mutex::new(HashMap::new()),
             trigger_tx: trigger_tx.clone(),
@@ -291,7 +296,7 @@ impl IndexEngine {
         {
             let statuses_bg = Arc::clone(&engine.statuses);
             tokio::spawn(async move {
-                seed_statuses_from_db(&statuses_bg, &repo_dbs_bg, &home_dir_bg, &repos_bg).await;
+                seed_statuses_from_db(&statuses_bg, &repo_dbs_bg, &data_dir_bg, &repos_bg).await;
             });
         }
 
@@ -567,7 +572,7 @@ impl IndexEngine {
         warm_repo_shard(
             &self.vector_index,
             &self.repo_dbs,
-            &self.home_dir,
+            &self.data_dir,
             &repo,
             &[],
         )
@@ -646,7 +651,7 @@ async fn run_consumer(
 
         // Acquire the SHARED repo DB handle — the same instance the server reads
         // through, so the explorer/query layer sees these writes immediately.
-        let db = match store::get_or_open(&engine_ref.repo_dbs, &engine_ref.home_dir, &repo).await {
+        let db = match store::get_or_open(&engine_ref.repo_dbs, &engine_ref.data_dir, &repo).await {
             Ok(db) => db,
             Err(e) => {
                 error!(repo = %repo, error = %e, "failed to open repo DB");
@@ -698,7 +703,7 @@ async fn run_consumer(
             // different model configurations get isolated cache directories.
             let embed_cache = if let Some(ref client) = voyage_client {
                 crate::embedding::cache::EmbeddingCache::new(
-                    &engine_ref.home_dir,
+                    &engine_ref.data_dir,
                     client.model(),
                 )
             } else {

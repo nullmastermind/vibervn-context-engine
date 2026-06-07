@@ -34,7 +34,13 @@ pub struct CodebaseRetrievalArgs {
 
 #[derive(Clone)]
 pub struct McpHandler {
+    /// Used ONLY for `settings.json` access (config_path / ensure_dir_and_load).
+    /// settings.json's location is fixed at `~/.vibervn/context-engine/settings.json`.
     home_dir: PathBuf,
+    /// Boot-resolved data directory (CLI > env > `Settings.data_dir` > builtin
+    /// default). Used for store/embedding paths. Captured once at startup —
+    /// MUST NOT be re-read from `Settings` mid-run.
+    data_dir: PathBuf,
     index_engine: Arc<IndexEngine>,
     repo_dbs: Arc<RwLock<HashMap<String, Surreal<Db>>>>,
     settings: Arc<RwLock<crate::config::Settings>>,
@@ -47,12 +53,14 @@ pub struct McpHandler {
 impl McpHandler {
     pub fn new(
         home_dir: PathBuf,
+        data_dir: PathBuf,
         index_engine: Arc<IndexEngine>,
         repo_dbs: Arc<RwLock<HashMap<String, Surreal<Db>>>>,
         settings: Arc<RwLock<crate::config::Settings>>,
     ) -> Self {
         Self {
             home_dir,
+            data_dir,
             index_engine,
             repo_dbs,
             settings,
@@ -95,6 +103,7 @@ Parameters:
         let settings = self.settings.read().await.clone();
         let text = run_codebase_retrieval(
             &self.home_dir,
+            &self.data_dir,
             &self.index_engine,
             &self.repo_dbs,
             &settings,
@@ -124,10 +133,16 @@ impl ServerHandler for McpHandler {
 /// Returns plain-text results or an error/guidance string. Never panics, never
 /// returns `Err` — all failure paths produce a human-readable string.
 ///
+/// `home_dir` locates the fixed `settings.json` file. `data_dir` is the
+/// boot-resolved data directory used for the per-repo RocksDB / embedding cache
+/// paths. They are intentionally NOT collapsed into a single parameter — see
+/// `Settings.data_dir` for the bootstrap rationale (Shape C).
+///
 /// This is the single shared funnel used by both the MCP tool and the REST
 /// endpoint (`POST /api/mcp-tool`), so their outputs are byte-identical.
 pub async fn run_codebase_retrieval(
     home_dir: &Path,
+    data_dir: &Path,
     index_engine: &Arc<IndexEngine>,
     repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
     settings: &Settings,
@@ -182,7 +197,7 @@ pub async fn run_codebase_retrieval(
     }
 
     // 4. Open the repo DB and determine freshness from durable state.
-    let db = match store::get_or_open(repo_dbs, home_dir, repo).await {
+    let db = match store::get_or_open(repo_dbs, data_dir, repo).await {
         Ok(d) => d,
         Err(e) => {
             return format!("Error: could not open index database: {e}");
@@ -247,7 +262,7 @@ pub async fn run_codebase_retrieval(
                             err
                         );
                         return format!("{}{}", prefix, do_query(
-                            home_dir, index_engine, repo_dbs, settings,
+                            index_engine, repo_dbs, settings,
                             information_request, repo,
                         ).await);
                     } else {
@@ -263,7 +278,7 @@ pub async fn run_codebase_retrieval(
                         if is_usable {
                             let prefix = "(still indexing; results may be incomplete)\n\n";
                             return format!("{}{}", prefix, do_query(
-                                home_dir, index_engine, repo_dbs, settings,
+                                index_engine, repo_dbs, settings,
                                 information_request, repo,
                             ).await);
                         } else {
@@ -275,7 +290,7 @@ pub async fn run_codebase_retrieval(
         }
     }
 
-    do_query(home_dir, index_engine, repo_dbs, settings, information_request, repo).await
+    do_query(index_engine, repo_dbs, settings, information_request, repo).await
 }
 
 /// Returns true if the DB has chunks AND the durable timestamp is within the
@@ -363,8 +378,12 @@ mod tests {
 
 /// Execute the query pipeline and format the results as plain text.
 /// Returns a string — never panics, never returns Err.
+///
+/// Note: neither `home_dir` nor `data_dir` is needed here — both DB opens and
+/// vector access go through `index_engine` / `repo_dbs`, which were constructed
+/// with the boot-resolved `data_dir`. Keeping the signature path-free
+/// documents that this function never re-derives a base directory mid-run.
 async fn do_query(
-    _home_dir: &Path,
     index_engine: &Arc<IndexEngine>,
     repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
     settings: &Settings,
