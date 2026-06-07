@@ -471,6 +471,61 @@ fn open_gate(repo: &str) -> Arc<Mutex<()>> {
         .clone()
 }
 
+/// Remove a repo's on-disk index directory, serialized against `open_db` via the
+/// same per-repo open gate `get_or_open` uses.
+///
+/// Why the gate matters: SurrealDB's RocksDB datastore releases its exclusive
+/// per-directory LOCK *asynchronously* — a background router task flushes
+/// memtables and shuts down the engine some time after the last `Surreal<Db>`
+/// clone drops. On Windows the OS file handles outlive the handle drop, so a
+/// `remove_dir_all` immediately after `close_repo_db` can fail, AND a concurrent
+/// re-index that calls `open_db` will `create_dir_all` + open RocksDB on the very
+/// path we're trying to delete. Without serialization those two interleave: the
+/// cleaner deletes files out from under a freshly opened datastore (or collides
+/// with the still-draining old LOCK), producing repeating `open surrealdb`
+/// errors on re-index.
+///
+/// Holding the open gate for the entire retry loop closes that race: any
+/// concurrent `get_or_open` blocks on the gate until removal finishes, then
+/// re-checks the cache (miss) and opens a fresh DB on the now-clean directory.
+/// The caller MUST have already dropped the cached handle (`close_repo_db`) so
+/// the only thing keeping the LOCK alive is the async shutdown, which the retry
+/// loop waits out. Returns `true` if the directory is gone on return.
+pub async fn remove_index_dir(home_dir: &Path, repo: &str) -> bool {
+    let path = db_path(home_dir, repo);
+
+    // Serialize against open_db for this repo. Held across every retry so no
+    // re-index can recreate/open the directory mid-removal.
+    let gate = open_gate(repo);
+    let _open_guard = gate.lock().await;
+
+    if !path.exists() {
+        return true;
+    }
+
+    // Retry with backoff: the async datastore shutdown that still holds the LOCK
+    // typically completes within a second or two. Budget ~20s total, generous
+    // enough for a slow Windows handle release without wedging the request.
+    for attempt in 0..18u32 {
+        let p = path.clone();
+        let removed = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&p).is_ok())
+            .await
+            .unwrap_or(false);
+        if removed || !path.exists() {
+            return true;
+        }
+        // 100ms, 200ms, … capped at 2s — geometric-ish, summing to ~20s over 18 tries.
+        let backoff_ms = (100u64 * (attempt as u64 + 1)).min(2000);
+        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+    }
+
+    let still = path.exists();
+    if still {
+        warn!(path = ?path, "index directory still present after removal retries");
+    }
+    !still
+}
+
 pub async fn get_or_open(
     repo_dbs: &RepoDbMap,
     home_dir: &Path,

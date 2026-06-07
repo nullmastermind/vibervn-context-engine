@@ -362,47 +362,29 @@ async fn delete_repo_index(
     // the user's perspective regardless of whether the directory removal succeeds.
     state.index_engine.clear_repo_index(&repo).await;
 
-    let db_dir = store::db_path(&state.home_dir, &repo);
-    if !db_dir.exists() {
-        return Json(json!({ "status": "ok", "message": "no index to remove" })).into_response();
+    // Remove the on-disk directory, serialized against `open_db` via the per-repo
+    // open gate (see store::remove_index_dir). Holding that gate across the
+    // retry loop is what prevents a concurrent/immediate re-index from racing the
+    // cleanup: the re-index's get_or_open blocks on the gate until the directory
+    // is fully gone, then opens a fresh DB on a clean path. Without it, the old
+    // detached cleaner could delete files out from under a freshly opened RocksDB
+    // (or collide with the still-draining async LOCK release), producing the
+    // repeating `open surrealdb` errors seen on re-index after "Remove Indexes".
+    let removed = store::remove_index_dir(&state.home_dir, &repo).await;
+
+    if removed {
+        Json(json!({ "status": "ok" })).into_response()
+    } else {
+        // The directory is logically removed (handle closed, status cleared,
+        // vector shard evicted) but the OS hasn't released the files yet. Report
+        // it so the UI can surface that a retry may be needed; the gate is no
+        // longer held, so a re-index would race — the user should retry removal.
+        Json(json!({
+            "status": "pending",
+            "message": "index directory could not be fully removed yet; retry shortly"
+        }))
+        .into_response()
     }
-
-    // SurrealDB's background router task releases the RocksDB lock asynchronously
-    // after the last Surreal<Db> clone drops (the spawned task must flush memtables
-    // and shut down internal engine tasks). On Windows, file handles are not
-    // released until the background task completes — which can take unbounded time.
-    //
-    // Strategy: attempt removal with retries. If it still fails (background task
-    // hasn't shut down yet), spawn a detached cleanup task that keeps retrying in
-    // the background and return success to the caller — the index is already
-    // logically removed (handle closed, status cleared, vector shard evicted).
-    let db_dir_bg = db_dir.clone();
-    let removed = tokio::task::spawn_blocking(move || {
-        for i in 0..10 {
-            if std::fs::remove_dir_all(&db_dir_bg).is_ok() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(100 * (i + 1)));
-        }
-        false
-    })
-    .await
-    .unwrap_or(false);
-
-    if !removed {
-        // Detached background cleanup — keeps trying until the OS releases the lock.
-        tokio::task::spawn_blocking(move || {
-            for i in 0..60 {
-                std::thread::sleep(Duration::from_secs(1 + i / 10));
-                if std::fs::remove_dir_all(&db_dir).is_ok() {
-                    return;
-                }
-            }
-            tracing::warn!(path = ?db_dir, "could not remove index directory after extended retry");
-        });
-    }
-
-    Json(json!({ "status": "ok" })).into_response()
 }
 
 /// POST /api/index-all — trigger index for all repos.
