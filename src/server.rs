@@ -5,11 +5,11 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use axum::{
-    extract::{Json, Path, Query, State},
+    extract::{Json, Path, Query, Request, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     response::sse::{Event, Sse},
-    routing::{delete, get, post, put},
+    routing::{any, delete, get, post, put},
     Router,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -26,6 +26,8 @@ use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager,
 };
 
+type RepoMcpService = StreamableHttpService<RepoMcpHandler, LocalSessionManager>;
+
 use crate::config::{
     ConfigError, CURRENT_VERSION, Settings, ensure_dir_and_load, write_settings_atomic,
     config_path,
@@ -34,7 +36,7 @@ use crate::defender;
 use crate::embedding::voyage::VoyageClient;
 use crate::indexing::IndexEngine;
 use crate::llm::LlmClient;
-use crate::mcp::{McpHandler, run_codebase_retrieval};
+use crate::mcp::{McpHandler, RepoMcpHandler, run_codebase_retrieval};
 use crate::path_in_repo;
 use crate::store;
 use crate::query;
@@ -97,6 +99,8 @@ pub struct AppState {
     /// Shared live settings — the single source of truth.
     /// All mutations go through this handle AND are written to disk first.
     pub settings: Arc<RwLock<crate::config::Settings>>,
+    /// Per-repo MCP services, lazily created on first access.
+    pub repo_mcp_services: Arc<RwLock<HashMap<String, RepoMcpService>>>,
 }
 
 // ─── Router ────────────────────────────────────────────────────────────────
@@ -117,6 +121,7 @@ pub fn build_router(
         index_engine: index_engine.clone(),
         repo_dbs: repo_dbs.clone(),
         settings: settings.clone(),
+        repo_mcp_services: Arc::new(RwLock::new(HashMap::new())),
     };
 
     // Build the StreamableHttpService for the /mcp endpoint.
@@ -183,6 +188,7 @@ pub fn build_router(
         .route("/api/embedding-cache", delete(delete_embedding_cache))
         .route("/api/defender-status", get(get_defender_status))
         .route("/api/defender-exclude", post(post_defender_exclude))
+        .route("/mcp-repo/:repo_id", any(handle_repo_mcp))
         .merge(Router::new().nest_service("/mcp", mcp_service))
         .with_state(state)
 }
@@ -845,6 +851,64 @@ async fn post_file_retrieval(
     )
     .await;
     Json(json!({ "result": result })).into_response()
+}
+
+// ─── Per-repo MCP endpoint ──────────────────────────────────────────────
+
+/// ANY /mcp-repo/:repo_id — per-repo MCP endpoint (no workspace_full_path needed).
+async fn handle_repo_mcp(
+    State(state): State<AppState>,
+    Path(repo_id): Path<String>,
+    req: Request,
+) -> Response {
+    let repo = match decode_repo_id(&repo_id) {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+
+    // Get or create the per-repo MCP service.
+    let service = {
+        let cache = state.repo_mcp_services.read().await;
+        cache.get(&repo).cloned()
+    };
+    let mut service = match service {
+        Some(s) => s,
+        None => {
+            let home = state.home_dir.clone();
+            let data = state.data_dir.clone();
+            let engine = state.index_engine.clone();
+            let dbs = state.repo_dbs.clone();
+            let settings = state.settings.clone();
+            let repo_clone = repo.clone();
+            let new_service = StreamableHttpService::new(
+                move || {
+                    let enabled = settings
+                        .try_read()
+                        .map(|g| g.enabled_mcp_tools.clone())
+                        .unwrap_or_else(|_| crate::config::Settings::default().enabled_mcp_tools);
+                    Ok(RepoMcpHandler::new(
+                        home.clone(),
+                        data.clone(),
+                        repo_clone.clone(),
+                        engine.clone(),
+                        dbs.clone(),
+                        settings.clone(),
+                        &enabled,
+                    ))
+                },
+                Arc::new(LocalSessionManager::default()),
+                StreamableHttpServerConfig::default(),
+            );
+            state.repo_mcp_services.write().await.insert(repo.clone(), new_service.clone());
+            new_service
+        }
+    };
+
+    use tower_service::Service;
+    match service.call(req).await {
+        Ok(resp) => resp.into_response(),
+        Err(e) => match e {},
+    }
 }
 
 // ─── Index events SSE stream ─────────────────────────────────────────────

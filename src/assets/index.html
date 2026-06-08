@@ -540,6 +540,12 @@
                      focus:outline-none focus:ring-2 focus:ring-blue-400">
         Search
       </button>
+      <button role="tab" id="subtab-claude" aria-selected="false" aria-controls="subpanel-claude" data-i18n="mcp.claudeCode"
+              class="subtab-btn px-4 py-2 text-sm border-b-2 border-transparent text-gray-500 dark:text-wiki-text-muted
+                     hover:text-gray-900 dark:hover:text-wiki-heading hover:border-gray-300 dark:hover:border-wiki-border
+                     focus:outline-none focus:ring-2 focus:ring-blue-400">
+        Claude Code
+      </button>
     </div>
 
     <!-- Sub-tab: Index Explorer (default) -->
@@ -709,6 +715,42 @@
       </div>
 
     </div>
+
+    <!-- Sub-tab: Claude Code -->
+    <div role="tabpanel" id="subpanel-claude" class="hidden">
+      <p data-i18n="repo.claudeCmdDesc" class="text-sm text-gray-600 dark:text-wiki-text-muted mb-3">
+        Run this command in your terminal to register the MCP server with Claude Code for this project.
+      </p>
+      <div class="flex items-center gap-2">
+        <code id="repo-claude-cmd"
+              class="flex-1 font-mono text-sm px-3 py-2 rounded border border-gray-200 dark:border-wiki-border
+                     bg-gray-50 dark:bg-wiki-surface text-gray-800 dark:text-wiki-link select-all whitespace-pre-wrap break-all block"></code>
+        <button id="btn-copy-repo-claude" data-i18n="action.copy"
+                class="px-3 py-2 text-sm rounded border border-gray-300 dark:border-wiki-border
+                       text-gray-600 dark:text-wiki-text-muted hover:bg-gray-100 dark:hover:bg-wiki-surface
+                       hover:text-gray-900 dark:hover:text-wiki-text
+                       focus:outline-none focus:ring-2 focus:ring-blue-400 shrink-0">
+          Copy
+        </button>
+      </div>
+
+      <p data-i18n-html="mcp.claudeMdDesc" class="text-sm text-gray-600 dark:text-wiki-text-muted mt-6 mb-3">
+        Add the following to your project's <code class="font-mono text-xs px-1 py-0.5 rounded bg-gray-100 dark:bg-wiki-surface">CLAUDE.md</code> so Claude prefers the context engine for codebase exploration.
+      </p>
+      <div class="flex items-start gap-2">
+        <pre id="repo-claude-md"
+             class="flex-1 font-mono text-sm px-3 py-2 rounded border border-gray-200 dark:border-wiki-border
+                    bg-gray-50 dark:bg-wiki-surface text-gray-800 dark:text-wiki-link select-all whitespace-pre-wrap break-words block m-0"></pre>
+        <button id="btn-copy-repo-claude-md" data-i18n="action.copy"
+                class="px-3 py-2 text-sm rounded border border-gray-300 dark:border-wiki-border
+                       text-gray-600 dark:text-wiki-text-muted hover:bg-gray-100 dark:hover:bg-wiki-surface
+                       hover:text-gray-900 dark:hover:text-wiki-text
+                       focus:outline-none focus:ring-2 focus:ring-blue-400 shrink-0">
+          Copy
+        </button>
+      </div>
+    </div>
+
   </div><!-- /search-page -->
 </div><!-- /container -->
 
@@ -940,6 +982,9 @@ const STR = {
   // Repo detail — explorer & graph
   'repo.explorer':     { en: `Index Explorer`, vi: `Index Explorer`, zh: `索引浏览器` },
   'repo.search':       { en: `Search`, vi: `Tìm kiếm`, zh: `搜索` },
+  'repo.claudeCmdDesc': { en: `Run this command in your terminal to register the MCP server with Claude Code for this project.`,
+                         vi: `Chạy lệnh này trong terminal để đăng ký MCP server với Claude Code cho project này.`,
+                         zh: `在终端中运行此命令，将 MCP 服务器注册到 Claude Code（项目范围）。` },
   'repo.rebuild':      { en: `Rebuild Index`, vi: `Rebuild Index`, zh: `重建索引` },
   'repo.incremental':  { en: `Incremental Update`, vi: `Incremental Update`, zh: `增量更新` },
   'graph.heading':     { en: `Call graph`, vi: `Call graph`, zh: `调用图` },
@@ -1964,6 +2009,7 @@ document.getElementById('btn-mcp-run').addEventListener('click', runMcpTest);
 const SUBTABS = [
   { btn: 'subtab-explorer', panel: 'subpanel-explorer' },
   { btn: 'subtab-search',   panel: 'subpanel-search' },
+  { btn: 'subtab-claude',   panel: 'subpanel-claude' },
 ];
 
 function activateSubTab(idx) {
@@ -1983,11 +2029,26 @@ function activateSubTab(idx) {
     }
   });
   if (idx === 1) document.getElementById('input-search').focus();
+  if (idx === 2) initRepoClaudeTab();
 }
 
 SUBTABS.forEach((t, i) => {
   document.getElementById(t.btn).addEventListener('click', () => activateSubTab(i));
 });
+
+// ─── Repo Claude Code tab ─────────────────────────────────────────────────
+function initRepoClaudeTab() {
+  if (!currentSearchRepo) return;
+  const origin = window.location.origin;
+  const repoId = encodeRepoId(currentSearchRepo);
+  const endpointUrl = origin + '/mcp-repo/' + repoId;
+  const cmd = 'claude mcp add --scope project --transport http codebase-retrieval ' + endpointUrl;
+  document.getElementById('repo-claude-cmd').textContent = cmd;
+  document.getElementById('repo-claude-md').textContent = buildClaudeMdSnippet();
+}
+
+makeCopyBtn('btn-copy-repo-claude',    () => document.getElementById('repo-claude-cmd').textContent);
+makeCopyBtn('btn-copy-repo-claude-md', () => document.getElementById('repo-claude-md').textContent);
 
 async function runSearch() {
   const input = document.getElementById('input-search');

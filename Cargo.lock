@@ -972,6 +972,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
  "tree-sitter",
