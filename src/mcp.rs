@@ -20,6 +20,99 @@ use crate::indexing::{IndexEngine, IndexState};
 use crate::llm::LlmClient;
 use crate::store;
 
+// ─── Output budget ───────────────────────────────────────────────────────
+// MCP clients (Claude Code, IDE extensions) reject tool outputs exceeding
+// ~50,000 characters. We cap at 48K to leave headroom for client framing.
+
+const MAX_TOOL_OUTPUT_CHARS: usize = 48_000;
+const MAX_FIRST_LINE_CHARS: usize = 120;
+
+/// A single result block ready for budget-aware assembly.
+struct OutputBlock {
+    header: String,
+    content: String,
+    line_start: u32,
+    line_end: u32,
+}
+
+/// Assemble result blocks into a single string respecting `MAX_TOOL_OUTPUT_CHARS`.
+///
+/// Results are in priority order (reranked). Full content is emitted until the
+/// budget would be exceeded; from that point, all remaining blocks are shown as
+/// header + first line (capped at 120 chars) + elision marker.
+fn assemble_with_budget(blocks: &[OutputBlock]) -> String {
+    // Reserve space for the footer so it's never squeezed out.
+    const FOOTER_RESERVE: usize = 150;
+    let effective_budget = MAX_TOOL_OUTPUT_CHARS - FOOTER_RESERVE;
+
+    let mut out = String::new();
+    let mut truncated_count = 0usize;
+    let mut budget_exceeded = false;
+
+    for block in blocks {
+        let full_text = format!("{}\n{}", block.header, block.content);
+        let separator = if out.is_empty() { "" } else { "\n\n" };
+
+        if !budget_exceeded {
+            let candidate_len = out.len() + separator.len() + full_text.len();
+            if candidate_len <= effective_budget {
+                out.push_str(separator);
+                out.push_str(&full_text);
+                continue;
+            }
+            budget_exceeded = true;
+        }
+
+        // Truncated form: header + first line (capped) + elision marker.
+        let first_line = block.content.lines().next().unwrap_or("");
+        let first_line_display = if first_line.len() > MAX_FIRST_LINE_CHARS {
+            let mut end = MAX_FIRST_LINE_CHARS;
+            while !first_line.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}…", &first_line[..end])
+        } else {
+            first_line.to_string()
+        };
+
+        let elision = if block.line_end > block.line_start {
+            format!(
+                "... (L{}-{} elided, use Read)",
+                block.line_start + 1,
+                block.line_end
+            )
+        } else {
+            String::new()
+        };
+
+        let truncated_text = if elision.is_empty() {
+            format!("{}\n{}", block.header, first_line_display)
+        } else {
+            format!("{}\n{}\n{}", block.header, first_line_display, elision)
+        };
+
+        let separator = if out.is_empty() { "" } else { "\n\n" };
+        let candidate_len = out.len() + separator.len() + truncated_text.len();
+        if candidate_len <= effective_budget {
+            out.push_str(separator);
+            out.push_str(&truncated_text);
+        }
+        truncated_count += 1;
+    }
+
+    if truncated_count > 0 {
+        let footer = format!(
+            "\n\n---\n{} of {} results truncated to fit output size limit; \
+             use the Read tool with the line ranges above.",
+            truncated_count,
+            blocks.len()
+        );
+        out.push_str(&footer);
+    }
+
+    out
+}
+
 // ─── Tool argument schema ─────────────────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -524,6 +617,119 @@ mod tests {
         assert_eq!(cosine_similarity(&[], &[]), 0.0);
         assert_eq!(cosine_similarity(&[1.0], &[]), 0.0);
     }
+
+    #[test]
+    fn budget_all_fit() {
+        let blocks = vec![
+            OutputBlock {
+                header: "file.rs#L1-10".to_string(),
+                content: "1: fn main() {\n2:   println!(\"hi\");\n3: }".to_string(),
+                line_start: 1,
+                line_end: 10,
+            },
+            OutputBlock {
+                header: "file.rs#L20-30".to_string(),
+                content: "20: fn foo() {\n21:   bar();\n22: }".to_string(),
+                line_start: 20,
+                line_end: 30,
+            },
+        ];
+        let out = assemble_with_budget(&blocks);
+        assert!(out.contains("1: fn main()"));
+        assert!(out.contains("20: fn foo()"));
+        assert!(!out.contains("truncated"));
+    }
+
+    #[test]
+    fn budget_exceeded_shows_header_and_first_line() {
+        let big_content = (1..=500)
+            .map(|i| format!("{}: // line {}", i, "x".repeat(80)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut blocks = Vec::new();
+        for i in 0..200 {
+            blocks.push(OutputBlock {
+                header: format!("big.rs#L{}-{}", i * 500 + 1, (i + 1) * 500),
+                content: big_content.clone(),
+                line_start: i * 500 + 1,
+                line_end: (i + 1) * 500,
+            });
+        }
+        let out = assemble_with_budget(&blocks);
+        assert!(out.len() <= MAX_TOOL_OUTPUT_CHARS);
+        assert!(out.contains("truncated to fit output size limit"));
+        assert!(out.contains("elided, use Read"));
+    }
+
+    #[test]
+    fn budget_first_line_capped_at_120() {
+        let long_line = format!("1: {}", "x".repeat(200));
+        let blocks = vec![
+            OutputBlock {
+                header: "file.rs#L1-5".to_string(),
+                content: "1: short line".to_string(),
+                line_start: 1,
+                line_end: 5,
+            },
+        ];
+        // This block fits fully, so test the truncation on a block that exceeds budget.
+        let big = "y".repeat(MAX_TOOL_OUTPUT_CHARS);
+        let blocks2 = vec![
+            OutputBlock {
+                header: "a.rs#L1-999".to_string(),
+                content: big,
+                line_start: 1,
+                line_end: 999,
+            },
+            OutputBlock {
+                header: "b.rs#L1-10".to_string(),
+                content: long_line,
+                line_start: 1,
+                line_end: 10,
+            },
+        ];
+        let out = assemble_with_budget(&blocks2);
+        // The second block should be truncated. Its first line is >120 chars.
+        // Verify the output contains the ellipsis marker for long line.
+        assert!(out.contains("…"));
+        // Verify within budget.
+        assert!(out.len() <= MAX_TOOL_OUTPUT_CHARS);
+        // First block's full output (all 'y's) also gets budget-applied:
+        // since it alone exceeds budget, even it gets truncated form.
+        assert!(out.contains("elided, use Read"));
+
+        // Test blocks that fit fine.
+        let out1 = assemble_with_budget(&blocks);
+        assert!(out1.contains("1: short line"));
+        assert!(!out1.contains("truncated"));
+    }
+
+    #[test]
+    fn budget_single_line_chunk_no_elision() {
+        // Single-line chunk: line_end == line_start, so no elision marker needed.
+        // Put it behind a budget-buster so it gets truncated form.
+        let big = "z".repeat(MAX_TOOL_OUTPUT_CHARS);
+        let blocks2 = vec![
+            OutputBlock {
+                header: "huge.rs#L1-999".to_string(),
+                content: big,
+                line_start: 1,
+                line_end: 999,
+            },
+            OutputBlock {
+                header: "file.rs#L5-5".to_string(),
+                content: "5: let x = 1;".to_string(),
+                line_start: 5,
+                line_end: 5,
+            },
+        ];
+        let out = assemble_with_budget(&blocks2);
+        // line_end == line_start → no "elided" line for this block
+        assert!(out.contains("file.rs#L5-5"));
+        assert!(out.contains("5: let x = 1;"));
+        // But the "elided" marker should appear for the first (big) block
+        assert!(out.contains("elided, use Read"));
+    }
 }
 
 /// Execute the query pipeline and format the results as plain text.
@@ -578,21 +784,26 @@ async fn do_query(
                 }
                 return format!("No results found for: {information_request}");
             }
-            let mut out = String::new();
-            for r in &result.results {
-                if !out.is_empty() {
-                    out.push_str("\n\n");
-                }
-                let caller_tag = match (r.callers, r.caller_files) {
-                    (Some(c), Some(f)) => format!(" [callers:{c} files:{f}]"),
-                    _ => String::new(),
-                };
-                out.push_str(&format!(
-                    "{}#L{}-{}{}\n{}",
-                    r.file, r.line_start, r.line_end, caller_tag, r.content
-                ));
-            }
-            out
+            let blocks: Vec<OutputBlock> = result
+                .results
+                .iter()
+                .map(|r| {
+                    let caller_tag = match (r.callers, r.caller_files) {
+                        (Some(c), Some(f)) => format!(" [callers:{c} files:{f}]"),
+                        _ => String::new(),
+                    };
+                    OutputBlock {
+                        header: format!(
+                            "{}#L{}-{}{}",
+                            r.file, r.line_start, r.line_end, caller_tag
+                        ),
+                        content: r.content.clone(),
+                        line_start: r.line_start,
+                        line_end: r.line_end,
+                    }
+                })
+                .collect();
+            assemble_with_budget(&blocks)
         }
     }
 }
@@ -728,7 +939,7 @@ pub async fn run_file_retrieval(
     // Cap to requested top_k after reranking.
     let final_count = top_k.min(rerank_output.reranked_indices.len());
     let display_path = &db_key;
-    let mut out = String::new();
+    let mut blocks: Vec<OutputBlock> = Vec::new();
 
     for k in 0..final_count {
         let idx = rerank_output.reranked_indices[k];
@@ -739,26 +950,24 @@ pub async fn run_file_retrieval(
         match (numbered_text, selection) {
             (Some(text), Some(ranges)) if !ranges.is_empty() => {
                 for &(s, e) in ranges {
-                    if !out.is_empty() {
-                        out.push_str("\n\n");
-                    }
                     let sliced = crate::query::engine::slice_numbered(text, chunk.line_start, s, e);
-                    out.push_str(&format!("{}#L{}-{}\n{}", display_path, s, e, sliced));
+                    blocks.push(OutputBlock {
+                        header: format!("{}#L{}-{}", display_path, s, e),
+                        content: sliced,
+                        line_start: s,
+                        line_end: e,
+                    });
                 }
             }
             (Some(text), _) => {
-                if !out.is_empty() {
-                    out.push_str("\n\n");
-                }
-                out.push_str(&format!(
-                    "{}#L{}-{}\n{}",
-                    display_path, chunk.line_start, chunk.line_end, text
-                ));
+                blocks.push(OutputBlock {
+                    header: format!("{}#L{}-{}", display_path, chunk.line_start, chunk.line_end),
+                    content: text.to_string(),
+                    line_start: chunk.line_start,
+                    line_end: chunk.line_end,
+                });
             }
             (None, _) => {
-                if !out.is_empty() {
-                    out.push_str("\n\n");
-                }
                 let fallback = chunk
                     .content
                     .lines()
@@ -766,18 +975,21 @@ pub async fn run_file_retrieval(
                     .map(|(i, line)| format!("{}: {}", chunk.line_start + i as u32, line))
                     .collect::<Vec<_>>()
                     .join("\n");
-                out.push_str(&format!(
-                    "{}#L{}-{}\n{}",
-                    display_path, chunk.line_start, chunk.line_end, fallback
-                ));
+                blocks.push(OutputBlock {
+                    header: format!("{}#L{}-{}", display_path, chunk.line_start, chunk.line_end),
+                    content: fallback,
+                    line_start: chunk.line_start,
+                    line_end: chunk.line_end,
+                });
             }
         }
     }
 
-    if out.is_empty() {
-        out.push_str(&format!("No relevant chunks found for query in file: {file_path}"));
+    if blocks.is_empty() {
+        return format!("No relevant chunks found for query in file: {file_path}");
     }
 
+    let mut out = assemble_with_budget(&blocks);
     out.push_str(
         "\n\n---\nSnippets may be incomplete. \
          Use the Read tool with the returned line ranges \
