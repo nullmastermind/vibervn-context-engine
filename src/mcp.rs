@@ -31,8 +31,11 @@ const MAX_FIRST_LINE_CHARS: usize = 120;
 struct OutputBlock {
     header: String,
     content: String,
+    file: String,
     line_start: u32,
     line_end: u32,
+    callers: Option<u32>,
+    caller_files: Option<u32>,
 }
 
 /// Assemble result blocks into a single string respecting `MAX_TOOL_OUTPUT_CHARS`.
@@ -111,6 +114,139 @@ fn assemble_with_budget(blocks: &[OutputBlock]) -> String {
     }
 
     out
+}
+
+/// Merge output blocks from the same file whose line ranges overlap or are
+/// adjacent (next.line_start <= current.line_end + 1). Merged content is
+/// re-read from the filesystem; if the read fails, original content strings
+/// are concatenated with line-number dedup.
+///
+/// Preserves first-occurrence position: the merged block occupies the slot of
+/// the earliest block in its file group. Blocks from different files pass
+/// through unchanged.
+fn merge_overlapping_blocks(blocks: Vec<OutputBlock>) -> Vec<OutputBlock> {
+    if blocks.len() <= 1 {
+        return blocks;
+    }
+
+    // Group by file. Normalize path separators for grouping on Windows
+    // (the index stores native `\` but sub-query paths may use `/`).
+    let normalize_key = |file: &str| -> String {
+        if cfg!(windows) {
+            file.replace('/', "\\")
+        } else {
+            file.to_string()
+        }
+    };
+
+    // Group by normalized file key. Collect (original_index, block).
+    let mut by_file: std::collections::HashMap<String, Vec<(usize, OutputBlock)>> =
+        std::collections::HashMap::new();
+    for (i, block) in blocks.into_iter().enumerate() {
+        let key = normalize_key(&block.file);
+        by_file.entry(key).or_default().push((i, block));
+    }
+
+    // Merge within each file group.
+    let mut positioned: Vec<(usize, OutputBlock)> = Vec::new();
+
+    for (_file, mut group) in by_file {
+        if group.len() == 1 {
+            let (idx, block) = group.remove(0);
+            positioned.push((idx, block));
+            continue;
+        }
+
+        // Sort by line_start within file.
+        group.sort_unstable_by_key(|(_, b)| b.line_start);
+
+        // Merge pass: accumulate (min_orig_idx, block, original_contents).
+        // min_orig_idx tracks the earliest original position of any block
+        // that was merged into this entry — used for output ordering.
+        let mut merged: Vec<(usize, OutputBlock, Vec<String>)> = Vec::new();
+
+        for (orig_idx, next) in group {
+            if let Some((min_idx, current, originals)) = merged.last_mut() {
+                if next.line_start <= current.line_end + 1 {
+                    current.line_end = current.line_end.max(next.line_end);
+                    *min_idx = (*min_idx).min(orig_idx);
+                    // Combine caller stats: take the max across merged blocks.
+                    current.callers = match (current.callers, next.callers) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        (a, b) => a.or(b),
+                    };
+                    current.caller_files = match (current.caller_files, next.caller_files) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        (a, b) => a.or(b),
+                    };
+                    originals.push(next.content);
+                } else {
+                    let content_snapshot = next.content.clone();
+                    merged.push((orig_idx, next, vec![content_snapshot]));
+                }
+            } else {
+                let content_snapshot = next.content.clone();
+                merged.push((orig_idx, next, vec![content_snapshot]));
+            }
+        }
+
+        // Rebuild content and header for merged blocks.
+        for (_, block, originals) in &mut merged {
+            if originals.len() > 1 {
+                // Multiple blocks were merged — try FS re-read for the full range.
+                match crate::query::engine::read_lines_from_fs(
+                    &block.file,
+                    block.line_start,
+                    block.line_end,
+                ) {
+                    Ok(text) => block.content = text,
+                    Err(_) => {
+                        // Fallback: union original content lines, dedup by
+                        // line-number prefix, sort by line number.
+                        block.content = merge_content_fallback(originals);
+                    }
+                }
+            }
+            // Rebuild header with updated range + caller tag.
+            let caller_tag = match (block.callers, block.caller_files) {
+                (Some(c), Some(f)) => format!(" [callers:{c} files:{f}]"),
+                _ => String::new(),
+            };
+            block.header = format!(
+                "{}#L{}-{}{}",
+                block.file, block.line_start, block.line_end, caller_tag
+            );
+        }
+
+        // Use the tracked min_orig_idx for output ordering.
+        for (min_idx, block, _) in merged {
+            positioned.push((min_idx, block));
+        }
+    }
+
+    // Sort by the position index to restore original priority order.
+    positioned.sort_by_key(|(idx, _)| *idx);
+    positioned.into_iter().map(|(_, b)| b).collect()
+}
+
+/// Fallback content merge: union all numbered lines from the original content
+/// strings, dedup by line number, sort ascending. Only used when the FS re-read
+/// fails (file moved/deleted mid-query).
+fn merge_content_fallback(originals: &[String]) -> String {
+    let mut by_lineno: std::collections::BTreeMap<u32, &str> = std::collections::BTreeMap::new();
+    for content in originals {
+        for line in content.lines() {
+            if let Some(colon_pos) = line.find(':')
+                && let Ok(num) = line[..colon_pos].trim().parse::<u32>()
+            {
+                by_lineno.entry(num).or_insert(line);
+            }
+        }
+    }
+    if by_lineno.is_empty() {
+        return originals.join("\n");
+    }
+    by_lineno.values().copied().collect::<Vec<_>>().join("\n")
 }
 
 // ─── Tool argument schema ─────────────────────────────────────────────────
@@ -787,14 +923,20 @@ mod tests {
             OutputBlock {
                 header: "file.rs#L1-10".to_string(),
                 content: "1: fn main() {\n2:   println!(\"hi\");\n3: }".to_string(),
+                file: "file.rs".to_string(),
                 line_start: 1,
                 line_end: 10,
+            callers: None,
+            caller_files: None,
             },
             OutputBlock {
                 header: "file.rs#L20-30".to_string(),
                 content: "20: fn foo() {\n21:   bar();\n22: }".to_string(),
+                file: "file.rs".to_string(),
                 line_start: 20,
                 line_end: 30,
+            callers: None,
+            caller_files: None,
             },
         ];
         let out = assemble_with_budget(&blocks);
@@ -814,8 +956,11 @@ mod tests {
             blocks.push(OutputBlock {
                 header: format!("big.rs#L{}-{}", i * 500 + 1, (i + 1) * 500),
                 content: big_content.clone(),
+                file: "big.rs".to_string(),
                 line_start: i * 500 + 1,
                 line_end: (i + 1) * 500,
+            callers: None,
+            caller_files: None,
             });
         }
         let out = assemble_with_budget(&blocks);
@@ -831,8 +976,11 @@ mod tests {
             OutputBlock {
                 header: "file.rs#L1-5".to_string(),
                 content: "1: short line".to_string(),
+                file: "file.rs".to_string(),
                 line_start: 1,
                 line_end: 5,
+            callers: None,
+            caller_files: None,
             },
         ];
         // This block fits fully, so test the truncation on a block that exceeds budget.
@@ -841,14 +989,20 @@ mod tests {
             OutputBlock {
                 header: "a.rs#L1-999".to_string(),
                 content: big,
+                file: "a.rs".to_string(),
                 line_start: 1,
                 line_end: 999,
+            callers: None,
+            caller_files: None,
             },
             OutputBlock {
                 header: "b.rs#L1-10".to_string(),
                 content: long_line,
+                file: "b.rs".to_string(),
                 line_start: 1,
                 line_end: 10,
+            callers: None,
+            caller_files: None,
             },
         ];
         let out = assemble_with_budget(&blocks2);
@@ -876,14 +1030,20 @@ mod tests {
             OutputBlock {
                 header: "huge.rs#L1-999".to_string(),
                 content: big,
+                file: "huge.rs".to_string(),
                 line_start: 1,
                 line_end: 999,
+            callers: None,
+            caller_files: None,
             },
             OutputBlock {
                 header: "file.rs#L5-5".to_string(),
                 content: "5: let x = 1;".to_string(),
+                file: "file.rs".to_string(),
                 line_start: 5,
                 line_end: 5,
+            callers: None,
+            caller_files: None,
             },
         ];
         let out = assemble_with_budget(&blocks2);
@@ -893,9 +1053,245 @@ mod tests {
         // But the "elided" marker should appear for the first (big) block
         assert!(out.contains("elided, use Read"));
     }
-}
 
-/// Execute the query pipeline and format the results as plain text.
+    #[test]
+    fn merge_blocks_no_overlap() {
+        let blocks = vec![
+            OutputBlock {
+                header: "a.rs#L1-10".into(),
+                content: "1: aaa".into(),
+                file: "a.rs".into(),
+                line_start: 1,
+                line_end: 10,
+            callers: None,
+            caller_files: None,
+            },
+            OutputBlock {
+                header: "a.rs#L20-30".into(),
+                content: "20: bbb".into(),
+                file: "a.rs".into(),
+                line_start: 20,
+                line_end: 30,
+            callers: None,
+            caller_files: None,
+            },
+        ];
+        let merged = merge_overlapping_blocks(blocks);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].line_start, 1);
+        assert_eq!(merged[1].line_start, 20);
+    }
+
+    #[test]
+    fn merge_blocks_overlap_same_file() {
+        let blocks = vec![
+            OutputBlock {
+                header: "a.rs#L1-50".into(),
+                content: "1: aaa\n2: bbb".into(),
+                file: "a.rs".into(),
+                line_start: 1,
+                line_end: 50,
+                callers: None,
+                caller_files: None,
+            },
+            OutputBlock {
+                header: "a.rs#L26-75".into(),
+                content: "26: ccc\n27: ddd".into(),
+                file: "a.rs".into(),
+                line_start: 26,
+                line_end: 75,
+                callers: None,
+                caller_files: None,
+            },
+        ];
+        let merged = merge_overlapping_blocks(blocks);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].line_start, 1);
+        assert_eq!(merged[0].line_end, 75);
+        // Header uses the same file path as inputs + merged range, no caller tag.
+        assert_eq!(merged[0].header, "a.rs#L1-75");
+    }
+
+    #[test]
+    fn merge_blocks_combines_caller_tags() {
+        let blocks = vec![
+            OutputBlock {
+                header: "a.rs#L1-50 [callers:3 files:2]".into(),
+                content: "1: aaa".into(),
+                file: "a.rs".into(),
+                line_start: 1,
+                line_end: 50,
+                callers: Some(3),
+                caller_files: Some(2),
+            },
+            OutputBlock {
+                header: "a.rs#L26-75 [callers:7 files:4]".into(),
+                content: "26: bbb".into(),
+                file: "a.rs".into(),
+                line_start: 26,
+                line_end: 75,
+                callers: Some(7),
+                caller_files: Some(4),
+            },
+        ];
+        let merged = merge_overlapping_blocks(blocks);
+        assert_eq!(merged.len(), 1);
+        // Caller stats: max(3,7)=7, max(2,4)=4
+        assert_eq!(merged[0].callers, Some(7));
+        assert_eq!(merged[0].caller_files, Some(4));
+        // Header includes the combined caller tag.
+        assert_eq!(merged[0].header, "a.rs#L1-75 [callers:7 files:4]");
+    }
+
+    #[test]
+    fn merge_blocks_adjacent() {
+        let blocks = vec![
+            OutputBlock {
+                header: "a.rs#L1-10".into(),
+                content: "1: x".into(),
+                file: "a.rs".into(),
+                line_start: 1,
+                line_end: 10,
+            callers: None,
+            caller_files: None,
+            },
+            OutputBlock {
+                header: "a.rs#L11-20".into(),
+                content: "11: y".into(),
+                file: "a.rs".into(),
+                line_start: 11,
+                line_end: 20,
+            callers: None,
+            caller_files: None,
+            },
+        ];
+        let merged = merge_overlapping_blocks(blocks);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].line_start, 1);
+        assert_eq!(merged[0].line_end, 20);
+    }
+
+    #[test]
+    fn merge_blocks_different_files_no_merge() {
+        let blocks = vec![
+            OutputBlock {
+                header: "a.rs#L1-50".into(),
+                content: "1: aaa".into(),
+                file: "a.rs".into(),
+                line_start: 1,
+                line_end: 50,
+            callers: None,
+            caller_files: None,
+            },
+            OutputBlock {
+                header: "b.rs#L1-50".into(),
+                content: "1: bbb".into(),
+                file: "b.rs".into(),
+                line_start: 1,
+                line_end: 50,
+            callers: None,
+            caller_files: None,
+            },
+        ];
+        let merged = merge_overlapping_blocks(blocks);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn merge_blocks_preserves_priority_order() {
+        let blocks = vec![
+            OutputBlock {
+                header: "b.rs#L1-10".into(),
+                content: "1: first".into(),
+                file: "b.rs".into(),
+                line_start: 1,
+                line_end: 10,
+            callers: None,
+            caller_files: None,
+            },
+            OutputBlock {
+                header: "a.rs#L1-50".into(),
+                content: "1: second".into(),
+                file: "a.rs".into(),
+                line_start: 1,
+                line_end: 50,
+            callers: None,
+            caller_files: None,
+            },
+            OutputBlock {
+                header: "a.rs#L26-75".into(),
+                content: "26: third".into(),
+                file: "a.rs".into(),
+                line_start: 26,
+                line_end: 75,
+            callers: None,
+            caller_files: None,
+            },
+            OutputBlock {
+                header: "b.rs#L20-30".into(),
+                content: "20: fourth".into(),
+                file: "b.rs".into(),
+                line_start: 20,
+                line_end: 30,
+            callers: None,
+            caller_files: None,
+            },
+        ];
+        let merged = merge_overlapping_blocks(blocks);
+        // b.rs: L1-10 and L20-30 not overlapping → 2 blocks
+        // a.rs: L1-50 and L26-75 overlap → 1 merged block
+        assert_eq!(merged.len(), 3);
+        // b.rs appeared first (index 0), so its blocks come first
+        assert_eq!(merged[0].file, "b.rs");
+        assert_eq!(merged[0].line_start, 1);
+        // a.rs appeared at index 1
+        assert_eq!(merged[1].file, "a.rs");
+        assert_eq!(merged[1].line_start, 1);
+        assert_eq!(merged[1].line_end, 75);
+        // b.rs second block at index 3 → comes after a.rs
+        assert_eq!(merged[2].file, "b.rs");
+        assert_eq!(merged[2].line_start, 20);
+    }
+
+    #[test]
+    fn merge_blocks_fallback_preserves_content_on_fs_failure() {
+        // Use a non-existent file path so read_lines_from_fs will fail,
+        // exercising the fallback content-merge path.
+        let blocks = vec![
+            OutputBlock {
+                header: "/nonexistent/z.rs#L1-50".into(),
+                content: "1: aaa\n2: bbb\n3: ccc".into(),
+                file: "/nonexistent/z.rs".into(),
+                line_start: 1,
+                line_end: 50,
+            callers: None,
+            caller_files: None,
+            },
+            OutputBlock {
+                header: "/nonexistent/z.rs#L26-75".into(),
+                content: "2: bbb\n26: ddd\n27: eee".into(),
+                file: "/nonexistent/z.rs".into(),
+                line_start: 26,
+                line_end: 75,
+            callers: None,
+            caller_files: None,
+            },
+        ];
+        let merged = merge_overlapping_blocks(blocks);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].line_start, 1);
+        assert_eq!(merged[0].line_end, 75);
+        assert!(merged[0].header.contains("L1-75"));
+        // Fallback should preserve original lines, deduped by line number.
+        assert!(merged[0].content.contains("1: aaa"));
+        assert!(merged[0].content.contains("2: bbb"));
+        assert!(merged[0].content.contains("3: ccc"));
+        assert!(merged[0].content.contains("26: ddd"));
+        assert!(merged[0].content.contains("27: eee"));
+        // Line "2: bbb" appeared in both blocks but should only appear once.
+        assert_eq!(merged[0].content.matches("2: bbb").count(), 1);
+    }
+}
 /// Returns a string — never panics, never returns Err.
 ///
 /// Note: neither `home_dir` nor `data_dir` is needed here — both DB opens and
@@ -964,11 +1360,15 @@ async fn do_query(
                             r.file, r.line_start, r.line_end, caller_tag
                         ),
                         content: r.content.clone(),
+                        file: r.file.clone(),
                         line_start: r.line_start,
                         line_end: r.line_end,
+                        callers: r.callers,
+                        caller_files: r.caller_files,
                     }
                 })
                 .collect();
+            let blocks = merge_overlapping_blocks(blocks);
             assemble_with_budget(&blocks)
         }
     }
@@ -1120,8 +1520,11 @@ pub async fn run_file_retrieval(
                     blocks.push(OutputBlock {
                         header: format!("{}#L{}-{}", display_path, s, e),
                         content: sliced,
+                        file: display_path.clone(),
                         line_start: s,
                         line_end: e,
+                        callers: None,
+                        caller_files: None,
                     });
                 }
             }
@@ -1129,8 +1532,11 @@ pub async fn run_file_retrieval(
                 blocks.push(OutputBlock {
                     header: format!("{}#L{}-{}", display_path, chunk.line_start, chunk.line_end),
                     content: text.to_string(),
+                    file: display_path.clone(),
                     line_start: chunk.line_start,
                     line_end: chunk.line_end,
+                    callers: None,
+                    caller_files: None,
                 });
             }
             (None, _) => {
@@ -1144,8 +1550,11 @@ pub async fn run_file_retrieval(
                 blocks.push(OutputBlock {
                     header: format!("{}#L{}-{}", display_path, chunk.line_start, chunk.line_end),
                     content: fallback,
+                    file: display_path.clone(),
                     line_start: chunk.line_start,
                     line_end: chunk.line_end,
+                    callers: None,
+                    caller_files: None,
                 });
             }
         }
@@ -1155,6 +1564,7 @@ pub async fn run_file_retrieval(
         return format!("No relevant chunks found for query in file: {file_path}");
     }
 
+    let blocks = merge_overlapping_blocks(blocks);
     let mut out = assemble_with_budget(&blocks);
     out.push_str(
         "\n\n---\nSnippets may be incomplete. \

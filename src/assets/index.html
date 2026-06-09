@@ -2520,6 +2520,70 @@ RESULT_TABS.forEach((t, i) => {
   document.getElementById(t.btn).addEventListener('click', () => activateResultTab(i));
 });
 
+// Merge results from the same file whose line ranges overlap or are adjacent
+// (next.line_start <= current.line_end + 1). Mirrors the backend
+// merge_overlapping_blocks in mcp.rs so Search UI output matches MCP output.
+// Path keys are normalized to forward slashes; original priority order is
+// preserved by tracking the earliest index of any merged group.
+function mergeOverlappingResults(results) {
+  if (!results || results.length <= 1) return results || [];
+
+  const normKey = (file) => (file || '').replace(/\\/g, '/');
+  const byFile = new Map();
+  results.forEach((r, i) => {
+    const key = normKey(r.file);
+    if (!byFile.has(key)) byFile.set(key, []);
+    byFile.get(key).push({ origIdx: i, r });
+  });
+
+  // Dedupe numbered content lines by leading "N:" prefix, sort by line number.
+  const mergeContent = (contents) => {
+    const byLineno = new Map();
+    contents.forEach((c) => {
+      (c || '').split('\n').forEach((line) => {
+        const m = /^\s*(\d+):/.exec(line);
+        if (m) {
+          const n = parseInt(m[1], 10);
+          if (!byLineno.has(n)) byLineno.set(n, line);
+        }
+      });
+    });
+    if (byLineno.size === 0) return contents.join('\n');
+    return [...byLineno.keys()].sort((a, b) => a - b).map((n) => byLineno.get(n)).join('\n');
+  };
+
+  const positioned = [];
+  byFile.forEach((group) => {
+    if (group.length === 1) {
+      positioned.push(group[0]);
+      return;
+    }
+    group.sort((a, b) => a.r.line_start - b.r.line_start);
+    const merged = [];
+    for (const { origIdx, r } of group) {
+      const last = merged[merged.length - 1];
+      if (last && r.line_start <= last.cur.line_end + 1) {
+        last.cur.line_end = Math.max(last.cur.line_end, r.line_end);
+        last.minIdx = Math.min(last.minIdx, origIdx);
+        last.cur.score = Math.max(last.cur.score || 0, r.score || 0);
+        const maxOrNull = (a, b) => (a == null && b == null ? null : Math.max(a || 0, b || 0));
+        last.cur.callers = maxOrNull(last.cur.callers, r.callers);
+        last.cur.caller_files = maxOrNull(last.cur.caller_files, r.caller_files);
+        last.contents.push(r.content || '');
+      } else {
+        merged.push({ minIdx: origIdx, cur: { ...r }, contents: [r.content || ''] });
+      }
+    }
+    merged.forEach(({ minIdx, cur, contents }) => {
+      if (contents.length > 1) cur.content = mergeContent(contents);
+      positioned.push({ origIdx: minIdx, r: cur });
+    });
+  });
+
+  positioned.sort((a, b) => a.origIdx - b.origIdx);
+  return positioned.map((p) => p.r);
+}
+
 function renderSearchResults(results, containerId, emptyId) {
   const container = document.getElementById(containerId || 'search-results');
   const emptyEl = document.getElementById(emptyId || 'search-empty');
@@ -2530,6 +2594,8 @@ function renderSearchResults(results, containerId, emptyId) {
     return;
   }
   emptyEl.classList.add('hidden');
+
+  results = mergeOverlappingResults(results);
 
   results.forEach((r) => {
     const card = document.createElement('div');
