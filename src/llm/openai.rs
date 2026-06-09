@@ -194,18 +194,46 @@ pub async fn complete(
         prompt_cache_key: None,
     };
 
-    let resp = http
+    info!(
+        url = %url,
+        model = %model,
+        structured = structured,
+        "openai completion request"
+    );
+
+    let resp = match http
         .post(&url)
         .header("Authorization", format!("Bearer {api_key}"))
         .json(&body)
         .send()
         .await
-        .context("OpenAI HTTP request failed")?;
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(
+                url = %url,
+                model = %model,
+                error = %e,
+                error_debug = ?e,
+                is_timeout = e.is_timeout(),
+                is_connect = e.is_connect(),
+                "openai completion: connection-level failure"
+            );
+            return Err(e).context("OpenAI HTTP request failed");
+        }
+    };
 
     let status = resp.status();
     let text = resp.text().await.context("failed to read OpenAI response body")?;
 
     if !status.is_success() {
+        tracing::error!(
+            url = %url,
+            model = %model,
+            status = %status,
+            response_body = %text,
+            "openai completion HTTP error"
+        );
         bail!("OpenAI API returned HTTP {status}: {text}");
     }
 
@@ -312,18 +340,49 @@ pub async fn complete_with_tools(
         prompt_cache_key: prompt_cache_key.map(|s| s.to_owned()),
     };
 
-    let resp = http
+    let request_json = serde_json::to_string(&body).unwrap_or_default();
+    info!(
+        url = %url,
+        model = %model,
+        tool_count = tools.len(),
+        force_tool_use = force_tool_use,
+        request_bytes = request_json.len(),
+        "openai tool-call request"
+    );
+
+    let resp = match http
         .post(&url)
         .header("Authorization", format!("Bearer {api_key}"))
         .json(&body)
         .send()
         .await
-        .context("OpenAI tool-calling HTTP request failed")?;
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(
+                url = %url,
+                model = %model,
+                error = %e,
+                error_debug = ?e,
+                is_timeout = e.is_timeout(),
+                is_connect = e.is_connect(),
+                "openai tool-call: connection-level failure"
+            );
+            return Err(e).context("OpenAI tool-calling HTTP request failed");
+        }
+    };
 
     let status = resp.status();
     let text = resp.text().await.context("failed to read OpenAI response body")?;
 
     if !status.is_success() {
+        tracing::error!(
+            url = %url,
+            model = %model,
+            status = %status,
+            response_body = %text,
+            "openai tool-call HTTP error"
+        );
         bail!("OpenAI API returned HTTP {status}: {text}");
     }
 

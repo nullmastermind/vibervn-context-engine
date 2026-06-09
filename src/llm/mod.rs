@@ -83,7 +83,7 @@ impl LlmClient {
             return None;
         }
         let http = Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(300))
             .build()
             .ok()?;
         Some(Self {
