@@ -282,6 +282,15 @@ async fn put_config(
     // Server always stamps the current version regardless of what the client sent.
     settings.version = CURRENT_VERSION;
 
+    // Validate voyage_base_url if provided.
+    if let Some(ref url) = settings.embedding.voyage_base_url {
+        let trimmed = url.trim();
+        if !trimmed.is_empty() && reqwest::Url::parse(trimmed).is_err() {
+            let body = json!({ "error": "embedding.voyage_base_url is not a valid URL" });
+            return (StatusCode::BAD_REQUEST, Json(body)).into_response();
+        }
+    }
+
     // Normalize repo paths to OS-native separators so D:/foo and D:\foo unify.
     settings.repos = settings
         .repos
@@ -879,6 +888,7 @@ async fn post_query(
     let voyage_client = match VoyageClient::new(
         settings.embedding.model.clone(),
         settings.embedding.api_keys.clone(),
+        settings.embedding.voyage_base_url.as_deref(),
     ) {
         Ok(c) => c,
         Err(e) => {

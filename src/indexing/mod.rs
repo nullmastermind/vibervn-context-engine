@@ -647,6 +647,7 @@ async fn run_consumer(
             match VoyageClient::new(
                 settings_ref.embedding.model.clone(),
                 settings_ref.embedding.api_keys.clone(),
+                settings_ref.embedding.voyage_base_url.as_deref(),
             ) {
                 Ok(c) => Some(c),
                 Err(e) => {

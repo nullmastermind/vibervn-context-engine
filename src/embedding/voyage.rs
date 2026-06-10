@@ -12,6 +12,29 @@ use crate::embedding::InputType;
 const VOYAGE_ENDPOINT: &str = "https://api.voyageai.com/v1/embeddings";
 pub const MAX_BATCH_SIZE: usize = 128;
 
+/// Resolve the embeddings URL from an optional user-supplied base.
+///
+/// Normalization rules (mirrors `llm::openai::chat_url`):
+///   * `None`, empty, or whitespace-only → `VOYAGE_ENDPOINT`.
+///   * Trim whitespace, then strip a trailing `/`.
+///   * If the path already ends in `/embeddings`, keep it as-is.
+///   * Otherwise append `/embeddings`.
+pub fn voyage_url(base: Option<&str>) -> String {
+    let raw = match base {
+        Some(s) => s.trim(),
+        None => "",
+    };
+    if raw.is_empty() {
+        return VOYAGE_ENDPOINT.to_owned();
+    }
+    let trimmed = raw.trim_end_matches('/');
+    if trimmed.ends_with("/embeddings") {
+        trimmed.to_owned()
+    } else {
+        format!("{trimmed}/embeddings")
+    }
+}
+
 // ─── Request / response shapes ────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -45,13 +68,15 @@ struct VoyageInner {
     query_http: Client,
     model: String,
     api_keys: Vec<String>,
+    /// Resolved embeddings endpoint URL.
+    endpoint: String,
     /// Round-robin cursor — atomically advanced on each batch call.
     key_cursor: AtomicUsize,
 }
 
 impl VoyageClient {
     /// Create a new client. Returns `Err` if `api_keys` is empty.
-    pub fn new(model: String, api_keys: Vec<String>) -> Result<Self> {
+    pub fn new(model: String, api_keys: Vec<String>, base_url: Option<&str>) -> Result<Self> {
         if api_keys.is_empty() {
             bail!("VoyageAI client requires at least one API key");
         }
@@ -63,12 +88,14 @@ impl VoyageClient {
             .timeout(Duration::from_secs(30))
             .build()
             .context("build query reqwest client")?;
+        let endpoint = voyage_url(base_url);
         Ok(Self {
             inner: Arc::new(VoyageInner {
                 http,
                 query_http,
                 model,
                 api_keys,
+                endpoint,
                 key_cursor: AtomicUsize::new(0),
             }),
         })
@@ -215,7 +242,7 @@ impl VoyageClient {
         };
 
         let response = client
-            .post(VOYAGE_ENDPOINT)
+            .post(&self.inner.endpoint)
             .bearer_auth(key)
             .json(&body)
             .send()
@@ -249,4 +276,57 @@ impl VoyageClient {
 enum EmbedError {
     RateLimited,
     Other(anyhow::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn voyage_url_default_when_none() {
+        assert_eq!(voyage_url(None), VOYAGE_ENDPOINT);
+    }
+
+    #[test]
+    fn voyage_url_default_when_blank() {
+        assert_eq!(voyage_url(Some("")), VOYAGE_ENDPOINT);
+        assert_eq!(voyage_url(Some("   ")), VOYAGE_ENDPOINT);
+        assert_eq!(voyage_url(Some("\t\n")), VOYAGE_ENDPOINT);
+    }
+
+    #[test]
+    fn voyage_url_appends_to_base() {
+        assert_eq!(
+            voyage_url(Some("https://my-proxy.com/v1")),
+            "https://my-proxy.com/v1/embeddings"
+        );
+        assert_eq!(
+            voyage_url(Some("http://localhost:8080/api/v1")),
+            "http://localhost:8080/api/v1/embeddings"
+        );
+    }
+
+    #[test]
+    fn voyage_url_strips_trailing_slash() {
+        assert_eq!(
+            voyage_url(Some("https://my-proxy.com/v1/")),
+            "https://my-proxy.com/v1/embeddings"
+        );
+    }
+
+    #[test]
+    fn voyage_url_accepts_full_form() {
+        assert_eq!(
+            voyage_url(Some("https://my-proxy.com/v1/embeddings")),
+            "https://my-proxy.com/v1/embeddings"
+        );
+    }
+
+    #[test]
+    fn voyage_url_accepts_full_form_trailing_slash() {
+        assert_eq!(
+            voyage_url(Some("https://my-proxy.com/v1/embeddings/")),
+            "https://my-proxy.com/v1/embeddings"
+        );
+    }
 }

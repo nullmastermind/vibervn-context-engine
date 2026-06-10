@@ -1437,6 +1437,7 @@ async fn do_query(
     let voyage_client = match VoyageClient::new(
         settings.embedding.model.clone(),
         settings.embedding.api_keys.clone(),
+        settings.embedding.voyage_base_url.as_deref(),
     ) {
         Ok(c) => c,
         Err(e) => return format!("Error: failed to create embedding client: {e}"),
@@ -1583,6 +1584,7 @@ pub async fn run_file_retrieval(
     let voyage_client = match VoyageClient::new(
         settings.embedding.model.clone(),
         settings.embedding.api_keys.clone(),
+        settings.embedding.voyage_base_url.as_deref(),
     ) {
         Ok(c) => c,
         Err(e) => return format!("Error: failed to create embedding client: {e}"),

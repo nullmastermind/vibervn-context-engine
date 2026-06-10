@@ -517,6 +517,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             prompt_cache_key: Some("test-key-123".to_owned()),
+            reasoning: None,
         };
         let json = serde_json::to_value(&body).expect("serialize");
         assert_eq!(json.get("prompt_cache_key").and_then(|v| v.as_str()), Some("test-key-123"));
@@ -533,6 +534,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             prompt_cache_key: None,
+            reasoning: None,
         };
         let json = serde_json::to_value(&body).expect("serialize");
         assert!(json.get("prompt_cache_key").is_none());

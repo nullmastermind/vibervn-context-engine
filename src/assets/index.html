@@ -229,6 +229,18 @@
                         focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active" />
         </div>
         <div class="mb-4">
+          <label data-i18n="embed.baseUrl" class="block text-xs font-medium text-gray-500 dark:text-wiki-text-muted mb-1" for="embedding-base-url">
+            Base URL
+          </label>
+          <input id="embedding-base-url" type="text" placeholder="https://api.voyageai.com/v1" data-i18n-ph="embed.baseUrlPlaceholder"
+                 class="w-full border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm font-mono
+                        placeholder:text-gray-400 dark:placeholder:text-wiki-text-muted
+                        focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active" />
+          <p data-i18n="embed.baseUrlHelp" class="mt-1 text-xs text-gray-400 dark:text-wiki-text-muted">
+            Custom Voyage AI-compatible endpoint. Leave blank to use api.voyageai.com. Accepts either the base form (…/v1) or the full /v1/embeddings URL.
+          </p>
+        </div>
+        <div class="mb-4">
           <label data-i18n="embed.concurrency" class="block text-xs font-medium text-gray-500 dark:text-wiki-text-muted mb-1" for="embedding-concurrency">
             Concurrent batches per key
           </label>
@@ -1110,6 +1122,11 @@ const STR = {
   // Settings — Embedding
   'embed.heading':     { en: `Embedding Provider`, vi: `Embedding Provider`, zh: `嵌入向量提供商` },
   'embed.model':       { en: `Embedding model`, vi: `Embedding model`, zh: `嵌入模型` },
+  'embed.baseUrl':     { en: `Base URL`, vi: `Base URL`, zh: `Base URL` },
+  'embed.baseUrlHelp': { en: `Custom Voyage AI-compatible endpoint. Leave blank to use api.voyageai.com. Accepts either the base form (…/v1) or the full /v1/embeddings URL.`,
+                         vi: `Endpoint tương thích Voyage AI. Để trống để dùng api.voyageai.com. Chấp nhận dạng base (…/v1) hoặc URL đầy đủ /v1/embeddings.`,
+                         zh: `自定义 Voyage AI 兼容 endpoint。留空使用 api.voyageai.com。接受 base 形式（…/v1）或完整的 /v1/embeddings URL。` },
+  'embed.baseUrlPlaceholder': { en: `https://api.voyageai.com/v1`, vi: `https://api.voyageai.com/v1`, zh: `https://api.voyageai.com/v1` },
   'embed.concurrency': { en: `Concurrent batches per key`, vi: `Số batch đồng thời mỗi key`, zh: `每个密钥的并发批次数` },
   'field.provider':    { en: `Provider`, vi: `Provider`, zh: `提供商` },
   'field.apiKeys':     { en: `API keys`, vi: `API key`, zh: `API 密钥` },
@@ -1492,6 +1509,11 @@ function maskKey(k) {
   return '••••••••' + k.slice(-4);
 }
 
+function isValidUrl(s) {
+  try { const u = new URL(s); return u.protocol === 'http:' || u.protocol === 'https:'; }
+  catch { return false; }
+}
+
 function showToast() {
   const t = document.getElementById('toast-saved');
   t.classList.remove('hidden');
@@ -1726,6 +1748,7 @@ function renderAll() {
   renderRepos();
   document.getElementById('embedding-provider').value = cfg.embedding.provider || 'voyage';
   document.getElementById('embedding-model').value = cfg.embedding.model || '';
+  document.getElementById('embedding-base-url').value = cfg.embedding.voyage_base_url || '';
   document.getElementById('embedding-concurrency').value = cfg.embedding.embed_concurrency ?? 16;
   renderKeyList('embedding-keys-list', cfg.embedding.api_keys, (idx) => {
     cfg.embedding.api_keys.splice(idx, 1);
@@ -1984,6 +2007,13 @@ document.getElementById('input-ignore-filename').addEventListener('keydown', (e)
 
 document.getElementById('embedding-model').addEventListener('input', (e) => {
   if (cfg) { cfg.embedding.model = e.target.value; saveDebounced(); }
+});
+document.getElementById('embedding-base-url').addEventListener('input', (e) => {
+  if (!cfg) return;
+  const v = e.target.value.trim();
+  if (v !== '' && !isValidUrl(v)) return;
+  cfg.embedding.voyage_base_url = v === '' ? null : v;
+  saveDebounced();
 });
 document.getElementById('embedding-concurrency').addEventListener('input', (e) => {
   if (!cfg) return;
