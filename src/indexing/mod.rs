@@ -25,6 +25,7 @@ use crate::indexing::pipeline::IndexPipeline;
 use crate::indexing::tracker::FileChange;
 use crate::indexing::watcher::start_watcher;
 use crate::store::{self, RepoDbMap};
+use crate::store::ops::set_meta;
 use crate::vector::{SearchResult, ShardedSearch, ShardedVectorIndex, VectorIndex};
 
 // ─── Repo indexing status ─────────────────────────────────────────────────
@@ -639,10 +640,20 @@ async fn run_consumer(
             status.total_files = 0;
         }
 
-        // Build embedding client — skip if no keys configured.
+        // Build embedding client — reject if no keys configured.
         let voyage_client = if settings_ref.embedding.api_keys.is_empty() {
-            info!(repo = %repo, "no embedding API keys configured, skipping embed");
-            None
+            let msg = "no embedding API keys configured — cannot index without embeddings".to_string();
+            error!(repo = %repo, "{}", msg);
+            let mut statuses = engine_ref.statuses.write().await;
+            let s = statuses.entry(repo.clone()).or_default();
+            s.state = IndexState::Error;
+            s.error = Some(msg.clone());
+            engine_ref.event_bus.emit(IndexEvent::Failed {
+                repo: repo.clone(),
+                error: msg,
+            });
+            engine_ref.clear_cancel_token(&repo).await;
+            continue;
         } else {
             match VoyageClient::new(
                 settings_ref.embedding.model.clone(),
@@ -769,7 +780,7 @@ async fn run_consumer(
                 s.error = None;
                 // Persist durable timestamp so the MCP tool can check freshness
                 // without relying on in-memory state.
-                let _ = crate::store::ops::set_meta(&db, "last_indexed_at", &chrono::Utc::now().to_rfc3339()).await;
+                let _ = set_meta(&db, "last_indexed_at", &chrono::Utc::now().to_rfc3339()).await;
                 // Clear needs_rebuild flag after successful rebuild.
                 if force_rebuild {
                     let _ = db.query("DELETE FROM index_meta WHERE key = 'needs_rebuild'").await;
@@ -782,8 +793,8 @@ async fn run_consumer(
                 });
             }
             Err(e) => {
-                let err_str = format!("{e:#}");
-                let is_cancelled = err_str.contains("cancelled");
+                let is_cancelled = e.downcast_ref::<pipeline::PipelineAbort>()
+                    .is_some_and(|a| matches!(a, pipeline::PipelineAbort::Cancelled));
                 if is_cancelled {
                     info!(repo = %repo, "indexing cancelled by user");
                     let mut statuses = engine_ref.statuses.write().await;
@@ -794,7 +805,10 @@ async fn run_consumer(
                         repo: repo.clone(),
                     });
                 } else {
+                    let err_str = format!("{e:#}");
                     error!(repo = %repo, error = %err_str, "indexing failed");
+                    // Mark for full rebuild on next attempt so the index is consistent.
+                    let _ = set_meta(&db, "needs_rebuild", "1").await;
                     let mut statuses = engine_ref.statuses.write().await;
                     let s = statuses.entry(repo.clone()).or_default();
                     s.state = IndexState::Error;

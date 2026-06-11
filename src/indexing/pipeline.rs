@@ -136,6 +136,25 @@ struct EmbeddedFile {
     cache_miss_chunks: u64,
 }
 
+/// Distinguishes user-initiated cancel from an embedding API failure.
+/// `run_consumer` uses this to decide whether to set `needs_rebuild`.
+#[derive(Debug)]
+pub enum PipelineAbort {
+    Cancelled,
+    EmbeddingFailed(String),
+}
+
+impl std::fmt::Display for PipelineAbort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => write!(f, "indexing cancelled"),
+            Self::EmbeddingFailed(msg) => write!(f, "embedding failed: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for PipelineAbort {}
+
 #[derive(Default)]
 pub struct IndexPipelineStats {
     pub indexed_files: u64,
@@ -737,6 +756,12 @@ impl IndexPipeline {
 
         // Wrap the parse receiver as a stream of ParseOutput, embed each
         // concurrently up to `embed_concurrency` at a time.
+        // Shared error slot: when Voyage fails, Stage 2 writes the error here
+        // and cancels the token. Stage 3 checks this after its loop to distinguish
+        // "user cancelled" from "Voyage failed".
+        let embed_error: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
         {
             let voyage_clone = voyage.clone();
             let done_counter_clone = done_counter.clone();
@@ -746,6 +771,7 @@ impl IndexPipeline {
             let bus_clone = event_bus_clone.clone();
             let hints_clone = key_hints_owned.clone();
             let cancel_clone = cancel_token.cloned();
+            let embed_error_clone = embed_error.clone();
 
             tokio::spawn(async move {
                 // Convert mpsc receiver to a stream that stops on cancel.
@@ -771,6 +797,7 @@ impl IndexPipeline {
                         let bus_ref = bus_clone.clone();
                         let hints_ref = hints_clone.clone();
                         let ct_ref = cancel_clone.clone();
+                        let err_slot = embed_error_clone.clone();
                         async move {
                             // Short-circuit if cancelled — skip the expensive embed call.
                             if let Some(ref ct) = ct_ref
@@ -815,12 +842,29 @@ impl IndexPipeline {
                                     let key_hint = hints_ref.first().cloned().unwrap_or_default();
                                     let embed_start = Instant::now();
 
-                                    let embed_result = embed_parsed_file(&pf, voyage_ref.as_ref(), cache_ref.clone()).await;
+                                    let embed_result = match embed_parsed_file(&pf, voyage_ref.as_ref(), cache_ref.clone()).await {
+                                        Ok(r) => r,
+                                        Err(e) => {
+                                            // Voyage failed — store error and cancel pipeline.
+                                            let msg = format!("{e:#}");
+                                            warn!(file = %file_path, error = %msg, "embed failed — aborting index");
+                                            if let Ok(mut slot) = err_slot.lock()
+                                                && slot.is_none()
+                                            {
+                                                *slot = Some(msg);
+                                            }
+                                            if let Some(ref ct) = ct_ref {
+                                                ct.cancel();
+                                            }
+                                            return None;
+                                        }
+                                    };
 
                                     let embed_elapsed_ms = embed_start.elapsed().as_millis() as u64;
 
                                     // Detect embed failure: all embeddings empty and chunks non-zero
-                                    // indicates an API error path.
+                                    // indicates a cache-panic degradation (not a Voyage error — those
+                                    // now abort the pipeline).
                                     let embed_failed = !pf.chunks.is_empty()
                                         && embed_result.embeddings.iter().all(|e| e.is_empty());
 
@@ -1092,9 +1136,16 @@ impl IndexPipeline {
         }
 
         // If cancelled, drop remaining channel items and return early.
+        // Check the shared error slot first — if Voyage failed, return the typed
+        // EmbeddingFailed variant so run_consumer can distinguish it from user cancel.
         if cancelled {
             drop(embed_rx);
-            anyhow::bail!("indexing cancelled");
+            if let Ok(slot) = embed_error.lock()
+                && let Some(msg) = slot.clone()
+            {
+                return Err(PipelineAbort::EmbeddingFailed(msg).into());
+            }
+            return Err(PipelineAbort::Cancelled.into());
         }
 
         // ── Flush tail: remaining symbols + chunks + file_metas ─────────
@@ -2112,26 +2163,26 @@ async fn embed_parsed_file(
     pf: &ParsedFile,
     voyage: Option<&VoyageClient>,
     cache: Option<Arc<EmbeddingCache>>,
-) -> EmbedFileResult {
+) -> Result<EmbedFileResult> {
     if pf.chunks.is_empty() {
-        return EmbedFileResult {
+        return Ok(EmbedFileResult {
             embeddings: vec![],
             fully_cached: false,
             hit_chunks: 0,
             miss_chunks: 0,
-        };
+        });
     }
 
     let texts: Vec<String> = pf.chunks.iter().map(|c| c.content.clone()).collect();
 
     // No voyage client AND no cache → return empty embeddings (same as before).
     if voyage.is_none() && cache.is_none() {
-        return EmbedFileResult {
+        return Ok(EmbedFileResult {
             embeddings: vec![vec![]; texts.len()],
             fully_cached: false,
             hit_chunks: 0,
             miss_chunks: texts.len() as u64,
-        };
+        });
     }
 
     match cache {
@@ -2148,7 +2199,7 @@ async fn embed_parsed_file(
             // Map JoinError (panic in spawn_blocking) to the degradation path.
             let (raw_hits, miss_indices) = match map_get_many_result(&pf.path, texts.len(), get_result) {
                 Ok(result) => result,
-                Err(degraded) => return degraded,
+                Err(degraded) => return Ok(degraded),
             };
 
             if miss_indices.is_empty() && !raw_hits.is_empty() {
@@ -2195,10 +2246,10 @@ async fn embed_parsed_file(
                                 }
                             }
                             Err(e) => {
-                                warn!(file = %pf.path, error = %e, "embed failed for dim-mismatched entries; storing empty");
-                                for &i in &dim_miss_indices {
-                                    extra_embeddings.push((i, vec![]));
-                                }
+                                return Err(e.context(format!(
+                                    "embed failed for dim-mismatched entries in {}",
+                                    pf.path
+                                )));
                             }
                         }
                     } else {
@@ -2218,13 +2269,13 @@ async fn embed_parsed_file(
                 }
                 let n_dim_miss = dim_miss_indices.len() as u64;
                 let n_total = texts.len() as u64;
-                EmbedFileResult {
+                Ok(EmbedFileResult {
                     fully_cached: dim_miss_indices.is_empty(),
                     embeddings: result,
                     // valid cache reads = total minus any dim-mismatches that needed API
                     hit_chunks: n_total - n_dim_miss,
                     miss_chunks: n_dim_miss,
-                }
+                })
             } else {
                 // Partial or total cache miss path.
                 let mut result = vec![vec![]; texts.len()];
@@ -2252,8 +2303,10 @@ async fn embed_parsed_file(
                     match client.embed(&miss_texts, InputType::Document).await {
                         Ok(embs) => Some(embs),
                         Err(e) => {
-                            warn!(file = %pf.path, error = %e, "embed failed; storing empty embeddings");
-                            None
+                            return Err(e.context(format!(
+                                "embed failed for cache-miss texts in {}",
+                                pf.path
+                            )));
                         }
                     }
                 } else {
@@ -2320,7 +2373,10 @@ async fn embed_parsed_file(
                                     }
                                 }
                                 Err(e) => {
-                                    warn!(file = %pf.path, error = %e, "re-embed failed for dim-mismatched hits; storing empty");
+                                    return Err(e.context(format!(
+                                        "re-embed failed for dim-mismatched hits in {}",
+                                        pf.path
+                                    )));
                                 }
                             }
                         }
@@ -2342,12 +2398,12 @@ async fn embed_parsed_file(
 
                 let n_miss = all_miss_indices.len() as u64;
                 let n_total = texts.len() as u64;
-                EmbedFileResult {
+                Ok(EmbedFileResult {
                     fully_cached: false,
                     embeddings: result,
                     hit_chunks: n_total.saturating_sub(n_miss),
                     miss_chunks: n_miss,
-                }
+                })
             }
         }
         None => {
@@ -2355,29 +2411,23 @@ async fn embed_parsed_file(
             match voyage {
                 Some(client) => {
                     match client.embed(&texts, InputType::Document).await {
-                        Ok(embs) => EmbedFileResult {
+                        Ok(embs) => Ok(EmbedFileResult {
                             fully_cached: false,
                             embeddings: embs,
                             hit_chunks: 0,
                             miss_chunks: texts.len() as u64,
-                        },
+                        }),
                         Err(e) => {
-                            warn!(file = %pf.path, error = %e, "embed failed; storing empty embeddings");
-                            EmbedFileResult {
-                                fully_cached: false,
-                                embeddings: vec![vec![]; texts.len()],
-                                hit_chunks: 0,
-                                miss_chunks: texts.len() as u64,
-                            }
+                            Err(e.context(format!("embed failed for {}", pf.path)))
                         }
                     }
                 }
-                None => EmbedFileResult {
+                None => Ok(EmbedFileResult {
                     fully_cached: false,
                     embeddings: vec![vec![]; texts.len()],
                     hit_chunks: 0,
                     miss_chunks: texts.len() as u64,
-                },
+                }),
             }
         }
     }
