@@ -206,11 +206,22 @@
         Add an embedding API key below to start indexing repositories.
       </div>
 
-      <!-- Section: Buy Plan -->
-      <section id="section-buy-plan" class="mb-8">
-        <h2 data-i18n="plan.heading" class="font-wiki text-xl dark:text-wiki-heading text-gray-900 border-b border-gray-200 dark:border-wiki-border pb-2 mb-4">
+      <!-- Section: Plans (collapsible card with gold border) -->
+      <section id="section-buy-plan" class="mb-8 border border-amber-400/60 dark:border-amber-500/40 rounded p-4">
+        <button id="plan-card-toggle" type="button"
+                class="w-full flex items-center justify-between cursor-pointer focus:outline-none focus:ring-2 focus:ring-blue-400 rounded">
+          <h2 data-i18n="plan.cardHeading" class="font-wiki text-xl dark:text-wiki-heading text-gray-900">
+            Plans
+          </h2>
+          <svg id="plan-card-chevron" class="w-5 h-5 text-gray-500 dark:text-wiki-text-muted transition-transform duration-200" viewBox="0 0 20 20" fill="currentColor">
+            <path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clip-rule="evenodd"/>
+          </svg>
+        </button>
+        <div id="plan-card-body" class="mt-4">
+        <!-- Sub-section: Buy -->
+        <h3 data-i18n="plan.heading" class="font-wiki text-base dark:text-wiki-heading text-gray-900 border-b border-gray-200 dark:border-wiki-border pb-2 mb-3">
           Buy Plan
-        </h2>
+        </h3>
         <!-- Package cards container -->
         <div id="plan-packages" class="space-y-3"></div>
         <!-- Loading / empty states -->
@@ -267,13 +278,11 @@
             Your LLM provider is set to Google. To use this key for reranking, switch to OpenAI above.
           </p>
         </div>
-      </section>
-
-      <!-- Section: Purchased Plans -->
-      <section id="plan-purchased-section" class="mb-8">
-        <h2 data-i18n="plan.purchased" class="font-wiki text-xl dark:text-wiki-heading text-gray-900 border-b border-gray-200 dark:border-wiki-border pb-2 mb-4">
+        <!-- Sub-section: Purchased Plans -->
+        <div id="plan-purchased-section" class="mt-6">
+        <h3 data-i18n="plan.purchased" class="font-wiki text-base dark:text-wiki-heading text-gray-900 border-b border-gray-200 dark:border-wiki-border pb-2 mb-3">
           Purchased Plans
-        </h2>
+        </h3>
         <!-- Lookup by invoice -->
         <div class="mb-4 flex gap-2">
           <input id="plan-lookup-input" type="text" placeholder="PKG_..."
@@ -288,6 +297,8 @@
         <div id="plan-lookup-error" class="hidden text-sm text-red-600 dark:text-red-400 mb-3"></div>
         <!-- Purchased list -->
         <div id="plan-purchased-list" class="space-y-3"></div>
+        </div>
+        </div>
       </section>
 
       <!-- Section: Embedding Provider -->
@@ -1181,6 +1192,7 @@ const STR = {
   'tab.settings':     { en: `Settings`, vi: `Cài đặt`, zh: `设置` },
 
   // Buy Plan
+  'plan.cardHeading':  { en: `Plans`, vi: `Gói dịch vụ`, zh: `套餐` },
   'plan.heading':       { en: `Buy Plan`, vi: `Mua gói`, zh: `购买套餐` },
   'plan.loading':       { en: `Loading packages…`, vi: `Đang tải gói…`, zh: `正在加载套餐…` },
   'plan.empty':         { en: `No packages available.`, vi: `Không có gói nào.`, zh: `暂无可用套餐。` },
@@ -2578,6 +2590,24 @@ document.getElementById('plan-purchased-list').addEventListener('click', (e) => 
 
 // Render purchased plans on startup
 renderPurchasedPlans();
+
+// Plan card collapse toggle
+(function() {
+  const btn = document.getElementById('plan-card-toggle');
+  const body = document.getElementById('plan-card-body');
+  const chevron = document.getElementById('plan-card-chevron');
+  const KEY = 'plan_card_collapsed';
+  function applyState(collapsed) {
+    body.classList.toggle('hidden', collapsed);
+    chevron.style.transform = collapsed ? 'rotate(-90deg)' : '';
+  }
+  applyState(localStorage.getItem(KEY) === '1');
+  btn.addEventListener('click', () => {
+    const next = !body.classList.contains('hidden');
+    localStorage.setItem(KEY, next ? '1' : '0');
+    applyState(next);
+  });
+})();
 
 // ─── End Buy Plan ──────────────────────────────────────────────────────────
 
