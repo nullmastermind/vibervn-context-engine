@@ -124,20 +124,13 @@ async fn main() {
     };
 
     // Load settings (needed to know which repos to watch).
-    let mut settings = match ensure_dir_and_load(&home_dir) {
+    let settings = match ensure_dir_and_load(&home_dir) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: could not load settings: {e}");
             std::process::exit(2);
         }
     };
-
-    // Env override for admin gateway URL (UI-only, not boot-frozen).
-    if let Ok(url) = std::env::var("CONTEXT_ENGINE_ADMIN_URL")
-        && !url.is_empty()
-    {
-        settings.admin_base_url = Some(url);
-    }
 
     // Resolve data_dir with the documented precedence:
     //   CLI flag > env CONTEXT_ENGINE_DATA_DIR > Settings.data_dir > builtin default.

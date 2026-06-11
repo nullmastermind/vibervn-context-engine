@@ -252,11 +252,7 @@ async fn serve_index() -> impl IntoResponse {
 async fn get_config(State(state): State<AppState>) -> Response {
     match tokio::task::spawn_blocking(move || ensure_dir_and_load(&state.home_dir)).await {
         Ok(Ok(settings)) => {
-            let mut v = serde_json::to_value(&settings).unwrap_or_default();
-            if let Some(obj) = v.as_object_mut() {
-                obj.remove("admin_base_url");
-            }
-            Json(v).into_response()
+            Json(serde_json::to_value(&settings).unwrap_or_default()).into_response()
         }
         Ok(Err(e)) => e.into_response(),
         Err(join_err) => {
@@ -1229,12 +1225,11 @@ async fn post_defender_exclude(State(state): State<AppState>) -> Response {
 const PLAN_DEFAULT_ADMIN: &str = "https://context-engine.viber.vn";
 const PLAN_PROXY_TIMEOUT: Duration = Duration::from_secs(15);
 
-fn plan_admin_base(settings: &Settings) -> String {
-    settings
-        .admin_base_url
-        .as_deref()
+fn plan_admin_base() -> String {
+    std::env::var("CONTEXT_ENGINE_ADMIN_URL")
+        .ok()
         .filter(|s| !s.is_empty())
-        .unwrap_or(PLAN_DEFAULT_ADMIN)
+        .unwrap_or_else(|| PLAN_DEFAULT_ADMIN.to_string())
         .trim_end_matches('/')
         .to_string()
 }
@@ -1246,8 +1241,8 @@ fn plan_http_client() -> reqwest::Client {
         .unwrap_or_default()
 }
 
-async fn plan_get_packages(State(state): State<AppState>) -> Response {
-    let base = plan_admin_base(&*state.settings.read().await);
+async fn plan_get_packages(State(_): State<AppState>) -> Response {
+    let base = plan_admin_base();
     let url = format!("{base}/api/packages");
 
     let res = match plan_http_client().get(&url).send().await {
@@ -1271,10 +1266,10 @@ async fn plan_get_packages(State(state): State<AppState>) -> Response {
 }
 
 async fn plan_post_checkout(
-    State(state): State<AppState>,
+    State(_): State<AppState>,
     Json(body): Json<Value>,
 ) -> Response {
-    let base = plan_admin_base(&*state.settings.read().await);
+    let base = plan_admin_base();
     let url = format!("{base}/api/checkout");
 
     let res = match plan_http_client()
@@ -1297,11 +1292,11 @@ async fn plan_post_checkout(
     let status = StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let body_bytes = res.bytes().await.unwrap_or_default();
 
-    // Inject admin_base_url into the response so frontend knows where the proxy key points to.
+    // Inject base_url into the response so frontend knows where the proxy key points to.
     if status.is_success()
         && let Ok(mut obj) = serde_json::from_slice::<Value>(&body_bytes)
     {
-        let admin_url = plan_admin_base(&*state.settings.read().await);
+        let admin_url = plan_admin_base();
         obj["base_url"] = Value::String(format!("{admin_url}/v1"));
         return (status, Json(obj)).into_response();
     }
@@ -1314,10 +1309,10 @@ async fn plan_post_checkout(
 }
 
 async fn plan_get_order_status(
-    State(state): State<AppState>,
+    State(_): State<AppState>,
     Path(invoice): Path<String>,
 ) -> Response {
-    let base = plan_admin_base(&*state.settings.read().await);
+    let base = plan_admin_base();
     let url = format!("{base}/api/orders/{invoice}/status");
 
     let res = match plan_http_client().get(&url).send().await {
@@ -1339,7 +1334,7 @@ async fn plan_get_order_status(
         && let Ok(mut obj) = serde_json::from_slice::<Value>(&body_bytes)
     {
         if obj.get("status").and_then(|s| s.as_str()) == Some("COMPLETED") {
-            let admin_url = plan_admin_base(&*state.settings.read().await);
+            let admin_url = plan_admin_base();
             obj["base_url"] = Value::String(format!("{admin_url}/v1"));
         }
         return (status, Json(obj)).into_response();
