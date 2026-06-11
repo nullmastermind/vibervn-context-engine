@@ -11,6 +11,10 @@ use crate::embedding::InputType;
 
 const VOYAGE_ENDPOINT: &str = "https://api.voyageai.com/v1/embeddings";
 pub const MAX_BATCH_SIZE: usize = 128;
+/// Byte-size cap for the sum of input texts in a single batch. VoyageAI's
+/// per-batch token limit is 1M for voyage-4-lite. Worst-case for minified code
+/// is ~2 bytes/token; 1.5 MB / 2 = 750K tokens — 25% headroom under the 1M limit.
+const MAX_BATCH_BYTES: usize = 1_500_000;
 
 /// Resolve the embeddings URL from an optional user-supplied base.
 ///
@@ -153,10 +157,11 @@ impl VoyageClient {
         anyhow::bail!("VoyageAI query embed still rate-limited after backoff")
     }
 
-    /// Embed texts in batches of up to 128. Returns one Vec<f32> per input.
+    /// Embed texts in batches respecting both count (128) and byte-size limits
+    /// per request. Returns one Vec<f32> per input.
     pub async fn embed(&self, texts: &[String], input_type: InputType) -> Result<Vec<Vec<f32>>> {
         let mut all_embeddings = Vec::with_capacity(texts.len());
-        for batch in texts.chunks(MAX_BATCH_SIZE) {
+        for batch in byte_aware_batches(texts) {
             let embeddings = self.embed_batch(batch, input_type).await?;
             all_embeddings.extend(embeddings);
         }
@@ -273,6 +278,29 @@ impl VoyageClient {
     }
 }
 
+/// Split texts into sub-slices where each batch has at most `MAX_BATCH_SIZE`
+/// texts AND the sum of `text.len()` stays under `MAX_BATCH_BYTES`. A single
+/// text exceeding the byte cap is sent alone (VoyageAI will truncate or reject
+/// at the token level, but it won't poison the whole batch).
+fn byte_aware_batches(texts: &[String]) -> Vec<&[String]> {
+    let mut batches = Vec::new();
+    let mut start = 0;
+    while start < texts.len() {
+        let mut end = start;
+        let mut batch_bytes = 0usize;
+        while end < texts.len()
+            && end - start < MAX_BATCH_SIZE
+            && (batch_bytes + texts[end].len() <= MAX_BATCH_BYTES || end == start)
+        {
+            batch_bytes += texts[end].len();
+            end += 1;
+        }
+        batches.push(&texts[start..end]);
+        start = end;
+    }
+    batches
+}
+
 enum EmbedError {
     RateLimited,
     Other(anyhow::Error),
@@ -328,5 +356,34 @@ mod tests {
             voyage_url(Some("https://my-proxy.com/v1/embeddings/")),
             "https://my-proxy.com/v1/embeddings"
         );
+    }
+
+    #[test]
+    fn byte_aware_batches_splits_by_size() {
+        // 600 KB each → only 2 fit in 1.5 MB cap (1.2 MB < 1.5 MB, 1.8 MB > 1.5 MB)
+        let texts: Vec<String> = (0..5).map(|_| "x".repeat(600_000)).collect();
+        let batches = byte_aware_batches(&texts);
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0].len(), 2);
+        assert_eq!(batches[1].len(), 2);
+        assert_eq!(batches[2].len(), 1);
+    }
+
+    #[test]
+    fn byte_aware_batches_respects_count_limit() {
+        let texts: Vec<String> = (0..200).map(|_| "short".to_string()).collect();
+        let batches = byte_aware_batches(&texts);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), 128);
+        assert_eq!(batches[1].len(), 72);
+    }
+
+    #[test]
+    fn byte_aware_batches_oversized_single_text_sent_alone() {
+        let texts: Vec<String> = vec!["x".repeat(3_000_000), "small".to_string()];
+        let batches = byte_aware_batches(&texts);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), 1);
+        assert_eq!(batches[1].len(), 1);
     }
 }
