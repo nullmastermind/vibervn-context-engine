@@ -1,12 +1,15 @@
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tokio::sync::RwLock;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use context_engine_rs::{
+    cli as cli_client,
+    cli::{ReadArgs, SearchArgs},
     config::{default_data_dir, default_embeddings_dir, ensure_dir_and_load},
     indexing::IndexEngine,
     server, store,
@@ -15,6 +18,9 @@ use context_engine_rs::{
 #[derive(Parser, Debug)]
 #[command(name = "context-engine", about = "Context Engine settings server")]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
     /// Port to listen on [env: CONTEXT_ENGINE_PORT]
     #[arg(long, env = "CONTEXT_ENGINE_PORT")]
     port: Option<u16>,
@@ -51,6 +57,33 @@ struct Cli {
     embeddings_dir: Option<PathBuf>,
 }
 
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Invoke codebase-retrieval against a running Context Engine server.
+    Search {
+        #[arg(long)]
+        query: String,
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        server: Option<String>,
+    },
+
+    /// Invoke file-retrieval against a running Context Engine server.
+    Read {
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        file: String,
+        #[arg(long)]
+        query: String,
+        #[arg(long = "top-k")]
+        top_k: Option<usize>,
+        #[arg(long)]
+        server: Option<String>,
+    },
+}
+
 /// Pin bounded RocksDB memory settings unless the operator has overridden them.
 ///
 /// SurrealDB's RocksDB layer reads these `SURREAL_ROCKSDB_*` env vars once (via
@@ -84,7 +117,7 @@ fn set_rocksdb_memory_bounds() {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
     // Bound RocksDB memory BEFORE any datastore opens. SurrealDB derives its
     // RocksDB defaults from total system RAM and applies the write buffers PER
     // database: on a 64 GiB host the block cache defaults to ~31 GiB and each DB
@@ -104,6 +137,40 @@ async fn main() {
         .init();
 
     let cli = Cli::parse();
+
+    if let Some(command) = cli.command {
+        let exit_code = match command {
+            Commands::Search {
+                query,
+                repo,
+                server,
+            } => {
+                cli_client::run_search(SearchArgs {
+                    query,
+                    repo,
+                    server,
+                })
+                .await
+            }
+            Commands::Read {
+                repo,
+                file,
+                query,
+                top_k,
+                server,
+            } => {
+                cli_client::run_read(ReadArgs {
+                    repo,
+                    file,
+                    query,
+                    top_k,
+                    server,
+                })
+                .await
+            }
+        };
+        return exit_code;
+    }
 
     // Resolve port: CLI flag → env (handled by clap) → default 6699.
     let port = cli.port.unwrap_or(6699);
@@ -249,4 +316,6 @@ async fn main() {
         eprintln!("server error: {e}");
         std::process::exit(1);
     });
+
+    ExitCode::SUCCESS
 }
