@@ -72,8 +72,8 @@ async fn test_get_creates_default() {
 
     let body: serde_json::Value = res.json().await.expect("parse json");
 
-    // version should be CURRENT_VERSION (= 7 after data_dir + embeddings_dir + mcp_tools + custom_extensions + index_ignore_filenames + voyage_base_url migrations)
-    assert_eq!(body["version"], 7);
+    // version should be CURRENT_VERSION (= 8 after data_dir + embeddings_dir + mcp_tools + custom_extensions + index_ignore_filenames + voyage_base_url + repo_generations migrations)
+    assert_eq!(body["version"], 8);
 
     // repos should be an empty array
     assert!(body["repos"].as_array().map(|a| a.is_empty()).unwrap_or(false));
@@ -152,7 +152,7 @@ async fn test_put_round_trips() {
     assert_eq!(get_body.repos, expected_repos);
     assert_eq!(get_body.embedding.model, "voyage-code-3");
     assert_eq!(get_body.llm.rerank_model, "gemini-2.0-flash");
-    assert_eq!(get_body.version, 7);
+    assert_eq!(get_body.version, 8);
 }
 
 // ─── Test 3 (Unix only): file mode bits should be 0o600 ───────────────────
@@ -537,7 +537,7 @@ async fn test_delete_repo_index_removes_directory() {
     // Pre-create the DB directory and open a handle via get_or_open so a real
     // RocksDB LOCK file exists — this is what triggers OS error 32 if not
     // closed before deletion.
-    let db_dir = store::db_path(home.path(), repo_path);
+    let db_dir = store::db_path(home.path(), repo_path, 0);
     std::fs::create_dir_all(&db_dir).expect("create db dir");
 
     // Open a DB handle through the server by triggering an index (which calls
@@ -591,7 +591,299 @@ async fn test_delete_repo_index_removes_directory() {
     }
 }
 
-// ─── Test 8: PUT data_dir persists but does NOT relocate the running process ─
+// ─── Test 7a': DELETE bumps the per-repo generation and the next index uses a
+// fresh directory; the UI's delete-then-PUT-config flow must NOT clobber the bump ─
+//
+// Proves the root-cause fix: after a delete the repo's generation counter advances,
+// the new generation's directory is what GET /api/config reports, and a subsequent
+// PUT /api/config (which the "Xóa repo" UI sends with a stale, generation-less body)
+// preserves the server-owned counter instead of resetting it to 0.
+#[tokio::test]
+async fn test_delete_bumps_generation_and_put_preserves_it() {
+    use context_engine_rs::store;
+
+    let home = TempDir::new().expect("tempdir");
+    let addr = start_server(&home).await;
+    let client = Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("client");
+
+    let repo_path = "D:/fake/repo/for_generation_test";
+    let repo_id = encode_repo_id(repo_path);
+
+    // Register the repo (generation starts at 0 → legacy path).
+    let put_body = serde_json::json!({
+        "repos": [repo_path],
+        "embedding": { "api_keys": ["test-key-gen"] }
+    });
+    client
+        .put(format!("http://{addr}/api/config"))
+        .json(&put_body)
+        .send()
+        .await
+        .expect("put config");
+
+    // Generation 0 → legacy path with no number segment; gen 1 nests under "1".
+    let gen0_dir = store::db_path(home.path(), repo_path, 0);
+    let gen1_dir = store::db_path(home.path(), repo_path, 1);
+    assert_ne!(gen0_dir, gen1_dir, "gen1 path must differ from gen0");
+
+    // Delete the index — server bumps the generation to 1 and persists it.
+    let del_res = client
+        .delete(format!("http://{addr}/api/repos/{repo_id}/index"))
+        .send()
+        .await
+        .expect("delete index");
+    assert_eq!(del_res.status().as_u16(), 200, "delete should succeed");
+
+    // GET /api/config must report repo_generations[repo] == 1.
+    let cfg: serde_json::Value = client
+        .get(format!("http://{addr}/api/config"))
+        .send()
+        .await
+        .expect("get config")
+        .json()
+        .await
+        .expect("parse config");
+    let normalized = store::normalize_repo_path(repo_path);
+    assert_eq!(
+        cfg["repo_generations"][&normalized].as_u64(),
+        Some(1),
+        "delete must bump generation to 1; got config: {cfg}"
+    );
+
+    // Now simulate the "Xóa repo" UI flow: PUT a config body that has NO
+    // repo_generations field (the client loaded it before the bump). The server
+    // must PRESERVE the bump, not reset it to 0.
+    let stale_put = serde_json::json!({
+        "repos": [repo_path],
+        "embedding": { "api_keys": ["test-key-gen"] }
+    });
+    client
+        .put(format!("http://{addr}/api/config"))
+        .json(&stale_put)
+        .send()
+        .await
+        .expect("stale put config");
+
+    let cfg2: serde_json::Value = client
+        .get(format!("http://{addr}/api/config"))
+        .send()
+        .await
+        .expect("get config 2")
+        .json()
+        .await
+        .expect("parse config 2");
+    assert_eq!(
+        cfg2["repo_generations"][&normalized].as_u64(),
+        Some(1),
+        "PUT /api/config must preserve the server-owned generation bump; got: {cfg2}"
+    );
+}
+
+// ─── Test 7a'': DELETE ?remove_repo=true is durable on disk ───────────────────
+//
+// Regression test for the "removed repo reappears after reload" bug. The old flow
+// only removed the repo from settings.repos via a follow-up client PUT /api/config
+// AFTER the (slow) DELETE resolved; if that PUT was ever lost (reload mid-teardown,
+// navigation, clobbered write) the repo survived on disk and came back on reload.
+// The fix: DELETE ...?remove_repo=true drops the repo from settings.repos in the
+// same durable write that bumps the generation. This test asserts the removal is
+// persisted to disk (a fresh GET /api/config no longer lists it) WITHOUT any PUT,
+// and that the other repo is untouched.
+#[tokio::test]
+async fn test_delete_remove_repo_persists_to_disk() {
+    use context_engine_rs::store;
+
+    let home = TempDir::new().expect("tempdir");
+    let addr = start_server(&home).await;
+    let client = Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("client");
+
+    let repo_a = "D:/fake/repo/remove_durable_a";
+    let repo_b = "D:/fake/repo/remove_durable_b";
+    let repo_a_id = encode_repo_id(repo_a);
+
+    // Configure two repos. Send a complete embedding/llm block — the PUT validates
+    // required provider/model fields, and this test needs the repos to actually
+    // persist (unlike the generation tests, which ignore the PUT status).
+    let put_body = serde_json::json!({
+        "version": 1,
+        "repos": [repo_a, repo_b],
+        "embedding": { "provider": "voyage", "model": "voyage-4-lite", "api_keys": ["test-key-remove"] },
+        "llm": { "provider": "google", "rerank_model": "gemini-3.1-flash-lite", "api_keys": [] }
+    });
+    let put_res = client
+        .put(format!("http://{addr}/api/config"))
+        .json(&put_body)
+        .send()
+        .await
+        .expect("put config");
+    let put_status = put_res.status().as_u16();
+    assert_eq!(
+        put_status,
+        200,
+        "PUT should return 200; body: {:?}",
+        put_res.text().await
+    );
+
+    // Remove repo A with the durable flag — and crucially send NO follow-up PUT.
+    let del_res = client
+        .delete(format!(
+            "http://{addr}/api/repos/{repo_a_id}/index?remove_repo=true"
+        ))
+        .send()
+        .await
+        .expect("delete repo");
+    assert_eq!(
+        del_res.status().as_u16(),
+        200,
+        "delete should succeed: {:?}",
+        del_res.text().await
+    );
+
+    // A fresh GET reads settings.json from disk (ensure_dir_and_load). Repo A must
+    // be gone, repo B must remain, and A's generation bump must be recorded.
+    let cfg: serde_json::Value = client
+        .get(format!("http://{addr}/api/config"))
+        .send()
+        .await
+        .expect("get config")
+        .json()
+        .await
+        .expect("parse config");
+
+    let norm_a = store::normalize_repo_path(repo_a);
+    let norm_b = store::normalize_repo_path(repo_b);
+    let repos: Vec<&str> = cfg["repos"]
+        .as_array()
+        .expect("repos array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+
+    assert!(
+        !repos.contains(&norm_a.as_str()),
+        "removed repo must NOT survive on disk (reload bug); got repos: {repos:?}"
+    );
+    assert!(
+        repos.contains(&norm_b.as_str()),
+        "the other repo must be untouched; got repos: {repos:?}"
+    );
+    assert_eq!(
+        cfg["repo_generations"][&norm_a].as_u64(),
+        Some(1),
+        "remove_repo must still bump the generation; got config: {cfg}"
+    );
+}
+
+// ─── Test 7b: DELETE aborts an in-flight schema migration before removal ──
+//
+// Regression test for the bug where a stale-version repo's background migration
+// held a live `Surreal<Db>` clone (pinning the RocksDB exclusive LOCK) past
+// `close_repo_db`, so `remove_index_dir` exhausted its retries and the delete
+// silently failed/looped. `close_repo_db` now calls `store::abort_migration` to
+// cancel + await the migration task so the clone drops before removal.
+//
+// We seed a DB stamped at schema version 1 so opening it via the server spawns a
+// v1→v5 migration, then DELETE and assert the observable contract: 200, status
+// cleared, and the directory eventually removed. On empty seed data the migration
+// completes near-instantly, so this primarily proves the abort wiring does not
+// break the happy path for a stale-version repo (an aborted/finished migration is
+// idempotent + crash-resumable and self-heals on the next open).
+#[tokio::test]
+async fn test_delete_repo_index_aborts_inflight_migration() {
+    use context_engine_rs::store;
+
+    let home = TempDir::new().expect("tempdir");
+
+    let repo_path = "D:/fake/repo/for_migration_delete_test";
+    let repo_id = encode_repo_id(repo_path);
+
+    // Seed a DB at an OLD schema version so the NEXT open spawns a migration.
+    // Open via the low-level store API in a scope so the handle (and its RocksDB
+    // LOCK) drops before the server re-opens the same path.
+    {
+        let db = store::open_db(home.path(), repo_path, 0)
+            .await
+            .expect("seed open");
+        store::ops::set_meta(&db, store::DB_SCHEMA_VERSION_KEY, "1")
+            .await
+            .expect("stamp stale version");
+    }
+    // Let the async RocksDB shutdown drain so the server's get_or_open re-opens
+    // cleanly (its retry loop also rides this out, but a brief wait reduces churn).
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let addr = start_server(&home).await;
+    let client = Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("client");
+
+    let put_body = serde_json::json!({
+        "repos": [repo_path],
+        "embedding": { "api_keys": ["test-key-for-migration-delete"] }
+    });
+    client
+        .put(format!("http://{addr}/api/config"))
+        .json(&put_body)
+        .send()
+        .await
+        .expect("put config");
+
+    // Trigger indexing so the server opens the stale DB and spawns the migration.
+    client
+        .post(format!("http://{addr}/api/repos/{repo_id}/index"))
+        .send()
+        .await
+        .expect("trigger index");
+
+    // Give the consumer a moment to open the handle + spawn the migration.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // DELETE must succeed (200) and not hang: close_repo_db aborts the migration
+    // so remove_index_dir can take the LOCK.
+    let del_res = client
+        .delete(format!("http://{addr}/api/repos/{repo_id}/index"))
+        .send()
+        .await
+        .expect("delete index");
+    assert_eq!(
+        del_res.status().as_u16(),
+        200,
+        "delete should succeed even with an in-flight migration"
+    );
+
+    // Status cleared (idle, 0 files).
+    let status_res = client
+        .get(format!("http://{addr}/api/index-status"))
+        .send()
+        .await
+        .expect("status");
+    let statuses: Vec<serde_json::Value> = status_res.json().await.expect("parse");
+    if let Some(s) = statuses.iter().find(|s| s["repo"].as_str() == Some(repo_path)) {
+        assert_eq!(s["state"].as_str(), Some("idle"));
+        assert_eq!(s["indexed_files"].as_u64(), Some(0));
+    }
+
+    // We intentionally do NOT assert the on-disk directory is gone — same as the
+    // sibling `test_delete_repo_index_removes_directory`. SurrealDB's RocksDB
+    // datastore releases its exclusive LOCK *asynchronously* (a background router
+    // drains memtables some time after the last handle drops), and on Windows the
+    // OS file handles outlive the Rust drop, so `remove_index_dir` legitimately
+    // reports "pending" even after its full retry budget. Asserting removal here
+    // would be flaky. What this test proves is the wiring contract: a repo with a
+    // *spawned migration* can be DELETEd, returns 200, and clears its status —
+    // i.e. `close_repo_db`'s `abort_migration` call does not break (or hang) the
+    // delete path for a stale-version repo. The migration-LOCK regression itself is
+    // covered deterministically by the `abort_migration_*` unit tests in
+    // `store::schemaless_tests`, which prove the handle is aborted + deregistered.
+}
+
 //
 // PUT /api/config with a new `data_dir` must:
 //   1. Persist the value to settings.json (round-trips on a subsequent GET).
@@ -697,8 +989,8 @@ async fn test_put_data_dir_persists_but_does_not_relocate() {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // boot path: data_dir == boot_home.path() per start_server.
-    let boot_db = store::db_path(boot_home.path(), repo_path);
-    let new_db = store::db_path(&new_data_dir, repo_path);
+    let boot_db = store::db_path(boot_home.path(), repo_path, 0);
+    let new_db = store::db_path(&new_data_dir, repo_path, 0);
     assert!(
         boot_db.exists(),
         "DB must materialize under the BOOT data_dir, not the persisted one. \
@@ -710,4 +1002,96 @@ async fn test_put_data_dir_persists_but_does_not_relocate() {
          the running process honored the PUT — split-brain). \
          unexpected: {new_db:?}"
     );
+}
+
+// ─── Free-trial proxy ────────────────────────────────────────────────────
+// The engine's /api/plan/free-trial[/claim] routes proxy to the admin gateway
+// at CONTEXT_ENGINE_ADMIN_URL. We boot a tiny mock gateway, point the env var
+// at it, and assert the engine forwards correctly and injects base_url. This
+// is the only test that exercises the plan proxy, so the process-global env
+// mutation does not collide with other tests.
+#[tokio::test]
+async fn test_free_trial_proxy_forwards_and_injects_base_url() {
+    use axum::{routing::{get, post}, Json, Router};
+
+    // Mock admin gateway.
+    let mock = Router::new()
+        .route(
+            "/api/free-trial",
+            get(|| async {
+                Json(serde_json::json!({
+                    "available": true,
+                    "voyage_budget": 1000,
+                    "openai_budget": 500,
+                    "duration_days": 7
+                }))
+            }),
+        )
+        .route(
+            "/api/free-trial/claim",
+            post(|Json(body): Json<serde_json::Value>| async move {
+                // Echo back a key only when a non-empty machine_id was forwarded.
+                let mid = body
+                    .get("machine_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                assert!(!mid.is_empty(), "engine must forward a machine_id");
+                Json(serde_json::json!({
+                    "proxy_key": "ft_test_key",
+                    "expires_at": "2099-01-01 00:00:00"
+                }))
+            }),
+        );
+    let mock_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+    let mock_addr = mock_listener.local_addr().expect("mock addr");
+    tokio::spawn(async move {
+        axum::serve(mock_listener, mock).await.expect("mock server");
+    });
+
+    // Point the proxy at the mock. SAFETY: single-threaded test setup, this is
+    // the only test that reads CONTEXT_ENGINE_ADMIN_URL.
+    unsafe {
+        std::env::set_var("CONTEXT_ENGINE_ADMIN_URL", format!("http://{mock_addr}"));
+    }
+
+    let home = TempDir::new().expect("tempdir");
+    let addr = start_server(&home).await;
+    let client = Client::new();
+
+    // GET /api/plan/free-trial → forwarded availability.
+    let res = client
+        .get(format!("http://{addr}/api/plan/free-trial"))
+        .send()
+        .await
+        .expect("get free-trial");
+    assert_eq!(res.status().as_u16(), 200);
+    let info: serde_json::Value = res.json().await.expect("json");
+    assert_eq!(info["available"], true);
+    assert_eq!(info["voyage_budget"], 1000);
+    assert_eq!(info["duration_days"], 7);
+
+    // POST /api/plan/free-trial/claim → key + injected base_url. machine_id is
+    // derived host-side; on the rare host where it's unavailable the engine
+    // returns 500 (never a random fallback), which we tolerate here.
+    let res = client
+        .post(format!("http://{addr}/api/plan/free-trial/claim"))
+        .send()
+        .await
+        .expect("post claim");
+    let status = res.status().as_u16();
+    if status == 200 {
+        let data: serde_json::Value = res.json().await.expect("json");
+        assert_eq!(data["proxy_key"], "ft_test_key");
+        assert_eq!(
+            data["base_url"],
+            format!("http://{mock_addr}/v1"),
+            "engine must inject base_url on success"
+        );
+    } else {
+        assert_eq!(status, 500, "claim must be 200 or a loud 500, never silent");
+    }
+
+    unsafe {
+        std::env::remove_var("CONTEXT_ENGINE_ADMIN_URL");
+    }
 }

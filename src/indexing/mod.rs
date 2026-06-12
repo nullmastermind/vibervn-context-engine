@@ -141,6 +141,12 @@ pub struct IndexEngine {
     /// Per-repo cancellation tokens. The consumer checks this before each file in
     /// the pipeline. A cancelled token triggers graceful early exit.
     cancel_tokens: Mutex<HashMap<String, CancellationToken>>,
+    /// Shared live settings handle — the single source of truth for per-repo index
+    /// generation. Read (never written) by the lazy warm-on-query path so it can
+    /// resolve a repo's current generation without the caller threading it through
+    /// the query layer. Only the generation counter is read mid-run; `data_dir`
+    /// stays boot-frozen.
+    settings_handle: Arc<RwLock<Settings>>,
 }
 
 #[derive(Debug)]
@@ -165,9 +171,10 @@ pub(crate) async fn warm_repo_shard(
     repo_dbs: &RepoDbMap,
     data_dir: &std::path::Path,
     repo: &str,
+    generation: u32,
     active: &[String],
 ) -> usize {
-    let db = match store::get_or_open(repo_dbs, data_dir, repo).await {
+    let db = match store::get_or_open(repo_dbs, data_dir, repo, generation).await {
         Ok(db) => db,
         Err(e) => {
             warn!(repo = %repo, error = %e, "warm: failed to open DB; skipping repo");
@@ -205,10 +212,12 @@ pub(crate) async fn seed_statuses_from_db(
     repo_dbs: &RepoDbMap,
     data_dir: &std::path::Path,
     repos: &[String],
+    generations: &HashMap<String, u32>,
 ) {
     for repo in repos {
         let repo = crate::store::normalize_repo_path(repo);
-        let db = match store::get_or_open(repo_dbs, data_dir, &repo).await {
+        let generation = generations.get(&repo).copied().unwrap_or(0);
+        let db = match store::get_or_open(repo_dbs, data_dir, &repo, generation).await {
             Ok(db) => db,
             Err(e) => {
                 warn!(repo = %repo, error = %format!("{e:#}"), "failed to open DB for status seed; skipping repo");
@@ -275,6 +284,7 @@ impl IndexEngine {
         let repo_dbs_bg = repo_dbs.clone();
         let data_dir_bg = data_dir.clone();
         let repos_bg = settings.repos.clone();
+        let generations_bg = settings.repo_generations.clone();
 
         let engine = Arc::new(IndexEngine {
             data_dir: data_dir.clone(),
@@ -287,6 +297,7 @@ impl IndexEngine {
             repo_dbs,
             event_bus: IndexEventBus::new(),
             cancel_tokens: Mutex::new(HashMap::new()),
+            settings_handle: settings_handle.clone(),
         });
 
         // Initialise status entries.
@@ -308,7 +319,7 @@ impl IndexEngine {
         {
             let statuses_bg = Arc::clone(&engine.statuses);
             tokio::spawn(async move {
-                seed_statuses_from_db(&statuses_bg, &repo_dbs_bg, &data_dir_bg, &repos_bg).await;
+                seed_statuses_from_db(&statuses_bg, &repo_dbs_bg, &data_dir_bg, &repos_bg, &generations_bg).await;
             });
         }
 
@@ -413,9 +424,9 @@ impl IndexEngine {
         self.vector_index.write().await.remove_repo(&repo);
     }
 
-    /// Cancel indexing, wait for the pipeline to finish, then remove the cached
-    /// DB handle from `repo_dbs`. The per-repo serialisation lock guarantees that
-    /// no pipeline iteration is mid-flight when the handle is removed — the
+    /// Cancel indexing, abort any in-flight schema migration, then remove the
+    /// cached DB handle from `repo_dbs`. The per-repo serialisation lock guarantees
+    /// that no pipeline iteration is mid-flight when the handle is removed — the
     /// consumer holds this lock for the entire iteration (open → run → emit).
     ///
     /// Returns once the handle has been removed and no pipeline holds it.
@@ -423,6 +434,14 @@ impl IndexEngine {
         let repo = crate::store::normalize_repo_path(repo);
         // 1. Cancel any in-progress run so it exits early.
         self.cancel_index(&repo).await;
+
+        // Abort any in-flight schema migration for this repo. A running migration
+        // holds a live `Surreal<Db>` clone that pins the RocksDB exclusive LOCK
+        // (see store::maybe_spawn_migration). Aborting + awaiting it here drops that
+        // clone deterministically so `remove_index_dir` can delete the directory.
+        // Safe: migrations are idempotent + crash-resumable, so an aborted migration
+        // self-heals on the next open.
+        crate::store::abort_migration(&repo).await;
 
         // 2. Acquire the per-repo lock — blocks until the consumer's current
         //    iteration for this repo finishes (including dropping its `db` clone).
@@ -592,11 +611,18 @@ impl IndexEngine {
         // room. In-flight searches are NOT at risk — they hold a read guard and
         // return owned results (cloned ChunkIds); install/evict take the write guard
         // afterwards. The warmed repo is protected internally by install_shard.
+        //
+        // Resolve the repo's current generation from live settings (read guard
+        // dropped before the await on warm work). Safe to read mid-run: generation
+        // only advances after a delete dropped the cached handle + evicted the shard,
+        // so a warm here always targets the live directory.
+        let generation = self.settings_handle.read().await.repo_generation(&repo);
         warm_repo_shard(
             &self.vector_index,
             &self.repo_dbs,
             &self.data_dir,
             &repo,
+            generation,
             &[],
         )
         .await;
@@ -695,7 +721,8 @@ async fn run_consumer(
         // healthy index. We must NOT call `close_repo_db` from here (it re-acquires
         // the per-repo index lock we already hold → deadlock); the heal removes the
         // cached handle directly.
-        let db = match store::open_or_reset_index(&engine_ref.repo_dbs, &engine_ref.data_dir, &repo).await {
+        let generation = settings_ref.repo_generation(&repo);
+        let db = match store::open_or_reset_index(&engine_ref.repo_dbs, &engine_ref.data_dir, &repo, generation).await {
             Ok((db, was_reset)) => {
                 if was_reset {
                     warn!(repo = %repo, "index directory failed to open and was reset; rebuilding from scratch");
@@ -850,7 +877,7 @@ mod load_repos_tests {
     /// uncached `open_db` on the same path would deadlock on the lock file —
     /// seeding through `get_or_open` keeps a single handle, mirroring real usage.
     async fn seed_repo(repo_dbs: &RepoDbMap, home: &std::path::Path, repo: &str, n: usize) {
-        let db = store::get_or_open(repo_dbs, home, repo).await.expect("get_or_open");
+        let db = store::get_or_open(repo_dbs, home, repo, 0).await.expect("get_or_open");
         for i in 0..n {
             let q = format!(
                 "CREATE chunk SET file = '{repo}/f{i}.rs', line_start = 1, line_end = 2, \
@@ -878,8 +905,8 @@ mod load_repos_tests {
 
         // Large cap so both repos stay resident after warming.
         let vector_index = Arc::new(RwLock::new(ShardedVectorIndex::new(1024 * 1024 * 1024)));
-        warm_repo_shard(&vector_index, &repo_dbs, home.path(), &repo_one, &[]).await;
-        warm_repo_shard(&vector_index, &repo_dbs, home.path(), &repo_two, &[]).await;
+        warm_repo_shard(&vector_index, &repo_dbs, home.path(), &repo_one, 0, &[]).await;
+        warm_repo_shard(&vector_index, &repo_dbs, home.path(), &repo_two, 0, &[]).await;
 
         let vi = vector_index.read().await;
         assert!(vi.is_resident(&repo_one), "repo_one shard must be resident");
@@ -895,7 +922,7 @@ mod load_repos_tests {
     /// map (single cached handle per repo — see [`seed_repo`] for why RocksDB
     /// requires this).
     async fn seed_file_meta(repo_dbs: &RepoDbMap, home: &std::path::Path, repo: &str, n: usize) {
-        let db = store::get_or_open(repo_dbs, home, repo).await.expect("get_or_open");
+        let db = store::get_or_open(repo_dbs, home, repo, 0).await.expect("get_or_open");
         for i in 0..n {
             let path = format!("{repo}/f{i}.rs");
             db.query("CREATE file_meta SET path = $path, mtime = 0, size = 1, repo = $repo, chunk_count = 1;")
@@ -921,7 +948,7 @@ mod load_repos_tests {
         let repo_dbs: RepoDbMap = Arc::new(RwLock::new(HashMap::new()));
         seed_file_meta(&repo_dbs, home.path(), &indexed, 5).await;
         // `empty` gets a DB (cached) but no file_meta rows.
-        let _ = store::get_or_open(&repo_dbs, home.path(), &empty).await.expect("get_or_open");
+        let _ = store::get_or_open(&repo_dbs, home.path(), &empty, 0).await.expect("get_or_open");
 
         let statuses: Arc<RwLock<HashMap<String, RepoStatus>>> =
             Arc::new(RwLock::new(HashMap::new()));
@@ -931,7 +958,7 @@ mod load_repos_tests {
             m.insert(empty.clone(), RepoStatus::default());
         }
 
-        seed_statuses_from_db(&statuses, &repo_dbs, home.path(), &[indexed_raw, empty_raw])
+        seed_statuses_from_db(&statuses, &repo_dbs, home.path(), &[indexed_raw, empty_raw], &HashMap::new())
             .await;
 
         let m = statuses.read().await;
@@ -959,7 +986,7 @@ mod load_repos_tests {
             );
         }
 
-        seed_statuses_from_db(&statuses, &repo_dbs, home.path(), &[repo_raw]).await;
+        seed_statuses_from_db(&statuses, &repo_dbs, home.path(), &[repo_raw], &HashMap::new()).await;
 
         let m = statuses.read().await;
         assert_eq!(m[&repo].state, IndexState::Indexing, "in-flight run must survive the seed");

@@ -195,6 +195,11 @@ pub fn build_router(
         .route("/api/plan/checkout", post(plan_post_checkout))
         .route("/api/plan/orders/:invoice/status", get(plan_get_order_status))
         .route("/api/plan/usage", get(plan_get_usage))
+        .route("/api/plan/free-trial", get(plan_get_free_trial))
+        .route(
+            "/api/plan/free-trial/claim",
+            post(plan_post_free_trial_claim),
+        )
         .route("/mcp-repo/:repo_id", any(handle_repo_mcp))
         .merge(Router::new().nest_service("/mcp", mcp_service))
         .with_state(state)
@@ -224,12 +229,19 @@ async fn acquire_repo_db_if_indexed(
     state: &AppState,
     repo: &str,
 ) -> Result<Option<Surreal<Db>>, Response> {
-    store::open_if_indexed(&state.repo_dbs, &state.data_dir, repo)
+    let generation = state.settings.read().await.repo_generation(repo);
+    store::open_if_indexed(&state.repo_dbs, &state.data_dir, repo, generation)
         .await
         .map_err(|e| {
             let body = json!({ "error": format!("failed to open index DB: {e}") });
             (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
         })
+}
+
+/// Current on-disk index generation for `repo` from the live settings handle.
+/// The read guard is dropped before returning, so it never spans a DB `.await`.
+async fn repo_generation(state: &AppState, repo: &str) -> u32 {
+    state.settings.read().await.repo_generation(repo)
 }
 
 /// Map a `store::ops` error to a 500 JSON response.
@@ -287,6 +299,16 @@ async fn put_config(
 
     // Server always stamps the current version regardless of what the client sent.
     settings.version = CURRENT_VERSION;
+
+    // `repo_generations` is SERVER-OWNED bookkeeping (bumped only by the delete
+    // handler). Discard whatever the client sent and preserve the live in-memory
+    // map — otherwise the UI's "Xóa repo" flow (DELETE bumps the counter, then PUT
+    // /api/config with the config it loaded *before* the bump) would silently
+    // clobber the bump, and the re-added repo would reuse the just-deleted (and
+    // possibly still-draining) directory. The live handle already reflects the
+    // bump because the delete handler persisted to disk AND memory before
+    // responding, and the UI awaits the DELETE before PUTting.
+    settings.repo_generations = state.settings.read().await.repo_generations.clone();
 
     // Validate voyage_base_url if provided.
     if let Some(ref url) = settings.embedding.voyage_base_url {
@@ -446,14 +468,31 @@ async fn post_cancel_index(
 }
 
 /// DELETE /api/repos/:repo_id/index — remove the index DB folder for a repo.
+///
+/// `?remove_repo=true` additionally drops the repo from `settings.repos` in the
+/// SAME durable write that bumps the generation, so "Remove Repo" is committed
+/// server-side and survives a reload even if the client never sends a follow-up
+/// PUT /api/config (or reloads mid-teardown — the on-disk lock-drain below can
+/// take many seconds on Windows). Without the flag the repo stays configured and
+/// only its index is torn down ("Remove Index").
 async fn delete_repo_index(
     State(state): State<AppState>,
     Path(repo_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let repo = match decode_repo_id(&repo_id) {
         Ok(r) => r,
         Err(r) => return r,
     };
+
+    let remove_repo = params
+        .get("remove_repo")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    // Resolve the generation BEFORE the bump — this is the directory currently on
+    // disk that we must remove. The read guard is dropped immediately.
+    let current_generation = repo_generation(&state, &repo).await;
 
     // Cancel any in-progress indexing, wait for it to finish, then drop the
     // cached DB handle. This guarantees no pipeline holds a RocksDB lock on
@@ -464,26 +503,99 @@ async fn delete_repo_index(
     // the user's perspective regardless of whether the directory removal succeeds.
     state.index_engine.clear_repo_index(&repo).await;
 
-    // Remove the on-disk directory, serialized against `open_db` via the per-repo
-    // open gate (see store::remove_index_dir). Holding that gate across the
-    // retry loop is what prevents a concurrent/immediate re-index from racing the
-    // cleanup: the re-index's get_or_open blocks on the gate until the directory
-    // is fully gone, then opens a fresh DB on a clean path. Without it, the old
-    // detached cleaner could delete files out from under a freshly opened RocksDB
-    // (or collide with the still-draining async LOCK release), producing the
-    // repeating `open surrealdb` errors seen on re-index after "Remove Indexes".
-    let removed = store::remove_index_dir(&state.data_dir, &repo).await;
+    // Bump the generation and persist (disk FIRST, then memory — mirroring
+    // put_config's ordering) BEFORE touching the old directory. Ordering is the fix
+    // for a real incident: the old code removed the directory first (a gated, ~30s
+    // Windows+Defender lock-drain retry loop) and bumped only afterwards. A re-index
+    // triggered during that window read the *old* generation (bump not yet durable)
+    // and parked behind the same per-repo open gate the removal held — wedging the UI
+    // in an indeterminate "Indexing…" with a dead Cancel, then failing with "open
+    // surrealdb" once it recreated the still-draining old path. Persisting the bump
+    // first guarantees a concurrent re-index resolves the NEW generation (a pristine
+    // path the draining handle never touched) and opens immediately. Persisting to
+    // memory before responding also lets the UI's subsequent "Xóa repo" PUT
+    // /api/config preserve the bump (it reads repo_generations from the live handle;
+    // see put_config).
+    let next_generation = current_generation.saturating_add(1);
+    let target = config_path(&state.home_dir);
+    let normalized_repo = crate::store::normalize_repo_path(&repo);
+    let to_write = {
+        let mut s = state.settings.read().await.clone();
+        s.repo_generations
+            .insert(normalized_repo.clone(), next_generation);
+        // "Remove Repo": drop it from the configured list in the SAME durable
+        // write as the generation bump. Doing it here (not via a follow-up PUT
+        // /api/config) makes the removal durable BEFORE the slow lock-drain below,
+        // so a reload mid-teardown — or a lost PUT — can't resurrect the repo from
+        // disk. The generation entry is intentionally KEPT (see repo_generations
+        // doc) so a future re-add reuses the higher generation instead of racing
+        // the still-draining old LOCK.
+        if remove_repo {
+            s.repos.retain(|r| r != &normalized_repo);
+        }
+        s
+    };
+    let persist = tokio::task::spawn_blocking({
+        let to_write = to_write.clone();
+        move || write_settings_atomic(&target, &to_write)
+    })
+    .await;
+    match persist {
+        Ok(Ok(())) => {
+            // Disk write succeeded — now swap memory under the write lock so the
+            // live handle matches disk (GET /api/config reads disk; in-memory is
+            // the source of truth for indexing triggers and the put_config diff).
+            let mut guard = state.settings.write().await;
+            guard
+                .repo_generations
+                .insert(normalized_repo.clone(), next_generation);
+            if remove_repo {
+                guard.repos.retain(|r| r != &normalized_repo);
+            }
+        }
+        Ok(Err(e)) => {
+            // Persisting the bump failed. Without a durable bump a re-index could
+            // reuse the old generation path — and we have NOT removed it yet, so the
+            // old index is intact. Surface the error so the user can retry rather
+            // than silently degrade.
+            let body = json!({ "error": format!("failed to persist index generation: {e}") });
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response();
+        }
+        Err(join_err) => {
+            let body = json!({ "error": format!("internal error: {join_err}") });
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response();
+        }
+    }
+
+    // NOTE: even for a full "Remove Repo" we deliberately do NOT drop the
+    // in-memory status entry — `clear_repo_index` above reset it in place. The
+    // detached watcher has no stop handle, so the status entry is the only thing
+    // that keeps a future `register_repo` (re-add) from spawning a second watcher
+    // (unbounded growth on repeated remove/re-add). The leftover idle entry is
+    // harmless: GET /api/config (disk) no longer lists the repo, so the UI renders
+    // it gone; the poll may re-sync once per tick, the same bounded path already
+    // used to surface MCP-auto-registered repos.
+
+    // Now remove the OLD generation's directory WITHOUT the open gate. The bump above
+    // is durable, so every future open targets `next_generation` — nothing can race
+    // or recreate `current_generation`, and there is nothing to serialize against. A
+    // gate-held removal here would block the fresh generation's open for the whole
+    // ~30s drain (the gate is keyed by repo, not generation); the ungated removal lets
+    // a re-index proceed on the clean path immediately while this drains in the
+    // foreground. If it outlives the retry budget, the boot-time sweep reclaims it
+    // (store::sweep_stale_generations).
+    let removed = store::remove_old_generation_dir(&state.data_dir, &repo, current_generation).await;
 
     if removed {
         Json(json!({ "status": "ok" })).into_response()
     } else {
-        // The directory is logically removed (handle closed, status cleared,
-        // vector shard evicted) but the OS hasn't released the files yet. Report
-        // it so the UI can surface that a retry may be needed; the gate is no
-        // longer held, so a re-index would race — the user should retry removal.
+        // The directory wasn't fully removed yet (OS still holds the files), but the
+        // generation bump already redirected future indexing to a fresh path — so the
+        // repo is fully usable now and the orphan will be swept on next boot. Report
+        // "pending" for transparency (the UI can note the leftover), not as a blocker.
         Json(json!({
             "status": "pending",
-            "message": "index directory could not be fully removed yet; retry shortly"
+            "message": "old index directory not fully removed yet; it will be reclaimed on next restart"
         }))
         .into_response()
     }
@@ -539,7 +651,7 @@ async fn get_index_stats(
         // from index status), and no phantom DB is created by a read.
         Ok(None) => {
             let embedding_model = state.settings.read().await.embedding.model.clone();
-            let db_dir = store::db_path(&state.data_dir, &repo);
+            let db_dir = store::db_path(&state.data_dir, &repo, repo_generation(&state, &repo).await);
             return Json(json!({
                 "repo": repo,
                 "files": 0,
@@ -582,7 +694,7 @@ async fn get_index_stats(
         None => (None, None),
     };
 
-    let db_dir = store::db_path(&state.data_dir, &repo);
+    let db_dir = store::db_path(&state.data_dir, &repo, repo_generation(&state, &repo).await);
 
     // Take an owned snapshot of only what's needed — guard dropped before the Json call.
     let embedding_model = state.settings.read().await.embedding.model.clone();
@@ -669,7 +781,8 @@ async fn post_ignore_file(
     let _guard = lock.lock().await;
 
     // Open DB handle.
-    let db = match store::get_or_open(&state.repo_dbs, &state.data_dir, &repo).await {
+    let generation = repo_generation(&state, &repo).await;
+    let db = match store::get_or_open(&state.repo_dbs, &state.data_dir, &repo, generation).await {
         Ok(d) => d,
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("db: {e}") }))).into_response();
@@ -720,7 +833,8 @@ async fn post_unignore_file(
     let lock = state.index_engine.get_repo_lock_public(&repo).await;
     let _guard = lock.lock().await;
 
-    let db = match store::get_or_open(&state.repo_dbs, &state.data_dir, &repo).await {
+    let generation = repo_generation(&state, &repo).await;
+    let db = match store::get_or_open(&state.repo_dbs, &state.data_dir, &repo, generation).await {
         Ok(d) => d,
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("db: {e}") }))).into_response();
@@ -745,7 +859,8 @@ async fn get_ignored_files(
         Ok(r) => r,
         Err(r) => return r,
     };
-    let db = match store::get_or_open(&state.repo_dbs, &state.data_dir, &repo).await {
+    let generation = repo_generation(&state, &repo).await;
+    let db = match store::get_or_open(&state.repo_dbs, &state.data_dir, &repo, generation).await {
         Ok(d) => d,
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("db: {e}") }))).into_response();
@@ -1240,6 +1355,116 @@ fn plan_http_client() -> reqwest::Client {
         .timeout(PLAN_PROXY_TIMEOUT)
         .build()
         .unwrap_or_default()
+}
+
+// Salt mixed into the machine-id hash. A fixed compile-in constant: it must
+// stay byte-identical across versions/restarts so the derived id is stable for
+// a given machine (the free-trial dedup + idempotent recovery depend on it).
+const MACHINE_ID_SALT: &str = "vibervn-context-engine::free-trial::v1";
+
+/// Derive a stable, opaque per-machine id: `sha256(SALT ‖ machine_uid)` as hex.
+///
+/// We never send the raw hardware uid to the server — only this hash. Returns
+/// an error (NOT a random fallback) when the hardware uid is unavailable: a
+/// random id would silently break idempotency (every claim would look like a
+/// new machine), so the claim must fail loudly instead.
+fn machine_id() -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let uid = machine_uid::get().map_err(|e| format!("machine id unavailable: {e}"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(MACHINE_ID_SALT.as_bytes());
+    hasher.update(b"\x00");
+    hasher.update(uid.as_bytes());
+    Ok(hex_encode(&hasher.finalize()))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+async fn plan_get_free_trial(State(_): State<AppState>) -> Response {
+    let base = plan_admin_base();
+    let url = format!("{base}/api/free-trial");
+
+    let res = match plan_http_client().get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("admin gateway unreachable: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let status = StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let body = res.bytes().await.unwrap_or_default();
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body))
+        .unwrap()
+}
+
+async fn plan_post_free_trial_claim(State(_): State<AppState>) -> Response {
+    // The machine id is computed here (server-side); the browser never sees it
+    // and cannot read hardware identifiers anyway. A failure to derive it is a
+    // hard error — see machine_id() for why no random fallback is allowed.
+    let machine_id = match machine_id() {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e })),
+            )
+                .into_response();
+        }
+    };
+
+    let base = plan_admin_base();
+    let url = format!("{base}/api/free-trial/claim");
+
+    let res = match plan_http_client()
+        .post(&url)
+        .header("content-type", "application/json")
+        .json(&json!({ "machine_id": machine_id }))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("admin gateway unreachable: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let status = StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let body_bytes = res.bytes().await.unwrap_or_default();
+
+    // Inject base_url on success so the frontend knows where the key points to
+    // (mirrors plan_post_checkout). Applies to both 201 Claimed and 200
+    // Recovered responses.
+    if status.is_success()
+        && let Ok(mut obj) = serde_json::from_slice::<Value>(&body_bytes)
+    {
+        let admin_url = plan_admin_base();
+        obj["base_url"] = Value::String(format!("{admin_url}/v1"));
+        return (status, Json(obj)).into_response();
+    }
+
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body_bytes))
+        .unwrap()
 }
 
 async fn plan_get_packages(State(_): State<AppState>) -> Response {

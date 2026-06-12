@@ -1,6 +1,6 @@
 [package]
 name = "context-engine-rs"
-version = "0.1.36"
+version = "0.1.40"
 edition = "2024"
 # The benchmark harness lives in src/bin/chunk_bench.rs as a second binary.
 # Without default-run, `cargo run`/`cargo watch -x 'run -r'` becomes ambiguous
@@ -47,6 +47,8 @@ tree-sitter-pascal = "0.10"
 tree-sitter-liquid = { path = "vendor/tree-sitter-liquid" }
 base64 = "0.22"
 md5 = "0.7"
+sha2 = "0.10"
+machine-uid = "0.5"
 filetime = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1"

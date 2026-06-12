@@ -134,7 +134,7 @@ async fn count_real_db_rows() {
     // the test continues to inspect the real index regardless of any
     // `Settings.data_dir` override (this binary is NOT booting the server).
     let data_dir = home_dir.join(".vibervn").join("context-engine");
-    let db = open_db(&data_dir, &repo).await.expect("open real db");
+    let db = open_db(&data_dir, &repo, 0).await.expect("open real db");
 
     #[derive(serde::Deserialize)]
     struct C { count: i64 }
@@ -173,7 +173,7 @@ async fn repro_full_rebuild_notepad_ade_fresh_db() {
         eprintln!("SKIP: source repo not present");
         return;
     }
-    let db = open_db(home.path(), &repo).await.expect("open fresh db");
+    let db = open_db(home.path(), &repo, 0).await.expect("open fresh db");
     // voyage = None — exercises parse + all DB writes + Phase 2 with zero embedding
     // work (the all-cached / no-network floor used for every prior measurement).
     let pipeline = IndexPipeline::new(repo.clone(), None);
@@ -255,7 +255,7 @@ async fn inspect_real_calls_indexes() {
         return;
     }
 
-    let db = open_db(&data_dir, &repo)
+    let db = open_db(&data_dir, &repo, 0)
         .await
         .expect("open real surreal db");
 
@@ -419,7 +419,7 @@ async fn repro_full_rebuild_notepad_ade_warm_cache() {
     // Open (or create) the real SurrealDB at ~/.vibervn/context-engine/rocksdb/…
     // Note: the rocksdb dir should be deleted before running this test so the
     // rebuild is genuinely forced from scratch, but open_db handles both cases.
-    let db = open_db(&data_dir, &repo)
+    let db = open_db(&data_dir, &repo, 0)
         .await
         .expect("open real surreal db");
 

@@ -218,6 +218,29 @@
           </svg>
         </button>
         <div id="plan-card-body" class="mt-4">
+        <!-- Sub-section: Free Trial (hidden until /api/plan/free-trial reports available) -->
+        <div id="plan-free-trial-section" class="hidden mb-6">
+          <h3 data-i18n="plan.freeTrial.heading" class="font-wiki text-base dark:text-wiki-heading text-gray-900 border-b border-gray-200 dark:border-wiki-border pb-2 mb-3">
+            Free Trial
+          </h3>
+          <div class="flex items-center justify-between p-3 border border-blue-300 dark:border-wiki-border-active/50 bg-blue-50/50 dark:bg-wiki-border-active/10 rounded">
+            <div class="flex-1 min-w-0">
+              <div class="font-medium text-sm text-gray-900 dark:text-wiki-heading" data-i18n="plan.freeTrial.heading">Free Trial</div>
+              <div id="plan-ft-budget" class="text-xs text-gray-400 dark:text-wiki-text-muted mt-1"></div>
+              <p class="text-xs text-gray-400 dark:text-wiki-text-muted mt-1" data-i18n="plan.freeTrial.machineHint">
+                A hashed machine identifier (not your raw hardware ID) is sent to ensure each machine can claim the free trial only once.
+              </p>
+            </div>
+            <div class="ml-4">
+              <button id="btn-plan-claim-ft" data-i18n="plan.freeTrial.claim"
+                      class="plan-claim-ft-btn px-3 py-1.5 bg-blue-600 dark:bg-wiki-border-active/20 dark:border dark:border-wiki-border-active text-white dark:text-wiki-link text-sm rounded whitespace-nowrap
+                             hover:bg-blue-700 dark:hover:bg-wiki-border-active/30 focus:outline-none focus:ring-2 focus:ring-blue-400">
+                Claim Free Trial
+              </button>
+            </div>
+          </div>
+          <div id="plan-ft-error" class="hidden text-sm text-red-600 dark:text-red-400 mt-2"></div>
+        </div>
         <!-- Sub-section: Buy -->
         <h3 data-i18n="plan.heading" class="font-wiki text-base dark:text-wiki-heading text-gray-900 border-b border-gray-200 dark:border-wiki-border pb-2 mb-3">
           Buy Plan
@@ -1079,8 +1102,25 @@
 let cfg = null;
 let saveTimer = null;
 let indexStatuses = {}; // keyed by repo path
+// Repos the user triggered that the consumer hasn't picked up yet. The backend
+// has no "queued" state (only Idle/Indexing/Error), so /api/index-status reports
+// a waiting repo as plain `idle` — without this client-side set the optimistic
+// "Queued…" label gets clobbered by the next poll. reconcileQueue() keeps it
+// honest so nothing sticks at "Queued…" forever.
+let queuedRepos = new Set(); // repo paths, same key form as indexStatuses
 let indexPollTimer = null;
 let repoFilter = '';
+// True while a PUT /api/config is actually in flight. Combined with a pending
+// saveTimer, this tells the index poll NOT to re-sync cfg.repos from disk: a
+// background GET /api/config reads DISK, which lags an in-flight save's disk
+// write, so a re-sync mid-save would clobber an optimistic add/remove with the
+// pre-save list (the repo row vanishes until the next reload).
+let saveInFlight = false;
+function isSavePending() { return saveInFlight || saveTimer !== null; }
+// Repos whose server-side teardown is in flight. renderRepos() hides them so the
+// row disappears instantly on "Remove Repo" while the slow DELETE runs in the
+// background (see the btn-remove-repo handler).
+const deletingRepos = new Set();
 
 // ─── i18n ──────────────────────────────────────────────────────────────────
 // Client-only locale (en | vi | zh), persisted in localStorage like the theme.
@@ -1098,6 +1138,19 @@ function isWindowsOS() {
 }
 function exampleRepoPath() {
   return isWindowsOS() ? 'D:\\projects\\my-app' : '~/projects/my-app';
+}
+
+// Mirrors Rust store::normalize_repo_path so a freshly-added repo's identity
+// matches the value the server persists and keys indexStatuses by. Without this
+// the optimistic row carries raw case (D:\…) while the server returns lowercase
+// (d:\…): the row's status badge never binds, and the index poll's "unknown
+// repo" heuristic misfires every tick. Windows → backslashes + lowercase;
+// elsewhere → forward slashes. Both trim trailing separators.
+function normalizeRepoPath(repo) {
+  let s = isWindowsOS()
+    ? repo.replace(/\//g, '\\').toLowerCase()
+    : repo.replace(/\\/g, '/');
+  return s.replace(/[\\/]+$/, '');
 }
 
 // Hand-built inline SVG flags (no emoji — Windows renders flag emoji as letter
@@ -1222,6 +1275,14 @@ const STR = {
   'plan.purchased.added': { en: `Added!`, vi: `Đã thêm!`, zh: `已添加！` },
   'plan.purchased.usage': { en: `{remaining} / {budget}`, vi: `{remaining} / {budget}`, zh: `{remaining} / {budget}` },
   'plan.purchased.usageLoading': { en: `Loading usage…`, vi: `Đang tải usage…`, zh: `正在加载用量…` },
+  'plan.freeTrial.heading': { en: `Free Trial`, vi: `Free Trial`, zh: `免费试用` },
+  'plan.freeTrial.claim': { en: `Claim Free Trial`, vi: `Nhận Free Trial`, zh: `领取免费试用` },
+  'plan.freeTrial.claiming': { en: `Claiming…`, vi: `Đang nhận…`, zh: `领取中…` },
+  'plan.freeTrial.budget': { en: `Voyage budget: {voyage} requests · OpenAI budget: {openai} requests`, vi: `Voyage budget: {voyage} requests · OpenAI budget: {openai} requests`, zh: `Voyage 预算：{voyage} 次请求 · OpenAI 预算：{openai} 次请求` },
+  'plan.freeTrial.machineHint': { en: `A hashed machine identifier (not your raw hardware ID) is sent to ensure each machine can claim the free trial only once.`, vi: `Một machine ID đã được hash (không phải ID phần cứng thô) sẽ được gửi để đảm bảo mỗi máy chỉ nhận free trial 1 lần.`, zh: `系统会发送一个经过哈希处理的机器标识符（而非原始硬件 ID），以确保每台机器只能领取一次免费试用。` },
+  'plan.freeTrial.expired': { en: `Free trial expired`, vi: `Free trial đã hết hạn`, zh: `免费试用已过期` },
+  'plan.freeTrial.expiredHint': { en: `Your free trial has ended. Buy a plan below to keep going.`, vi: `Free trial của bạn đã kết thúc. Mua một gói bên dưới để tiếp tục.`, zh: `您的免费试用已结束。购买下方的套餐以继续使用。` },
+  'plan.freeTrial.unavailable': { en: `Free trial is not available right now.`, vi: `Free trial hiện không khả dụng.`, zh: `免费试用当前不可用。` },
 
   // Repositories
   'repos.placeholder': { en: `e.g. {path}`, vi: `vd. {path}`, zh: `例如 {path}` },
@@ -1238,13 +1299,14 @@ const STR = {
   'repo.index':        { en: `Index`, vi: `Index`, zh: `索引` },
   'repo.queued':       { en: `Queued…`, vi: `Đang chờ…`, zh: `已排队…` },
   'repo.cancelling':   { en: `Cancelling…`, vi: `Đang hủy…`, zh: `正在取消…` },
-  'repo.removing':     { en: `Removing…`, vi: `Đang xóa…`, zh: `正在移除…` },
   'repo.removeIndex':  { en: `Remove Indexes`, vi: `Xóa index`, zh: `移除索引` },
   'repo.removeRepo':   { en: `Remove Repo`, vi: `Xóa repo`, zh: `移除仓库` },
   'repo.notIndexed':   { en: `Not indexed`, vi: `Chưa index`, zh: `未索引` },
   'repo.error':        { en: `Error`, vi: `Lỗi`, zh: `错误` },
   'repo.files':        { en: `{n} files`, vi: `{n} file`, zh: `{n} 个文件` },
   'repo.removeIndexFail': { en: `Failed to remove indexes`, vi: `Xóa index thất bại`, zh: `移除索引失败` },
+  'repo.removeRepoFail': { en: `Failed to remove repo`, vi: `Xóa repo thất bại`, zh: `移除仓库失败` },
+  'toast.removed':     { en: `Removed`, vi: `Đã xóa`, zh: `已移除` },
 
   // Settings — Embedding
   'embed.heading':     { en: `Embedding Provider`, vi: `Embedding Provider`, zh: `嵌入向量提供商` },
@@ -1529,6 +1591,10 @@ async function syncReposFromConfig() {
     const res = await fetch('/api/config');
     if (!res.ok) return;
     const fresh = await res.json();
+    // A save may have started while this GET was in flight; its disk write can
+    // lag, so the body we just read may predate it. Don't clobber an in-flight
+    // optimistic mutation — the save's own renderRepos() is authoritative.
+    if (isSavePending()) return;
     if (fresh && Array.isArray(fresh.repos)) {
       if (cfg) { cfg.repos = fresh.repos; } else { cfg = fresh; }
       renderRepos();
@@ -1548,9 +1614,12 @@ async function pollIndexStatus() {
     indexStatuses = newStatuses;
     // If a repo appears in status (e.g. auto-registered by an MCP call) but is
     // not yet in our cfg.repos, refresh the repo list without a full reload.
+    // Skip while a save is pending/in-flight: GET /api/config reads disk, which
+    // lags the in-flight PUT's write, so re-syncing now would clobber the user's
+    // optimistic add/remove with the stale pre-save list (row vanishes until reload).
     const known = (cfg && cfg.repos) ? cfg.repos : [];
     const hasNewRepo = Object.keys(newStatuses).some(r => !known.includes(r));
-    if (hasNewRepo) { await syncReposFromConfig(); }
+    if (hasNewRepo && !isSavePending()) { await syncReposFromConfig(); }
     updateRepoIndexUI();
   } catch (_) { /* ignore network errors in polling */ }
   scheduleNextPoll();
@@ -1567,8 +1636,27 @@ function startIndexPolling() {
   pollIndexStatus();
 }
 
+// Drop repos from the client-side queue once the server's truth makes "Queued…"
+// wrong. Called from updateRepoIndexUI (i.e. every poll). A repo leaves the queue
+// when: (a) it's now actually indexing — the consumer picked it up; (b) it
+// errored; (c) it was removed from config; or (d) the consumer is fully idle
+// (nothing is `indexing`), meaning the queue already drained or a fast repo
+// finished between polls — keeping it queued would strand it at "Queued…".
+function reconcileQueue() {
+  if (queuedRepos.size === 0) return;
+  const known = (cfg && cfg.repos) ? new Set(cfg.repos) : new Set();
+  const anyIndexing = Object.values(indexStatuses).some(s => s && s.state === 'indexing');
+  for (const repo of [...queuedRepos]) {
+    const s = indexStatuses[repo];
+    if (!known.has(repo)) { queuedRepos.delete(repo); continue; }
+    if (s && (s.state === 'indexing' || s.state === 'error')) { queuedRepos.delete(repo); continue; }
+    if (!anyIndexing) { queuedRepos.delete(repo); }
+  }
+}
+
 function updateRepoIndexUI() {
   if (!cfg || !cfg.repos) return;
+  reconcileQueue();
   cfg.repos.forEach((repo) => {
     const statusEl = document.getElementById('repo-status-' + encodeRepoId(repo));
     const btnEl = document.getElementById('repo-index-btn-' + encodeRepoId(repo));
@@ -1576,6 +1664,18 @@ function updateRepoIndexUI() {
     if (!statusEl || !btnEl) return;
     const s = indexStatuses[repo];
     statusEl.className = 'text-xs text-gray-400 dark:text-wiki-text-muted whitespace-nowrap';
+    // Queued: user triggered it, but the (single, sequential) consumer is still
+    // busy with another repo. The server reports it as idle / not-yet-known, so
+    // this branch must win over the no-status and idle branches below. A run that
+    // hasn't started can't be cancelled, so the Index button stays disabled.
+    if (queuedRepos.has(repo)) {
+      statusEl.innerHTML = '<span class="animate-pulse text-blue-500 dark:text-wiki-link">' + escHtml(t('repo.queued')) + '</span>';
+      btnEl.disabled = true;
+      btnEl.textContent = t('repo.index');
+      btnEl.classList.remove('cancel-state');
+      if (showBtn) showBtn.classList.add('hidden');
+      return;
+    }
     if (!s) {
       statusEl.textContent = '';
       btnEl.disabled = false;
@@ -1641,8 +1741,11 @@ function isValidUrl(s) {
   catch { return false; }
 }
 
-function showToast() {
+function showToast(msg) {
   const t = document.getElementById('toast-saved');
+  // Default to "Saved"; the remove flow passes "Removed". Always set explicitly
+  // so a prior custom message never leaks into a later save toast.
+  t.textContent = msg !== undefined ? msg : window.t('toast.saved');
   t.classList.remove('hidden');
   requestAnimationFrame(() => { t.classList.remove('opacity-0'); t.classList.add('opacity-100'); });
   setTimeout(() => {
@@ -1707,7 +1810,9 @@ function renderRepos() {
   empty.classList.add('hidden');
   noMatch.classList.add('hidden');
 
-  const repos = cfg.repos || [];
+  // Hide repos whose teardown is in flight so the row vanishes instantly on
+  // "Remove Repo", even though cfg.repos still holds it until the DELETE resolves.
+  const repos = (cfg.repos || []).filter(r => !deletingRepos.has(r));
   if (repos.length === 0) {
     filterInput.classList.add('hidden');
     empty.classList.remove('hidden');
@@ -1783,11 +1888,16 @@ function renderRepos() {
       }
       btn.disabled = true;
       const statusEl = document.getElementById('repo-status-' + repoId);
-      if (statusEl) statusEl.innerHTML = '<span class="animate-pulse text-blue-500 dark:text-wiki-link">' + escHtml(t('repo.queued')) + '</span>';
+      // Enqueue optimistically and render through the central path so the
+      // "Queued…" badge survives the immediate poll below (reconcileQueue keeps
+      // it only while another repo is actually indexing).
+      queuedRepos.add(repo);
+      updateRepoIndexUI();
       try {
         await fetch('/api/repos/' + repoId + '/index', { method: 'POST' });
         await pollIndexStatus();
       } catch (e) {
+        queuedRepos.delete(repo);
         if (statusEl) statusEl.innerHTML = '<span class="text-red-500">' + escHtml(t('repo.error')) + '</span>';
         btn.disabled = false;
       }
@@ -1809,8 +1919,13 @@ function renderRepos() {
       e.stopPropagation();
       const repo = btn.dataset.repo;
       const repoId = encodeRepoId(repo);
-      btn.textContent = t('repo.removing');
-      btn.disabled = true;
+      // Optimistic: the server clears in-memory index state immediately but the
+      // on-disk teardown (Windows lock-drain retry loop) can take seconds. Don't
+      // freeze the dropdown on "Đang xóa…" through it — close + toast now, run the
+      // DELETE in the background. The repo row stays (only its index is cleared);
+      // the status badge flips to "Not indexed" via the poll below / background poll.
+      btn.closest('.remove-dropdown').classList.add('hidden');
+      showToast(t('toast.removed'));
       try {
         const res = await fetch('/api/repos/' + repoId + '/index', { method: 'DELETE' });
         if (!res.ok) {
@@ -1819,10 +1934,6 @@ function renderRepos() {
         }
       } catch (err) {
         showError(t('err.network', { msg: err.message }));
-      } finally {
-        btn.textContent = t('repo.removeIndex');
-        btn.disabled = false;
-        btn.closest('.remove-dropdown').classList.add('hidden');
       }
       await pollIndexStatus();
     });
@@ -1833,21 +1944,44 @@ function renderRepos() {
       e.stopPropagation();
       btn.closest('.remove-dropdown').classList.add('hidden');
       const repo = btn.dataset.repo;
-      const idx = parseInt(btn.dataset.idx, 10);
+      // Optimistic removal: the server teardown (cancel in-progress index → drop
+      // RocksDB handle → Windows lock-drain retry loop → generation bump) can take
+      // seconds. Hide the row INSTANTLY via the deleting set + toast, then run the
+      // slow work in the background.
+      //
+      // The DELETE carries `?remove_repo=true`, so the server drops the repo from
+      // settings.repos in the SAME durable write that bumps the generation —
+      // BEFORE the slow on-disk teardown. That makes the removal survive a reload
+      // even if the user refreshes mid-teardown. Because the server is now
+      // authoritative we do NOT send a follow-up PUT /api/config: the old
+      // delete-then-splice-then-saveNow flow lost the removal whenever that second
+      // request never landed (reload, navigation, or a clobbered write), which is
+      // exactly why a removed repo used to reappear after reload.
+      deletingRepos.add(repo);
+      renderRepos();
+      showToast(t('toast.removed'));
       const repoId = encodeRepoId(repo);
-      btn.disabled = true;
       try {
-        const res = await fetch('/api/repos/' + repoId + '/index', { method: 'DELETE' });
+        const res = await fetch('/api/repos/' + repoId + '/index?remove_repo=true', { method: 'DELETE' });
         if (!res.ok) {
           const data = await res.json().catch(() => ({}));
-          showError(data.error || t('repo.removeIndexFail'));
+          showError(data.error || t('repo.removeRepoFail'));
+          deletingRepos.delete(repo);
+          renderRepos();
+          return;
         }
-      } catch (_) {
-        showError(t('repo.removeIndexFail'));
+        // Server already persisted the removal (disk + memory). Mirror it into the
+        // local cfg so the row stays gone without re-fetching, then clear the
+        // deleting marker. No saveNow() — the server is the source of truth here.
+        const i = (cfg.repos || []).indexOf(repo);
+        if (i !== -1) cfg.repos.splice(i, 1);
+        deletingRepos.delete(repo);
+        renderRepos();
+      } catch (err) {
+        showError(t('err.network', { msg: err.message }));
+        deletingRepos.delete(repo);
+        renderRepos();
       }
-      cfg.repos.splice(idx, 1);
-      renderRepos();
-      saveNow();
     });
   });
 
@@ -1932,6 +2066,8 @@ function escHtml(str) {
 // ─── Save ──────────────────────────────────────────────────────────────────
 async function saveNow() {
   clearTimeout(saveTimer);
+  saveTimer = null;
+  saveInFlight = true;
   hideError();
   try {
     const res = await fetch('/api/config', {
@@ -1950,6 +2086,8 @@ async function saveNow() {
     showToast();
   } catch (err) {
     showError(t('err.network', { msg: err.message }));
+  } finally {
+    saveInFlight = false;
   }
 }
 
@@ -1991,6 +2129,7 @@ async function loadConfig() {
     renderAll();
     navigateIfFirstUse();
     planFetchPackages();
+    planLoadFreeTrial();
     planResumePending();
   } catch (err) {
     document.getElementById('skeleton').classList.add('hidden');
@@ -2004,12 +2143,17 @@ document.getElementById('btn-retry').addEventListener('click', () => { hideError
 
 function handleAddRepo() {
   const input = document.getElementById('input-repo');
-  const val = input.value.trim();
-  if (!val) return;
+  const raw = input.value.trim();
+  if (!raw) return;
   const warning = document.getElementById('repo-warning');
-  const isAbsolute = val.startsWith('/') || /^[A-Za-z]:[\\\/]/.test(val);
+  const isAbsolute = raw.startsWith('/') || /^[A-Za-z]:[\\\/]/.test(raw);
   if (!isAbsolute) { warning.classList.remove('hidden'); } else { warning.classList.add('hidden'); }
+  // Normalize to the server's canonical form so the optimistic row's identity
+  // matches what the PUT response returns and what indexStatuses is keyed by —
+  // otherwise the status badge never binds and the poll re-syncs on every tick.
+  const val = normalizeRepoPath(raw);
   if (!cfg.repos) cfg.repos = [];
+  if (cfg.repos.includes(val)) { input.value = ''; return; }  // already configured — no-op
   cfg.repos.push(val);
   input.value = '';
   repoFilter = '';
@@ -2208,6 +2352,85 @@ async function planFetchPackages() {
   }
 }
 
+// ─── Free Trial ──────────────────────────────────────────────────────────
+let planFreeTrialInfo = null;
+
+async function planLoadFreeTrial() {
+  const section = document.getElementById('plan-free-trial-section');
+  try {
+    const res = await fetch('/api/plan/free-trial');
+    if (!res.ok) { section.classList.add('hidden'); return; }
+    const info = await res.json();
+    planFreeTrialInfo = info;
+    // Hide the whole card when the admin hasn't configured/enabled a free
+    // trial — matches how the public pricing page hides unavailable features.
+    if (!info.available) { section.classList.add('hidden'); return; }
+    document.getElementById('plan-ft-budget').textContent = t('plan.freeTrial.budget', {
+      voyage: (info.voyage_budget || 0).toLocaleString(),
+      openai: (info.openai_budget || 0).toLocaleString(),
+    });
+    section.classList.remove('hidden');
+  } catch (_) {
+    section.classList.add('hidden');
+  }
+}
+
+async function planClaimFreeTrial() {
+  const btn = document.getElementById('btn-plan-claim-ft');
+  const errEl = document.getElementById('plan-ft-error');
+  errEl.classList.add('hidden');
+  btn.disabled = true;
+  const prevLabel = btn.textContent;
+  btn.textContent = t('plan.freeTrial.claiming');
+  try {
+    const res = await fetch('/api/plan/free-trial/claim', { method: 'POST' });
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      // 503 == admin disabled / not configured.
+      throw new Error(res.status === 503 ? t('plan.freeTrial.unavailable') : (d.error || `HTTP ${res.status}`));
+    }
+    const data = await res.json();
+    // Reuse the purchase success machinery: show the key + save to Purchased
+    // Plans (usage bar, expiry badge, Apply/Replace all come for free). The
+    // duration comes from the free-trial info so the expiry badge is accurate.
+    const durationDays = planFreeTrialInfo
+      ? (planFreeTrialInfo.duration_days || 0) : 0;
+    planFreeTrialSuccess(data.proxy_key, data.base_url, data.expires_at, durationDays);
+  } catch (e) {
+    errEl.textContent = e.message;
+    errEl.classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = prevLabel;
+  }
+}
+
+function planFreeTrialSuccess(proxyKey, baseUrl, expiresAt, durationDays) {
+  // Save as a purchased plan flagged is_free_trial so the expired badge shows
+  // the "buy a plan" hint (F1=C). Idempotent invoice key so re-claim updates
+  // the same row instead of duplicating it.
+  let expiresMs = null;
+  if (expiresAt) {
+    const parsed = Date.parse(expiresAt.replace(' ', 'T') + 'Z');
+    if (!Number.isNaN(parsed)) expiresMs = parsed;
+  } else if (durationDays > 0) {
+    expiresMs = Date.now() + durationDays * 86400000;
+  }
+  const entry = {
+    invoice: 'FREETRIAL',
+    proxy_key: proxyKey,
+    base_url: baseUrl || '',
+    package_name: t('plan.freeTrial.heading'),
+    purchased_at: Date.now(),
+    expires_at: expiresMs,
+    is_free_trial: true,
+  };
+  addPurchasedPlan(entry);
+  renderPurchasedPlans();
+  // Immediately apply so the trial key is usable without an extra click.
+  planApplyEntry({ proxy_key: proxyKey, base_url: baseUrl || '' });
+}
+
 async function planCheckout(packageId) {
   const error = document.getElementById('plan-error');
   error.classList.add('hidden');
@@ -2397,9 +2620,16 @@ function renderPurchasedPlans() {
     if (p.expires_at) {
       const expired = Date.now() > p.expires_at;
       const expDate = new Date(p.expires_at).toLocaleDateString();
-      expiryHtml = expired
-        ? `<span class="text-red-400 text-xs">${t('plan.purchased.expired')}</span>`
-        : `<span class="text-xs text-gray-400 dark:text-wiki-text-muted">${t('plan.purchased.expires', { date: expDate })}</span>`;
+      if (expired) {
+        // Free-trial expiry gets a dedicated label + "buy a plan" nudge (F1=C);
+        // the key stays dead — re-claiming returns the same expired key.
+        expiryHtml = p.is_free_trial
+          ? `<span class="text-red-400 text-xs">${t('plan.freeTrial.expired')}</span>
+             <span class="block text-xs text-amber-600 dark:text-amber-400 mt-0.5">${t('plan.freeTrial.expiredHint')}</span>`
+          : `<span class="text-red-400 text-xs">${t('plan.purchased.expired')}</span>`;
+      } else {
+        expiryHtml = `<span class="text-xs text-gray-400 dark:text-wiki-text-muted">${t('plan.purchased.expires', { date: expDate })}</span>`;
+      }
     }
     return `<div class="flex items-center justify-between p-3 border border-gray-200 dark:border-wiki-border rounded" data-invoice="${escHtml(p.invoice)}">
       <div class="flex-1 min-w-0">
@@ -2413,7 +2643,6 @@ function renderPurchasedPlans() {
       </div>
       <div class="flex items-center gap-2 ml-4">
         <button class="plan-row-apply px-2 py-1 text-xs bg-blue-600 dark:bg-wiki-border-active/20 dark:border dark:border-wiki-border-active text-white dark:text-wiki-link rounded hover:bg-blue-700 dark:hover:bg-wiki-border-active/30">${t('plan.apply')}</button>
-        <button class="plan-row-replace px-2 py-1 text-xs bg-red-600 dark:bg-red-700/30 dark:border dark:border-red-600/50 text-white dark:text-red-300 rounded hover:bg-red-700 dark:hover:bg-red-700/50">${t('plan.replace')}</button>
         <button class="plan-row-remove px-2 py-1 text-xs border border-gray-300 dark:border-wiki-border text-gray-500 dark:text-wiki-text-muted rounded hover:bg-gray-100 dark:hover:bg-wiki-surface">${t('plan.purchased.remove')}</button>
       </div>
     </div>`;
@@ -2528,6 +2757,7 @@ document.getElementById('plan-packages').addEventListener('click', (e) => {
   planSelectedPackage = planPackagesCache.find(p => p.id === pkgId) || null;
   planCheckout(pkgId);
 });
+document.getElementById('btn-plan-claim-ft').addEventListener('click', planClaimFreeTrial);
 document.getElementById('btn-plan-cancel-wait').addEventListener('click', () => {
   planStopPolling();
   localStorage.removeItem('pending_payment');
@@ -2566,15 +2796,12 @@ document.getElementById('plan-purchased-list').addEventListener('click', (e) => 
   if (!entry) return;
 
   if (e.target.closest('.plan-row-apply')) {
-    planApplyEntry(entry);
+    // "Apply to Settings" replaces all existing keys with this one (was two
+    // separate buttons; merged into one for a simpler card UX).
+    planReplaceEntry(entry);
     const btn = e.target.closest('.plan-row-apply');
     btn.textContent = t('plan.applied');
     setTimeout(() => { btn.textContent = t('plan.apply'); }, 1500);
-  } else if (e.target.closest('.plan-row-replace')) {
-    planReplaceEntry(entry);
-    const btn = e.target.closest('.plan-row-replace');
-    btn.textContent = t('plan.replaced');
-    setTimeout(() => { btn.textContent = t('plan.replace'); }, 1500);
   } else if (e.target.closest('.plan-row-remove')) {
     removePurchasedPlan(invoice);
   } else if (e.target.closest('.plan-copy-key-btn')) {
@@ -4128,6 +4355,16 @@ document.getElementById('btn-index-all').addEventListener('click', async () => {
     ));
   } else {
     btn.textContent = t('repos.indexing');
+    // Enqueue every repo that isn't already running, so the row list shows one
+    // repo with a progress bar and the rest holding at "Queued…" as the single
+    // consumer drains them one by one.
+    if (cfg && Array.isArray(cfg.repos)) {
+      cfg.repos.forEach((repo) => {
+        const s = indexStatuses[repo];
+        if (!s || s.state !== 'indexing') queuedRepos.add(repo);
+      });
+      updateRepoIndexUI();
+    }
     try {
       await fetch('/api/index-all', { method: 'POST' });
     } catch (_) {}

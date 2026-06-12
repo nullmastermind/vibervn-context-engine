@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs,
     io,
     path::{Path, PathBuf},
@@ -9,14 +10,14 @@ use serde_json::Value;
 use tempfile::NamedTempFile;
 
 /// Bump this when a new migration is appended to MIGRATIONS.
-pub const CURRENT_VERSION: u32 = 7;
+pub const CURRENT_VERSION: u32 = 8;
 
 /// Migration function type: transforms a JSON Value from version N to version N+1.
 pub type MigrationFn = fn(Value) -> Result<Value, ConfigError>;
 
 /// Ordered list of migration functions. Each entry migrates from version N to N+1,
 /// where N is the index into this slice (0-based, so index 0 = v1→v2, etc.).
-pub const MIGRATIONS: &[MigrationFn] = &[migrate_v1_to_v2, migrate_v2_to_v3, migrate_v3_to_v4, migrate_v4_to_v5, migrate_v5_to_v6, migrate_v6_to_v7];
+pub const MIGRATIONS: &[MigrationFn] = &[migrate_v1_to_v2, migrate_v2_to_v3, migrate_v3_to_v4, migrate_v4_to_v5, migrate_v5_to_v6, migrate_v6_to_v7, migrate_v7_to_v8];
 
 /// v1→v2: introduce `data_dir` (Option<PathBuf>). The body is a no-op stamp —
 /// `serde(default)` already handles missing fields on deserialize, but we
@@ -93,6 +94,21 @@ fn migrate_v6_to_v7(mut value: Value) -> Result<Value, ConfigError> {
     {
         emb.entry("voyage_base_url".to_string())
             .or_insert(Value::Null);
+    }
+    Ok(value)
+}
+
+/// v7→v8: introduce `repo_generations` (map of repo path → generation counter).
+/// Defaults to an empty object — every existing repo is implicitly generation 0,
+/// which `db_path` maps to exactly today's `<data_dir>/rocksdb/<name>` layout, so
+/// no on-disk index is orphaned by this migration. The counter is bumped on every
+/// repo/index delete so the next index for that repo lands on a FRESH directory
+/// (`<data_dir>/rocksdb/<gen>/<name>` for gen ≥ 1), side-stepping the async RocksDB
+/// LOCK drain that otherwise makes an immediate re-index race the deleted handle.
+fn migrate_v7_to_v8(mut value: Value) -> Result<Value, ConfigError> {
+    if let Value::Object(ref mut obj) = value {
+        obj.entry("repo_generations".to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
     }
     Ok(value)
 }
@@ -312,6 +328,21 @@ pub struct Settings {
     /// Filenames to skip during indexing (case-sensitive, filename-only match).
     #[serde(default = "default_index_ignore_filenames")]
     pub index_ignore_filenames: Vec<String>,
+    /// Per-repo on-disk index generation counter, keyed by the **normalized** repo
+    /// path (see `store::normalize_repo_path`). SERVER-OWNED: `put_config` ignores
+    /// any client-sent value and preserves what is on disk, so the UI's
+    /// delete-then-PUT-config flow ("Xóa repo") cannot clobber a bump made by the
+    /// delete handler.
+    ///
+    /// Semantics: a repo absent from this map (or mapped to 0) uses the legacy path
+    /// `<data_dir>/rocksdb/<name>`. After each repo/index delete the counter is
+    /// incremented and persisted, and the next index lands on
+    /// `<data_dir>/rocksdb/<gen>/<name>` — a fresh directory the just-deleted (and
+    /// possibly still-draining) RocksDB handle never touched. Entries persist even
+    /// after a repo is removed from `repos`, so re-adding it keeps the higher
+    /// generation instead of resetting to 0 and racing the old LOCK again.
+    #[serde(default)]
+    pub repo_generations: HashMap<String, u32>,
 }
 
 impl Default for Settings {
@@ -329,7 +360,21 @@ impl Default for Settings {
             enabled_mcp_tools: default_enabled_mcp_tools(),
             custom_extensions: Vec::new(),
             index_ignore_filenames: default_index_ignore_filenames(),
+            repo_generations: HashMap::new(),
         }
+    }
+}
+
+impl Settings {
+    /// Generation counter for `repo` (0 if never deleted). The lookup key is the
+    /// normalized repo path so it matches how `repo_dbs`, statuses, and the delete
+    /// handler key the same repo. Generation 0 → legacy `<data_dir>/rocksdb/<name>`
+    /// path; ≥ 1 → `<data_dir>/rocksdb/<gen>/<name>`.
+    pub fn repo_generation(&self, repo: &str) -> u32 {
+        self.repo_generations
+            .get(&crate::store::normalize_repo_path(repo))
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -938,6 +983,50 @@ mod tests {
             emb.get("voyage_base_url").map(|x| x.is_null()).unwrap_or(false),
             "on-disk voyage_base_url should be explicit null after migration, got: {:?}",
             emb.get("voyage_base_url")
+        );
+    }
+
+    #[test]
+    fn test_v7_to_v8_migration_stamps_empty_repo_generations() {
+        let home = TempDir::new().expect("tempdir");
+        let path = config_path(home.path());
+        fs::create_dir_all(path.parent().expect("has parent")).expect("create dirs");
+
+        // A v7 file has no `repo_generations` key. After migration every existing
+        // repo must read as generation 0 (legacy path preserved — no orphaning).
+        let v7 = r#"{
+            "version": 7,
+            "repos": ["D:\\projects\\foo"],
+            "embedding": {"provider":"voyage","model":"voyage-4-lite","api_keys":[],"embed_concurrency":16,"voyage_base_url":null},
+            "llm": {"provider":"google","rerank_model":"gemini-3.1-flash-lite","api_keys":[]},
+            "data_dir": null,
+            "embeddings_dir": null,
+            "enabled_mcp_tools": ["codebase-retrieval","file-retrieval"],
+            "custom_extensions": [],
+            "index_ignore_filenames": ["CLAUDE.md","AGENTS.md"]
+        }"#;
+        fs::write(&path, v7).expect("write v7 settings.json");
+
+        let loaded = ensure_dir_and_load(home.path()).expect("load v7");
+        assert_eq!(loaded.version, CURRENT_VERSION);
+        assert!(
+            loaded.repo_generations.is_empty(),
+            "repo_generations must default to empty after v7→v8 migration"
+        );
+        // An unlisted repo (and every existing one) reads as generation 0.
+        assert_eq!(
+            loaded.repo_generation("D:\\projects\\foo"),
+            0,
+            "existing repo must be generation 0 so its on-disk index is not orphaned"
+        );
+
+        let raw = fs::read_to_string(&path).expect("re-read");
+        let v: Value = serde_json::from_str(&raw).expect("parse re-read");
+        assert_eq!(v.get("version").and_then(|x| x.as_u64()), Some(CURRENT_VERSION as u64));
+        assert!(
+            v.get("repo_generations").map(|x| x.is_object()).unwrap_or(false),
+            "on-disk repo_generations should be an explicit object after migration, got: {:?}",
+            v.get("repo_generations")
         );
     }
 

@@ -2757,7 +2757,7 @@ mod end_to_end_persist {
         let repo = env!("CARGO_MANIFEST_DIR").replace('\\', "/");
         println!("REAL-TREE PROBE: repo = {repo}");
 
-        let db = open_db(home.path(), &repo).await.expect("open db");
+        let db = open_db(home.path(), &repo, 0).await.expect("open db");
         let pipeline = IndexPipeline::new(repo.clone(), None);
 
         let result = pipeline.run(&db, None, true, None, None, None, &[], None).await;
@@ -2781,7 +2781,7 @@ mod end_to_end_persist {
         let _file_path = write_test_file(repo_dir.path());
         let repo = repo_dir.path().to_str().unwrap().replace('\\', "/");
 
-        let db = open_db(home.path(), &repo).await.expect("open db");
+        let db = open_db(home.path(), &repo, 0).await.expect("open db");
         let pipeline = IndexPipeline::new(repo.clone(), None);
 
         let stats = pipeline
@@ -2814,7 +2814,7 @@ mod end_to_end_persist {
         let _file_path = write_test_file(repo_dir.path());
         let repo = repo_dir.path().to_str().unwrap().replace('\\', "/");
 
-        let db = open_db(home.path(), &repo).await.expect("open db");
+        let db = open_db(home.path(), &repo, 0).await.expect("open db");
         let pipeline = IndexPipeline::new(repo.clone(), None);
         pipeline.run(&db, None, true, None, None, None, &[], None).await.expect("rebuild");
 
@@ -2846,7 +2846,7 @@ mod end_to_end_persist {
         let _file_path = write_test_file(repo_dir.path());
         let repo = repo_dir.path().to_str().unwrap().replace('\\', "/");
 
-        let db = open_db(home.path(), &repo).await.expect("open db");
+        let db = open_db(home.path(), &repo, 0).await.expect("open db");
         let pipeline = IndexPipeline::new(repo.clone(), None);
         pipeline.run(&db, None, true, None, None, None, &[], None).await.expect("rebuild");
 
@@ -2869,7 +2869,7 @@ mod resolution_tests {
 
         let home = TempDir::new().unwrap();
         let repo = "/test/symbol_repo";
-        let db = open_db(home.path(), repo).await.unwrap();
+        let db = open_db(home.path(), repo, 0).await.unwrap();
 
         // Insert 3 symbols with different names.
         for (name, file) in &[("foo", "/a.rs"), ("bar", "/b.rs"), ("baz", "/c.rs")] {
@@ -3010,7 +3010,7 @@ mod keyset_pagination_tests {
 
         let home = TempDir::new().unwrap();
         let repo = "/test/keyset_repo";
-        let db = open_db(home.path(), repo).await.unwrap();
+        let db = open_db(home.path(), repo, 0).await.unwrap();
 
         // Insert 15 raw_edge rows using the same native-bind path as Phase 1
         // (SurrealDB assigns the record ids — no app-managed seq).
@@ -3137,7 +3137,7 @@ mod keyset_pagination_tests {
 
         let home = TempDir::new().unwrap();
         let repo = "/test/restart_collision_repo";
-        let db = open_db(home.path(), repo).await.unwrap();
+        let db = open_db(home.path(), repo, 0).await.unwrap();
 
         #[derive(Serialize)]
         struct RawEdge {
@@ -3257,7 +3257,7 @@ mod per_edge_backfill_tests {
 
         let home = TempDir::new().unwrap();
         let repo = "/test/per_edge_backfill";
-        let db = open_db(home.path(), repo).await.unwrap();
+        let db = open_db(home.path(), repo, 0).await.unwrap();
 
         // Create symbols for the four endpoints.
         for (file, name) in &[
@@ -3475,7 +3475,7 @@ mod incremental_phase2_tests {
     async fn incremental_phase2_resolves_only_affected_files() {
         let home = TempDir::new().unwrap();
         let repo = "/test/incremental_phase2";
-        let db = open_db(home.path(), repo).await.unwrap();
+        let db = open_db(home.path(), repo, 0).await.unwrap();
 
         let pipeline = IndexPipeline::new(repo.to_string(), None);
 
@@ -3582,7 +3582,7 @@ mod incremental_phase2_tests {
     async fn new_file_wins_tiebreak_for_unchanged_caller() {
         let home = TempDir::new().unwrap();
         let repo = "/test/tiebreak_caller";
-        let db = open_db(home.path(), repo).await.unwrap();
+        let db = open_db(home.path(), repo, 0).await.unwrap();
 
         let pipeline = IndexPipeline::new(repo.to_string(), None);
 
@@ -3663,7 +3663,7 @@ mod incremental_phase2_tests {
     async fn removal_from_changed_file_caller_repoints() {
         let home = TempDir::new().unwrap();
         let repo = "/test/removal_repoints";
-        let db = open_db(home.path(), repo).await.unwrap();
+        let db = open_db(home.path(), repo, 0).await.unwrap();
 
         let pipeline = IndexPipeline::new(repo.to_string(), None);
 
@@ -3761,7 +3761,7 @@ mod incremental_phase2_tests {
     async fn direction1_fires_in_production_path() {
         let home = TempDir::new().unwrap();
         let repo = "/test/direction1_fires";
-        let db = open_db(home.path(), repo).await.unwrap();
+        let db = open_db(home.path(), repo, 0).await.unwrap();
 
         let pipeline = IndexPipeline::new(repo.to_string(), None);
 
@@ -4240,7 +4240,7 @@ mod perf_fix_tests {
 
         let file_a_path = file_a.to_str().unwrap().replace('\\', "/");
 
-        let db = open_db(home.path(), &repo).await.expect("open db");
+        let db = open_db(home.path(), &repo, 0).await.expect("open db");
 
         // First, do a full build so all four files are indexed.
         let pipeline = IndexPipeline::new(repo.clone(), None);
@@ -4354,7 +4354,7 @@ mod ram_path_fqn_tests {
     async fn ram_path_writes_full_fqn_in_call_names() {
         let home = TempDir::new().unwrap();
         let repo = "/test/ram_fqn";
-        let db = open_db(home.path(), repo).await.unwrap();
+        let db = open_db(home.path(), repo, 0).await.unwrap();
 
         // Caller: method `caller` inside class `Foo` in /a.cpp → FQN /a.cpp::Foo::caller
         // Callee: method `callee` inside class `Bar` in /b.cpp → FQN /b.cpp::Bar::callee
@@ -4412,7 +4412,7 @@ mod ram_path_fqn_tests {
     async fn ram_phase2_aborts_on_cancelled_token() {
         let home = TempDir::new().unwrap();
         let repo = "/test/ram_cancel";
-        let db = open_db(home.path(), repo).await.unwrap();
+        let db = open_db(home.path(), repo, 0).await.unwrap();
 
         insert_symbol_fqn(&db, "/a.cpp::Foo::caller", "/a.cpp", "caller").await;
         insert_symbol_fqn(&db, "/b.cpp::Bar::callee", "/b.cpp", "callee").await;
@@ -4459,7 +4459,7 @@ mod ram_path_fqn_tests {
     async fn db_phase2_aborts_on_cancelled_token() {
         let home = TempDir::new().unwrap();
         let repo = "/test/db_cancel";
-        let db = open_db(home.path(), repo).await.unwrap();
+        let db = open_db(home.path(), repo, 0).await.unwrap();
 
         insert_symbol_fqn(&db, "/a.cpp::Foo::caller", "/a.cpp", "caller").await;
         insert_symbol_fqn(&db, "/b.cpp::Bar::callee", "/b.cpp", "callee").await;

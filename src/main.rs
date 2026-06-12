@@ -264,6 +264,16 @@ async fn main() -> ExitCode {
     let boot_settings = settings_handle.read().await.clone();
     let repo_count = boot_settings.repos.len();
 
+    // Reclaim stale per-repo index generations BEFORE any RocksDB handle opens.
+    // Each repo/index delete bumps a repo's generation and moves the next index to
+    // a fresh directory; when the old directory's removal previously failed (Windows
+    // held the LOCK past the retry budget) it was left on disk. This is the one
+    // moment guaranteed lock-free — no handle in `repo_dbs`, no warmed shard — so a
+    // blocking removal here can't race a live datastore. Runs synchronously before
+    // IndexEngine::start so the first index never collides with a leftover. Skips
+    // (doesn't error) any directory it still can't remove; the next boot retries.
+    store::sweep_stale_generations(&data_dir, &boot_settings.repos, &boot_settings.repo_generations);
+
     // Start IndexEngine — spawns watchers for all configured repos.
     // It shares `repo_dbs` so indexer writes land in the handles the server reads.
     // It receives the shared settings handle so the consumer picks up post-boot changes.

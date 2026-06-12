@@ -685,7 +685,7 @@ pub async fn run_codebase_retrieval(
     }
 
     // 4. Open the repo DB and determine freshness from durable state.
-    let db = match store::get_or_open(repo_dbs, data_dir, repo).await {
+    let db = match store::get_or_open(repo_dbs, data_dir, repo, settings.repo_generation(repo)).await {
         Ok(d) => d,
         Err(e) => {
             return format!("Error: could not open index database: {e}");
@@ -1629,7 +1629,7 @@ pub async fn run_file_retrieval(
     }
 
     // Open DB for this repo.
-    let db = match store::get_or_open(repo_dbs, data_dir, repo).await {
+    let db = match store::get_or_open(repo_dbs, data_dir, repo, settings.repo_generation(repo)).await {
         Ok(d) => d,
         Err(e) => return format!("Error: could not open index database: {e}"),
     };

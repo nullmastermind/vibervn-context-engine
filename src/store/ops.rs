@@ -1061,7 +1061,7 @@ mod silent_rollback_proof {
     /// Open a fresh RocksDB-backed DB in a tempdir with the
     /// real schema applied, returning it ready for writes.
     async fn open_test_db(home: &TempDir, repo: &str) -> Surreal<surrealdb::engine::local::Db> {
-        open_db(home.path(), repo).await.expect("open test db")
+        open_db(home.path(), repo, 0).await.expect("open test db")
     }
 
     /// After the schema fix (`symbol_ref option<string>`), a quoted-string assignment
@@ -1250,7 +1250,7 @@ mod null_chunk_count_deserialization {
     #[tokio::test]
     async fn get_all_file_meta_decodes_real_chunk_count() {
         let home = TempDir::new().unwrap();
-        let db = open_db(home.path(), "/repo/real_chunk_count_test")
+        let db = open_db(home.path(), "/repo/real_chunk_count_test", 0)
             .await
             .expect("open_db");
 
@@ -1324,7 +1324,7 @@ mod call_graph_tests {
     #[tokio::test]
     async fn degree_seeded_hub_subgraph_returns_edges() {
         let home = TempDir::new().unwrap();
-        let db = open_db(home.path(), "/test/call_graph").await.unwrap();
+        let db = open_db(home.path(), "/test/call_graph", 0).await.unwrap();
 
         // hub <- c0..c9 (10 callers all calling the hub), plus c0 -> c1 (an
         // edge between two non-hub callers to test induced edges among hubs).
@@ -1366,7 +1366,7 @@ mod call_graph_tests {
     #[tokio::test]
     async fn empty_calls_yields_empty_graph() {
         let home = TempDir::new().unwrap();
-        let db = open_db(home.path(), "/test/call_graph_empty").await.unwrap();
+        let db = open_db(home.path(), "/test/call_graph_empty", 0).await.unwrap();
         let graph = call_graph(&db, 100, 50).await.expect("call_graph");
         assert!(graph.nodes.is_empty() && graph.edges.is_empty());
         assert!(!graph.truncated);
@@ -1380,7 +1380,7 @@ mod call_graph_tests {
     #[tokio::test]
     async fn duplicate_call_sites_collapse_to_one_edge() {
         let home = TempDir::new().unwrap();
-        let db = open_db(home.path(), "/test/call_graph_dup").await.unwrap();
+        let db = open_db(home.path(), "/test/call_graph_dup", 0).await.unwrap();
 
         insert_symbol(&db, "/a.cpp::caller", "/a.cpp", "caller").await;
         insert_symbol(&db, "/a.cpp::callee", "/a.cpp", "callee").await;
@@ -1424,7 +1424,7 @@ mod ignored_paths_tests {
     #[tokio::test]
     async fn round_trip_ignored_paths() {
         let home = TempDir::new().unwrap();
-        let db = open_db(home.path(), "/test/ignored").await.expect("open db");
+        let db = open_db(home.path(), "/test/ignored", 0).await.expect("open db");
 
         // Initially empty.
         let paths = get_ignored_paths(&db).await.unwrap();
