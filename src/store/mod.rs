@@ -168,13 +168,27 @@ pub fn maybe_spawn_migration(repo_dbs: RepoDbMap, repo: String, stored_version: 
     // next starts. A failed step aborts the chain via `?` (the version stamp is only
     // written on success, so the next open retries from the same point).
     //
-    // The handle is acquired from the shared map rather than held as an owned clone
-    // so that `close_repo_db` (which removes the entry) causes the migration to
-    // abort gracefully instead of keeping the RocksDB lock alive indefinitely.
-    tokio::spawn(async move {
+    // The task clones the `Surreal<Db>` handle once and holds that owned clone for
+    // the migration's entire duration. That clone pins the RocksDB exclusive LOCK,
+    // so removing the entry from `repo_dbs` does NOT release it — the task owns its
+    // own clone independent of the map. To delete the directory deterministically,
+    // `close_repo_db` calls `store::abort_migration`, which aborts + awaits this
+    // task so the clone is dropped before `remove_index_dir` runs. Safe because
+    // migrations are idempotent + crash-resumable: an aborted migration self-heals
+    // on the next open. We register the JoinHandle in `MIGRATION_TASKS` (keyed by
+    // repo) so `abort_migration` can find it; the task self-removes its entry on
+    // completion so the registry stays bounded by repo count.
+    let repo_for_cleanup = repo.clone();
+    let repo_key = repo.clone();
+    let handle = tokio::spawn(async move {
         let db = match repo_dbs.read().await.get(&repo) {
             Some(db) => db.clone(),
-            None => return, // repo was removed before migration started
+            None => {
+                // repo was removed before migration started — still self-remove the
+                // registry entry (the outer insert may have landed before us).
+                MIGRATION_TASKS.lock().unwrap().remove(&repo_for_cleanup);
+                return;
+            }
         };
         let result: Result<()> = async {
             if stored_version < 2 {
@@ -195,7 +209,14 @@ pub fn maybe_spawn_migration(repo_dbs: RepoDbMap, repo: String, stored_version: 
         if let Err(e) = result {
             warn!(error = %e, "chained DB migration failed");
         }
+        // Self-deregister so the registry doesn't leak. A completed-then-removed
+        // handle is harmless: a later `abort_migration` for this repo finds nothing
+        // and is a no-op. If the outer insert below races and re-adds this (already
+        // finished) handle, it only wastes one tiny HashMap slot, overwritten on the
+        // next migration for this repo — bounded by repo count.
+        MIGRATION_TASKS.lock().unwrap().remove(&repo_for_cleanup);
     });
+    MIGRATION_TASKS.lock().unwrap().insert(repo_key, handle);
 }
 
 /// Paged v1→v2 migration. Must be idempotent (safe to re-run).
@@ -648,6 +669,32 @@ fn open_gate(repo: &str) -> Arc<Mutex<()>> {
         .clone()
 }
 
+/// Tracks in-flight background migration tasks per repo so `close_repo_db` can
+/// abort + await them before directory removal. A running migration holds a
+/// live `Surreal<Db>` clone (see `maybe_spawn_migration`) that pins the RocksDB
+/// exclusive LOCK; without explicit cancellation the LOCK outlives `close_repo_db`
+/// and `remove_index_dir` fails. Bounded by repo count (one entry per repo with a
+/// live migration; entries self-remove on completion).
+static MIGRATION_TASKS: LazyLock<StdMutex<HashMap<String, tokio::task::JoinHandle<()>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// Abort and await any in-flight migration task for `repo`, dropping the
+/// migration's `Surreal<Db>` clone so the RocksDB LOCK can be released before
+/// directory removal. No-op if no migration is running (or it already finished
+/// and self-removed). Safe to call always: migrations are idempotent and
+/// crash-resumable, so an aborted migration self-heals on the next open.
+pub async fn abort_migration(repo: &str) {
+    let repo = normalize_repo_path(repo);
+    let handle = {
+        let mut tasks = MIGRATION_TASKS.lock().unwrap();
+        tasks.remove(&repo)
+    };
+    if let Some(handle) = handle {
+        handle.abort();
+        let _ = handle.await; // JoinError from abort/panic is expected; ignore.
+    }
+}
+
 /// Remove a repo's on-disk index directory, serialized against `open_db` via the
 /// same per-repo open gate `get_or_open` uses.
 ///
@@ -682,9 +729,10 @@ pub async fn remove_index_dir(data_dir: &Path, repo: &str) -> bool {
     }
 
     // Retry with backoff: the async datastore shutdown that still holds the LOCK
-    // typically completes within a second or two. Budget ~20s total, generous
-    // enough for a slow Windows handle release without wedging the request.
-    for attempt in 0..18u32 {
+    // typically completes within a second or two. Budget ~30s total to match
+    // `open_db`'s retry budget — a slow Windows+Defender handle drain that
+    // `open_db` tolerates must not make removal give up early.
+    for attempt in 0..20u32 {
         let p = path.clone();
         let removed = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&p).is_ok())
             .await
@@ -692,8 +740,9 @@ pub async fn remove_index_dir(data_dir: &Path, repo: &str) -> bool {
         if removed || !path.exists() {
             return true;
         }
-        // 100ms, 200ms, … capped at 2s — geometric-ish, summing to ~20s over 18 tries.
-        let backoff_ms = (100u64 * (attempt as u64 + 1)).min(2000);
+        // 200ms, 400ms, … capped at 2s — summing to ~30s over 20 tries, mirroring
+        // `open_db`'s backoff so removal waits out the same drain window.
+        let backoff_ms = (200u64 * (attempt as u64 + 1)).min(2000);
         tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
     }
 
@@ -740,8 +789,10 @@ pub async fn get_or_open(
     map.insert(repo.to_string(), db.clone());
     drop(map);
 
-    // Spawn migration AFTER the handle is in the map so the migration task can
-    // acquire it from the shared map (not hold an owned clone).
+    // Spawn migration AFTER the handle is in the map so the migration task's
+    // `repo_dbs.read().get(repo)` finds the freshly-inserted handle to clone. The
+    // task then holds that owned clone for its duration (see `maybe_spawn_migration`);
+    // `close_repo_db` cancels it via `store::abort_migration` before removal.
     maybe_spawn_migration(repo_dbs.clone(), repo.to_string(), stored_version);
 
     Ok(db)
@@ -1818,5 +1869,40 @@ mod schemaless_tests {
 
         let index = crate::vector::VectorIndex::load_from_db(&db).await.unwrap();
         assert_eq!(index.len(), 5, "all rows intact after resume");
+    }
+
+    /// `abort_migration` must take the registered handle out of `MIGRATION_TASKS`,
+    /// abort + await it, and leave the registry without the key. We register a
+    /// never-ending dummy task so we can prove the call returns promptly (it would
+    /// hang forever if it awaited the task without aborting) and the key is gone.
+    #[tokio::test]
+    async fn abort_migration_cancels_and_deregisters() {
+        let repo = "/test/abort_migration_cancels";
+        let key = normalize_repo_path(repo);
+        let handle = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+        MIGRATION_TASKS.lock().unwrap().insert(key.clone(), handle);
+        assert!(MIGRATION_TASKS.lock().unwrap().contains_key(&key));
+
+        // Would never return if it awaited the loop without aborting first.
+        abort_migration(repo).await;
+
+        assert!(
+            !MIGRATION_TASKS.lock().unwrap().contains_key(&key),
+            "registry entry must be removed after abort"
+        );
+    }
+
+    /// `abort_migration` on a repo that was never registered is a no-op: it must
+    /// return without panicking and without touching unrelated entries.
+    #[tokio::test]
+    async fn abort_migration_unknown_repo_is_noop() {
+        let repo = "/test/abort_migration_never_registered";
+        // Must not panic and must return promptly.
+        abort_migration(repo).await;
+        assert!(!MIGRATION_TASKS.lock().unwrap().contains_key(&normalize_repo_path(repo)));
     }
 }

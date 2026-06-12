@@ -413,9 +413,9 @@ impl IndexEngine {
         self.vector_index.write().await.remove_repo(&repo);
     }
 
-    /// Cancel indexing, wait for the pipeline to finish, then remove the cached
-    /// DB handle from `repo_dbs`. The per-repo serialisation lock guarantees that
-    /// no pipeline iteration is mid-flight when the handle is removed — the
+    /// Cancel indexing, abort any in-flight schema migration, then remove the
+    /// cached DB handle from `repo_dbs`. The per-repo serialisation lock guarantees
+    /// that no pipeline iteration is mid-flight when the handle is removed — the
     /// consumer holds this lock for the entire iteration (open → run → emit).
     ///
     /// Returns once the handle has been removed and no pipeline holds it.
@@ -423,6 +423,14 @@ impl IndexEngine {
         let repo = crate::store::normalize_repo_path(repo);
         // 1. Cancel any in-progress run so it exits early.
         self.cancel_index(&repo).await;
+
+        // Abort any in-flight schema migration for this repo. A running migration
+        // holds a live `Surreal<Db>` clone that pins the RocksDB exclusive LOCK
+        // (see store::maybe_spawn_migration). Aborting + awaiting it here drops that
+        // clone deterministically so `remove_index_dir` can delete the directory.
+        // Safe: migrations are idempotent + crash-resumable, so an aborted migration
+        // self-heals on the next open.
+        crate::store::abort_migration(&repo).await;
 
         // 2. Acquire the per-repo lock — blocks until the consumer's current
         //    iteration for this repo finishes (including dropping its `db` clone).
