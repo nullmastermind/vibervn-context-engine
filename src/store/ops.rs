@@ -572,7 +572,7 @@ pub async fn find_symbols_by_names(
 }
 
 /// Symbol with positional info, for tie-break sorting in two-phase edge resolution.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolWithPos {
     /// Full FQN from `meta::id(id)` — used as the RELATE endpoint in Phase 2.
     pub fqn: String,

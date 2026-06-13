@@ -625,7 +625,7 @@ impl IndexPipeline {
         // avoiding a DB write + read round-trip (~27s for notepad-ade).
         // If the repo exceeds MAX_RAM_EDGES, edges overflow to the DB and Phase 2
         // falls back to the keyset scan path (same as before).
-        let (chunk_vectors, mut stats, ram_raw_edges, ram_edges_overflowed) = self
+        let (chunk_vectors, mut stats, ram_raw_edges, ram_edges_overflowed, ram_symbols) = self
             .streaming_index(&all_files, db, progress, event_bus, key_hints, true, cancel_token)
             .await
             .context("full_rebuild: streaming_index")?;
@@ -636,8 +636,10 @@ impl IndexPipeline {
         }
         let phase2_start = Instant::now();
         let p2: Phase2Stats = if !ram_edges_overflowed && !ram_raw_edges.is_empty() {
-            // Fast path: all raw_edges are in RAM — skip DB scan entirely.
-            self.resolve_edges_from_ram(db, ram_raw_edges, cancel_token)
+            // Fast path: all raw_edges are in RAM — skip DB scan entirely. Pass the
+            // in-RAM symbol buffer so Phase 2 reuses it instead of reloading every
+            // symbol from the DB (None when the buffer overflowed → DB reload).
+            self.resolve_edges_from_ram(db, ram_raw_edges, ram_symbols, cancel_token)
                 .await
                 .context("full_rebuild: resolve_edges_from_ram")?
         } else {
@@ -722,7 +724,7 @@ impl IndexPipeline {
 
         // Stream parse → embed → write.
         // Raw edges go to DB (crash-safe incremental path).
-        let (chunk_vectors, _stage_stats, _ram_edges, _overflowed) = self
+        let (chunk_vectors, _stage_stats, _ram_edges, _overflowed, _ram_symbols) = self
             .streaming_index(&to_process, db, progress, event_bus, key_hints, false, cancel_token)
             .await
             .context("incremental_run: streaming_index")?;
@@ -777,13 +779,13 @@ impl IndexPipeline {
         key_hints: &[String],
         is_full_rebuild: bool,
         cancel_token: Option<&CancellationToken>,
-    ) -> Result<(Vec<(ChunkId, Vec<f32>)>, IndexPipelineStats, Vec<RawEdgeRecord>, bool)> {
+    ) -> Result<(Vec<(ChunkId, Vec<f32>)>, IndexPipelineStats, Vec<RawEdgeRecord>, bool, Option<HashMap<String, SymbolWithPos>>)> {
         if files.is_empty() {
             if let Some(ph) = progress {
                 ph.set_run_total(0).await;
                 ph.set_processed(0).await;
             }
-            return Ok((vec![], IndexPipelineStats::default(), vec![], false));
+            return Ok((vec![], IndexPipelineStats::default(), vec![], false, None));
         }
 
         let total_files = files.len() as u64;
@@ -1126,6 +1128,43 @@ impl IndexPipeline {
         };
         // Once the RAM buffer overflows, all subsequent raw_edges go to DB.
         let mut ram_edges_overflowed = false;
+
+        // Full-rebuild optimisation: buffer parsed symbols in RAM (up to
+        // MAX_RAM_SYMBOLS DISTINCT FQNs) alongside the Stage-3 DB symbol write.
+        // Phase 2 (resolve_edges_from_ram) reuses this buffer to build its
+        // name→candidates map instead of reloading every symbol from the DB
+        // (`load_all_symbols`), which costs ~4.7 min at kernel scale (2.6M rows).
+        //
+        // Keyed by FQN with last-write-wins, reproducing the `symbol` table's
+        // `INSERT ... ON DUPLICATE KEY UPDATE` dedup (one row per FQN) EXACTLY —
+        // a plain `insert(fqn, pos)` per parsed symbol in Stage-3 stream order is
+        // last-write-wins for free. This is an ADDITIVE in-RAM copy: symbols are
+        // STILL written to the DB below, so crash-safety (file_meta commit marker)
+        // and recovery are byte-identical to today; the buffer is ephemeral.
+        //
+        // Memory bound: distinct-FQN cap of 6M × ~150–250 bytes/entry (the three
+        // Strings fqn+file+name dominate, plus HashMap overhead) ≈ 0.9–1.5 GB at
+        // the cap. This coexists with the ≤1.6 GB ram_raw_edges buffer (8M cap),
+        // a combined bounded worst case consistent with the measured ~9 GB RSS at
+        // kernel scale. The kernel produces ~3.1M parsed symbols / ~2.6M distinct
+        // FQNs — within the cap with headroom. Repos exceeding the cap (Chromium-
+        // scale) drop the buffer and Phase 2 falls back to the DB reload — no OOM.
+        // NOT populated for incremental (returned as None; that path is untouched).
+        const MAX_RAM_SYMBOLS_DEFAULT: usize = 6_000_000;
+        // Test/ops seam: CONTEXT_ENGINE_MAX_RAM_SYMBOLS overrides the cap. This is a
+        // GENERAL knob (not repo-specific) — its purpose is to let the overflow
+        // fallback path be exercised against a real repo (e.g. force a low cap on a
+        // small repo so the buffer overflows and Phase 2 reloads from the DB),
+        // proving the fallback in production, not just in unit tests. Unset → default.
+        let max_ram_symbols: usize = std::env::var("CONTEXT_ENGINE_MAX_RAM_SYMBOLS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(MAX_RAM_SYMBOLS_DEFAULT);
+        let mut ram_symbols: HashMap<String, SymbolWithPos> = HashMap::new();
+        // Once distinct buffered symbols exceed the cap, the buffer is dropped and
+        // Phase 2 reloads symbols from the DB (mirrors ram_edges_overflowed).
+        let mut ram_symbols_overflowed = false;
         let mut cancelled = false;
 
         // ── Drop the two secondary symbol indexes before the bulk symbol write ──
@@ -1182,6 +1221,34 @@ impl IndexPipeline {
             // Accumulate symbols from multiple files, flush when batch fills.
             let t0 = Instant::now();
             total_symbols_count += ef.symbols.len() as u64;
+            // Full-rebuild optimisation: additively buffer each parsed symbol in
+            // RAM (keyed by FQN, last-write-wins) so Phase 2 can build its
+            // name→candidates map without reloading the symbol table. Populate in
+            // Stage-3 STREAM ORDER and BEFORE moving the symbols into the DB write
+            // batch, so the map's last-write-wins matches the DB's
+            // `INSERT ... ON DUPLICATE KEY UPDATE` per-FQN dedup byte-for-byte.
+            // Bounded by distinct-FQN count: on cap exceed, drop the buffer and set
+            // the overflow flag (mirrors ram_edges_overflowed) — Phase 2 then
+            // reloads from the DB. The DB write below is UNCHANGED either way.
+            if is_full_rebuild && !ram_symbols_overflowed {
+                for sym in &ef.symbols {
+                    let fqn = sym.qualified.fqn();
+                    // Inserting a NEW distinct FQN would push past the cap → drop.
+                    if !ram_symbols.contains_key(&fqn) && ram_symbols.len() >= max_ram_symbols {
+                        info!(
+                            buffered = ram_symbols.len(),
+                            "stage3: RAM symbol buffer full — dropping, Phase 2 will reload from DB"
+                        );
+                        ram_symbols = HashMap::new();
+                        ram_symbols.shrink_to_fit();
+                        ram_symbols_overflowed = true;
+                        break;
+                    }
+                    // Keyed insert via the shared helper — same code the invariance
+                    // test exercises, so the test proves the PRODUCTION dedup, not a copy.
+                    buffer_insert_symbol(&mut ram_symbols, sym);
+                }
+            }
             pending_symbol_batch.extend(ef.symbols);
             if pending_symbol_batch.len() >= SYM_BATCH_SIZE {
                 flush_symbol_batch_native(db, &std::mem::take(&mut pending_symbol_batch))
@@ -1454,6 +1521,7 @@ impl IndexPipeline {
         let chunk_cpu_ms = chunk_cpu_ns / 1_000_000;
         let filemeta_ms = filemeta_ns / 1_000_000;
         let ram_edges_in_buf = ram_raw_edges.len() as u64;
+        let ram_symbols_in_buf = ram_symbols.len() as u64;
 
         info!(
             stage3_total_ms,
@@ -1468,6 +1536,8 @@ impl IndexPipeline {
             embed_total_ms,
             ram_edges_buffered = ram_edges_in_buf,
             ram_edges_overflowed,
+            ram_symbols_buffered = ram_symbols_in_buf,
+            ram_symbols_overflowed,
             cache_hit_chunks = total_cache_hit_chunks,
             cache_miss_chunks = total_cache_miss_chunks,
             files = total_files,
@@ -1502,7 +1572,16 @@ impl IndexPipeline {
             ..Default::default()
         };
 
-        Ok((all_chunk_vectors, stats, ram_raw_edges, ram_edges_overflowed))
+        // Surface the in-RAM symbol buffer to Phase 2: Some when it holds the
+        // full deduped symbol set (within cap), None when overflowed/incremental.
+        // None → Phase 2 falls back to load_all_symbols (today's behavior).
+        let ram_symbols_out = if is_full_rebuild && !ram_symbols_overflowed {
+            Some(ram_symbols)
+        } else {
+            None
+        };
+
+        Ok((all_chunk_vectors, stats, ram_raw_edges, ram_edges_overflowed, ram_symbols_out))
     }
 
     // ─── Phase 2: batched edge resolution ────────────────────────────────
@@ -1947,6 +2026,7 @@ impl IndexPipeline {
         &self,
         db: &Surreal<Db>,
         raw_edges: Vec<RawEdgeRecord>,
+        ram_symbols: Option<HashMap<String, SymbolWithPos>>,
         cancel_token: Option<&CancellationToken>,
     ) -> Result<Phase2Stats> {
         let mut p2 = Phase2Stats::default();
@@ -1960,12 +2040,29 @@ impl IndexPipeline {
             return Ok(p2);
         }
 
-        // Load ALL symbols into memory at once — same as the DB-scan Phase 2 path.
+        // Source the symbol set: when the Stage-3 in-RAM symbol buffer is present
+        // (within cap), consume it directly and SKIP the redundant full
+        // `symbol`-table reload (`load_all_symbols`, ~4.7 min at kernel scale).
+        // The buffer is already deduped to one entry per FQN with last-write-wins,
+        // reproducing `load_all_symbols`' result EXACTLY. When absent (overflow),
+        // fall back to the DB reload — today's behavior, output-identical.
         let t_sym_load = Instant::now();
-        let all_symbols = load_all_symbols(db).await.context("phase2(ram): load all symbols")?;
-        let sym_load_ms = t_sym_load.elapsed().as_millis();
-        p2.sym_load_ms = sym_load_ms as u64;
-        info!(repo = %self.repo, symbol_count = all_symbols.len(), sym_load_ms, "phase2(ram): loaded all symbols");
+        let all_symbols: Vec<SymbolWithPos> = match ram_symbols {
+            Some(buf) => {
+                let n = buf.len();
+                let v: Vec<SymbolWithPos> = buf.into_values().collect();
+                // sym_load is ~0 here — the symbols never left RAM.
+                p2.sym_load_ms = t_sym_load.elapsed().as_millis() as u64;
+                info!(repo = %self.repo, symbol_count = n, sym_load_ms = p2.sym_load_ms, "phase2(ram): reused in-RAM symbol buffer (no DB reload)");
+                v
+            }
+            None => {
+                let v = load_all_symbols(db).await.context("phase2(ram): load all symbols")?;
+                p2.sym_load_ms = t_sym_load.elapsed().as_millis() as u64;
+                info!(repo = %self.repo, symbol_count = v.len(), sym_load_ms = p2.sym_load_ms, "phase2(ram): loaded all symbols from DB (buffer overflowed)");
+                v
+            }
+        };
 
         // Build name → Vec<SymbolWithPos> map for O(1) resolution.
         let t_bucket = Instant::now();
@@ -2259,6 +2356,29 @@ impl IndexPipeline {
 }
 
 // ─── Phase 2: in-memory symbol map helpers ───────────────────────────────
+
+/// Insert one parsed symbol into the Stage-3 in-RAM symbol buffer, keyed by FQN
+/// with last-write-wins on collision.
+///
+/// This is the SINGLE source of truth for how the buffer is populated: both the
+/// Stage-3 streaming loop and the invariance unit tests call it, so the tests
+/// exercise the PRODUCTION dedup behavior rather than a hand-copied duplicate.
+/// Last-write-wins (a plain `insert` that overwrites) reproduces the `symbol`
+/// table's `INSERT ... ON DUPLICATE KEY UPDATE` per-FQN dedup byte-for-byte, so
+/// the resulting symbol set equals `load_all_symbols`' result for the same stream.
+fn buffer_insert_symbol(buf: &mut HashMap<String, SymbolWithPos>, sym: &Symbol) {
+    let fqn = sym.qualified.fqn();
+    buf.insert(
+        fqn.clone(),
+        SymbolWithPos {
+            fqn,
+            file: sym.qualified.file.clone(),
+            name: sym.qualified.name.clone(),
+            line_start: sym.line_start as i64,
+            line_end: sym.line_end as i64,
+        },
+    );
+}
 
 /// Load ALL symbols from the DB into memory at once.
 /// Memory: 27K symbols × ~120 bytes = ~3.3 MB — bounded for repo-scale indexes.
@@ -5049,7 +5169,7 @@ mod ram_path_fqn_tests {
 
         let pipeline = IndexPipeline::new(repo.to_string(), None);
         pipeline
-            .resolve_edges_from_ram(&db, raw_edges, None)
+            .resolve_edges_from_ram(&db, raw_edges, None, None)
             .await
             .expect("resolve_edges_from_ram");
 
@@ -5107,7 +5227,7 @@ mod ram_path_fqn_tests {
 
         let pipeline = IndexPipeline::new(repo.to_string(), None);
         let err = pipeline
-            .resolve_edges_from_ram(&db, raw_edges, Some(&token))
+            .resolve_edges_from_ram(&db, raw_edges, None, Some(&token))
             .await
             .expect_err("pre-cancelled token must abort Phase 2");
         assert!(
@@ -5169,6 +5289,301 @@ mod ram_path_fqn_tests {
             marker.is_none(),
             "edges_resolved must stay unset after a cancelled Phase 2"
         );
+    }
+}
+
+// ─── In-RAM symbol-buffer Phase-2 invariance (optimize-index-pipeline-walltime) ─
+//
+// These pin the contract that the Stage-3 in-RAM symbol buffer reproduces
+// `load_all_symbols`' result EXACTLY, so Phase 2 resolving from the buffer
+// (Some) yields byte-identical `calls` rows to resolving from the DB reload
+// (None). The buffer is `HashMap<String /*fqn*/, SymbolWithPos>` with
+// last-write-wins on FQN collision — matching the symbol table's
+// `INSERT ... ON DUPLICATE KEY UPDATE` per-FQN dedup.
+#[cfg(test)]
+mod ram_symbol_buffer_invariance_tests {
+    use super::*;
+    use crate::parsing::symbols::{QualifiedSymbol, SymbolKind};
+    use crate::store::open_db;
+    use serde::Deserialize;
+    use tempfile::TempDir;
+
+    #[derive(Deserialize, Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
+    struct CallRow {
+        line: i64,
+        in_file: Option<String>,
+        out_file: Option<String>,
+        in_name: Option<String>,
+        out_name: Option<String>,
+    }
+
+    /// Read all `calls` rows, sorted deterministically, for set comparison.
+    async fn dump_calls(db: &Surreal<Db>) -> Vec<CallRow> {
+        let mut rows: Vec<CallRow> = db
+            .query("SELECT line, in_file, out_file, in_name, out_name FROM calls")
+            .await
+            .unwrap()
+            .take(0)
+            .unwrap();
+        rows.sort();
+        rows
+    }
+
+    fn mk_symbol(file: &str, name: &str, ls: u32, le: u32) -> Symbol {
+        Symbol {
+            qualified: QualifiedSymbol {
+                file: file.to_string(),
+                scope_path: vec![],
+                name: name.to_string(),
+            },
+            kind: SymbolKind::Function,
+            line_start: ls,
+            line_end: le,
+            signature: None,
+            parent_fqn: None,
+        }
+    }
+
+    /// Build the in-RAM buffer EXACTLY as `streaming_index` does, by calling the
+    /// SAME production helper (`buffer_insert_symbol`) in stream order →
+    /// last-write-wins on FQN collision. Not a copy of the logic — the real thing.
+    fn build_buffer(symbols: &[Symbol]) -> HashMap<String, SymbolWithPos> {
+        let mut buf: HashMap<String, SymbolWithPos> = HashMap::new();
+        for sym in symbols {
+            buffer_insert_symbol(&mut buf, sym);
+        }
+        buf
+    }
+
+    /// Build the name→sorted-candidates bucket map the SAME way
+    /// `resolve_edges_from_ram` does, so two symbol *sources* can be compared at
+    /// the resolution-input layer (not just the `calls` output layer).
+    fn build_name_bucket(symbols: Vec<SymbolWithPos>) -> std::collections::BTreeMap<String, Vec<SymbolWithPos>> {
+        let mut name_bucket: HashMap<String, Vec<SymbolWithPos>> = HashMap::new();
+        for s in symbols {
+            name_bucket.entry(s.name.clone()).or_default().push(s);
+        }
+        for bucket in name_bucket.values_mut() {
+            bucket.sort_unstable_by(|a, b| {
+                a.file
+                    .cmp(&b.file)
+                    .then(a.line_start.cmp(&b.line_start))
+                    .then(a.line_end.cmp(&b.line_end))
+            });
+        }
+        // Collect into a BTreeMap so equality comparison is order-independent at
+        // the key level while each bucket's candidate order is already fixed.
+        name_bucket.into_iter().collect()
+    }
+
+    /// 4.1 — Duplicate-FQN fixture: resolving via the in-RAM symbol buffer (Some)
+    /// produces byte-identical `calls` rows to resolving via the DB reload (None).
+    /// A function declared then defined in the SAME file yields two parsed symbols
+    /// with the SAME FQN and different positions — the .h/.cpp last-write-wins case.
+    #[tokio::test]
+    async fn ram_buffer_matches_db_reload_with_duplicate_fqn() {
+        // ── Fixture symbols (shared by both runs) ──────────────────────────
+        // Callee `compute` appears TWICE with the same FQN (/lib.cpp::compute):
+        // a declaration (lines 10-12) overwritten by a definition (lines 40-55).
+        // Last-write-wins must collapse it to the line-40 row in BOTH paths.
+        // A second distinct callee FQN with the same LEAF name `compute`
+        // (/util.cpp::compute) shares the name-bucket, so bucket ordering /
+        // tie-breaking is exercised. Two callers each call `compute`.
+        let caller_a = mk_symbol("/a.cpp", "caller_a", 1, 5);
+        let caller_b = mk_symbol("/util.cpp", "caller_b", 1, 5);
+        let compute_decl = mk_symbol("/lib.cpp", "compute", 10, 12);
+        let compute_def = mk_symbol("/lib.cpp", "compute", 40, 55);
+        let compute_util = mk_symbol("/util.cpp", "compute", 200, 230);
+        // Stream order matters for last-write-wins: decl BEFORE def.
+        let symbols = vec![
+            caller_a.clone(),
+            compute_decl,
+            compute_def,
+            compute_util,
+            caller_b.clone(),
+        ];
+
+        // Raw edges: caller_a (in /a.cpp) calls `compute`; caller_b (in /util.cpp)
+        // calls `compute`. Same-file preference (Level 3) should make caller_b
+        // resolve to /util.cpp::compute and caller_a to /lib.cpp::compute.
+        let raw_edges = vec![
+            RawEdgeRecord {
+                from_file: "/a.cpp".to_string(),
+                from_name: "caller_a".to_string(),
+                from_fqn: "/a.cpp::caller_a".to_string(),
+                to_name: "compute".to_string(),
+                kind: "calls".to_string(),
+                line: 3,
+                import_path: None,
+            },
+            RawEdgeRecord {
+                from_file: "/util.cpp".to_string(),
+                from_name: "caller_b".to_string(),
+                from_fqn: "/util.cpp::caller_b".to_string(),
+                to_name: "compute".to_string(),
+                kind: "calls".to_string(),
+                line: 4,
+                import_path: None,
+            },
+        ];
+
+        // ── Run 1: DB-reload path (None) — the baseline (today's behavior) ──
+        let home_db = TempDir::new().unwrap();
+        let repo = "/test/inv_db";
+        let db1 = open_db(home_db.path(), repo, 0).await.unwrap();
+        flush_symbol_batch_native(&db1, &symbols).await.unwrap();
+        let pipeline = IndexPipeline::new(repo.to_string(), None);
+        pipeline
+            .resolve_edges_from_ram(&db1, raw_edges.clone(), None, None)
+            .await
+            .expect("resolve via DB reload");
+        let calls_db = dump_calls(&db1).await;
+
+        // ── Run 2: in-RAM buffer path (Some) — the optimized path ───────────
+        let home_buf = TempDir::new().unwrap();
+        let db2 = open_db(home_buf.path(), repo, 0).await.unwrap();
+        // The symbols are STILL written to the DB in Stage 3 (additive buffer);
+        // but Phase 2 must NOT need them — pass the buffer and an EMPTY DB symbol
+        // table to prove no reload happens.
+        let buffer = build_buffer(&symbols);
+        pipeline
+            .resolve_edges_from_ram(&db2, raw_edges.clone(), Some(buffer), None)
+            .await
+            .expect("resolve via in-RAM buffer");
+        let calls_buf = dump_calls(&db2).await;
+
+        assert_eq!(
+            calls_db, calls_buf,
+            "in-RAM buffer resolution must be byte-identical to DB reload\nDB:  {calls_db:?}\nBUF: {calls_buf:?}"
+        );
+        assert_eq!(calls_db.len(), 2, "exactly two resolved edges expected");
+        // Same-file preference: caller_b → /util.cpp::compute (out_file /util.cpp).
+        let b_edge = calls_buf
+            .iter()
+            .find(|r| r.in_name.as_deref() == Some("/util.cpp::caller_b"))
+            .expect("caller_b edge present");
+        assert_eq!(b_edge.out_name.as_deref(), Some("/util.cpp::compute"));
+        // The /lib.cpp::compute endpoint resolves to a single FQN (dedup worked) —
+        // never two phantom rows from the duplicate decl/def.
+        let lib_edges = calls_buf
+            .iter()
+            .filter(|r| r.out_name.as_deref() == Some("/lib.cpp::compute"))
+            .count();
+        assert_eq!(lib_edges, 1, "duplicate-FQN callee must not create phantom edges");
+    }
+
+    /// 4.2 — Overflow fallback: when the buffer is `None` (overflowed or
+    /// incremental), Phase 2 reloads from the DB and produces identical edges to
+    /// the buffer path. Same fixture as 4.1, asserting both sources agree.
+    #[tokio::test]
+    async fn overflow_fallback_matches_buffer_path() {
+        let symbols = vec![
+            mk_symbol("/a.cpp", "caller", 1, 5),
+            mk_symbol("/lib.cpp", "target", 10, 12),
+            mk_symbol("/lib.cpp", "target", 40, 55), // dup FQN, last wins
+        ];
+        let raw_edges = vec![RawEdgeRecord {
+            from_file: "/a.cpp".to_string(),
+            from_name: "caller".to_string(),
+            from_fqn: "/a.cpp::caller".to_string(),
+            to_name: "target".to_string(),
+            kind: "calls".to_string(),
+            line: 3,
+            import_path: None,
+        }];
+        let pipeline = IndexPipeline::new("/test/overflow".to_string(), None);
+
+        // Buffer path (Some).
+        let home_buf = TempDir::new().unwrap();
+        let db_buf = open_db(home_buf.path(), "/test/overflow", 0).await.unwrap();
+        let buffer = build_buffer(&symbols);
+        pipeline
+            .resolve_edges_from_ram(&db_buf, raw_edges.clone(), Some(buffer), None)
+            .await
+            .unwrap();
+        let calls_buf = dump_calls(&db_buf).await;
+
+        // Overflow path (None) — symbols must be in the DB for the reload.
+        let home_of = TempDir::new().unwrap();
+        let db_of = open_db(home_of.path(), "/test/overflow", 0).await.unwrap();
+        flush_symbol_batch_native(&db_of, &symbols).await.unwrap();
+        pipeline
+            .resolve_edges_from_ram(&db_of, raw_edges.clone(), None, None)
+            .await
+            .unwrap();
+        let calls_of = dump_calls(&db_of).await;
+
+        assert_eq!(
+            calls_buf, calls_of,
+            "overflow DB-reload must produce identical edges to the buffer path"
+        );
+        assert_eq!(calls_buf.len(), 1, "one resolved edge expected");
+        assert_eq!(calls_buf[0].out_name.as_deref(), Some("/lib.cpp::target"));
+    }
+
+    /// The buffer construction reproduces last-write-wins on FQN collision: a
+    /// duplicate FQN collapses to a single entry holding the LAST write's position.
+    #[test]
+    fn buffer_dedups_fqn_last_write_wins() {
+        let symbols = vec![
+            mk_symbol("/lib.cpp", "compute", 10, 12), // decl
+            mk_symbol("/lib.cpp", "compute", 40, 55), // def — wins
+        ];
+        let buf = build_buffer(&symbols);
+        assert_eq!(buf.len(), 1, "duplicate FQN must collapse to one entry");
+        let entry = buf.get("/lib.cpp::compute").expect("compute present");
+        assert_eq!(entry.line_start, 40, "last write must win");
+        assert_eq!(entry.line_end, 55);
+    }
+
+    /// Symbol-MAP-level invariance (closes the gap the `calls`-level tests can't
+    /// observe): the name→sorted-candidates bucket built from the in-RAM buffer
+    /// MUST equal the one built from `load_all_symbols`, given the SAME symbol
+    /// stream. The `calls` output stores only the resolved callee FQN+file, so a
+    /// buggy buffer that kept duplicate FQNs (a Vec instead of last-write-wins map)
+    /// could still emit identical `calls` rows — but it would put a PHANTOM extra
+    /// candidate into the name-bucket here. This test compares the resolution INPUT
+    /// (the bucket map) directly, so such a regression fails loudly.
+    #[tokio::test]
+    async fn name_bucket_from_buffer_equals_name_bucket_from_db() {
+        // A duplicate FQN (decl+def) AND two distinct FQNs sharing a leaf name —
+        // exercises both dedup and intra-bucket sort.
+        let symbols = vec![
+            mk_symbol("/lib.cpp", "compute", 10, 12), // decl — overwritten
+            mk_symbol("/lib.cpp", "compute", 40, 55), // def — wins
+            mk_symbol("/util.cpp", "compute", 200, 230), // distinct FQN, same leaf
+            mk_symbol("/a.cpp", "caller", 1, 5),
+        ];
+
+        // DB source: write symbols, reload via load_all_symbols (the baseline).
+        let home = TempDir::new().unwrap();
+        let db = open_db(home.path(), "/test/bucket_inv", 0).await.unwrap();
+        flush_symbol_batch_native(&db, &symbols).await.unwrap();
+        let db_symbols = load_all_symbols(&db).await.unwrap();
+        let bucket_db = build_name_bucket(db_symbols);
+
+        // Buffer source: same stream through the production helper.
+        let buf_symbols: Vec<SymbolWithPos> = build_buffer(&symbols).into_values().collect();
+        let bucket_buf = build_name_bucket(buf_symbols);
+
+        assert_eq!(
+            bucket_db, bucket_buf,
+            "name→candidates bucket from the in-RAM buffer must be byte-identical to the DB-reload bucket\nDB:  {bucket_db:?}\nBUF: {bucket_buf:?}"
+        );
+        // The `compute` bucket must hold exactly TWO distinct-FQN candidates
+        // (/lib.cpp::compute deduped to one, + /util.cpp::compute), never three.
+        let compute_bucket = bucket_buf.get("compute").expect("compute bucket");
+        assert_eq!(
+            compute_bucket.len(),
+            2,
+            "duplicate decl/def must dedup to ONE candidate (+ the distinct util.cpp one) = 2, not 3"
+        );
+        // And the surviving /lib.cpp::compute candidate is the LAST write (line 40).
+        let lib = compute_bucket
+            .iter()
+            .find(|s| s.file == "/lib.cpp")
+            .expect("lib.cpp::compute candidate");
+        assert_eq!(lib.line_start, 40, "last-write-wins position must survive into the bucket");
     }
 }
 
