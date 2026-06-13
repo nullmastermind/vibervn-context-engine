@@ -186,6 +186,16 @@ pub struct IndexPipelineStats {
     pub stage3_chunk_idx_drop_ms: u64,
     /// Time spent rebuilding idx_chunk_file after bulk chunk write (full rebuild only, ms).
     pub stage3_chunk_idx_rebuild_ms: u64,
+    /// Time spent dropping idx_symbol_file + idx_symbol_name before the bulk symbol
+    /// write (full rebuild only, ms). Symbols were the only high-volume bulk-write
+    /// table still going through live secondary indexes; on the kernel that cost
+    /// ~20.6 min (92% of Stage 3). Mirrors the chunk/calls drop→bulk→rebuild trick.
+    /// ≈0 in practice (REMOVE INDEX is a metadata op). 0 on the incremental path.
+    pub stage3_sym_idx_drop_ms: u64,
+    /// Time spent rebuilding idx_symbol_file + idx_symbol_name after all symbol rows
+    /// are durable (full rebuild only, ms). One-shot bulk build that replaces ~6.2M
+    /// per-row incremental index updates. 0 on the incremental path.
+    pub stage3_sym_idx_rebuild_ms: u64,
 }
 
 /// Key used to track whether Phase 2 (raw edge resolution) has completed.
@@ -380,6 +390,8 @@ impl IndexPipeline {
                 stage3_chunk_cpu_ms = stage_stats.stage3_chunk_cpu_ms,
                 stage3_chunk_idx_drop_ms = stage_stats.stage3_chunk_idx_drop_ms,
                 stage3_chunk_idx_rebuild_ms = stage_stats.stage3_chunk_idx_rebuild_ms,
+                stage3_sym_idx_drop_ms = stage_stats.stage3_sym_idx_drop_ms,
+                stage3_sym_idx_rebuild_ms = stage_stats.stage3_sym_idx_rebuild_ms,
                 stage3_filemeta_ms = stage_stats.stage3_filemeta_ms,
                 phase2_ms = stage_stats.phase2_ms,
                 embed_total_ms = stage_stats.embed_total_ms,
@@ -410,6 +422,8 @@ impl IndexPipeline {
                 stage3_chunk_cpu_ms: stage_stats.stage3_chunk_cpu_ms,
                 stage3_chunk_idx_drop_ms: stage_stats.stage3_chunk_idx_drop_ms,
                 stage3_chunk_idx_rebuild_ms: stage_stats.stage3_chunk_idx_rebuild_ms,
+                stage3_sym_idx_drop_ms: stage_stats.stage3_sym_idx_drop_ms,
+                stage3_sym_idx_rebuild_ms: stage_stats.stage3_sym_idx_rebuild_ms,
             });
         }
 
@@ -1008,6 +1022,12 @@ impl IndexPipeline {
         let mut total_chunks_count: u64 = 0;
         let mut total_symbols_count: u64 = 0;
         let mut total_raw_edges_count: u64 = 0;
+        // Secondary-symbol-index drop/rebuild timings (full rebuild only; 0 otherwise).
+        // See the drop block before the writer loop and the rebuild block after the
+        // tail flush for the why. Kept separate from `sym_ns` so `sym_ms` keeps
+        // measuring pure symbol-flush time and stays comparable before/after.
+        let mut sym_idx_drop_ms: u64 = 0;
+        let mut sym_idx_rebuild_ms: u64 = 0;
         let stage3_start = Instant::now();
         // Embed/cache-read stage accumulators (from EmbeddedFile fields set in Stage 2).
         let mut embed_total_ms: u64 = 0;
@@ -1051,6 +1071,37 @@ impl IndexPipeline {
         // Once the RAM buffer overflows, all subsequent raw_edges go to DB.
         let mut ram_edges_overflowed = false;
         let mut cancelled = false;
+
+        // ── Drop the two secondary symbol indexes before the bulk symbol write ──
+        // (full rebuild only). The `symbol` table was the last high-volume bulk-write
+        // table still writing through LIVE secondary indexes: `idx_symbol_file` +
+        // `idx_symbol_name` were maintained per row, costing ~6.2M incremental index
+        // updates on the kernel (3.1M symbols × 2 indexes) — measured at sym_ms≈20.6 min,
+        // 92% of Stage 3. This is the same drop→bulk-write→rebuild trick already used for
+        // the `calls` table (see resolve_edges_phase2 ~pipeline.rs:1598) — we just apply it
+        // to symbols. The bulk INSERT and its ON DUPLICATE KEY UPDATE (dedup on PRIMARY
+        // KEY = FQN, NOT on these secondary indexes) are unchanged, so the exact same rows
+        // land in the table; only index-maintenance timing moves.
+        //
+        // Gated strictly on `is_full_rebuild` (D5): these are GLOBAL indexes. On the
+        // incremental path we touch O(changed) symbols, so dropping a global index and
+        // rebuilding over all 3.1M rows would turn O(changed) into O(repo) — catastrophic.
+        // Incremental keeps writing through the live indexes (cheap at small N).
+        //
+        // Crash-safety (D4): a crash between this drop and the post-tail-flush rebuild
+        // leaves symbol ROWS intact but these two secondary indexes missing. `SCHEMA_DDL`
+        // (store/schema.rs:39-40) runs `DEFINE INDEX IF NOT EXISTS idx_symbol_file/_name`
+        // on every `open_db`, which re-creates AND rebuilds them over the existing rows on
+        // the next startup. No data loss; file_meta crash-safety ordering is untouched.
+        if is_full_rebuild {
+            let t_sym_idx_drop = Instant::now();
+            db.query(
+                "REMOVE INDEX IF EXISTS idx_symbol_file ON symbol; \
+                 REMOVE INDEX IF EXISTS idx_symbol_name ON symbol;"
+            ).await.context("streaming_index: drop symbol indexes")?;
+            sym_idx_drop_ms = t_sym_idx_drop.elapsed().as_millis() as u64;
+            info!(repo = %self.repo, sym_idx_drop_ms, "stage3: dropped symbol indexes (full rebuild)");
+        }
 
         while let Some(ef) = embed_rx.recv().await {
             // Check cancellation before processing each file.
@@ -1290,6 +1341,29 @@ impl IndexPipeline {
                 .context("streaming_index: tail symbol batch")?;
             sym_ns += t0.elapsed().as_nanos() as u64;
         }
+
+        // ── Rebuild the two secondary symbol indexes (full rebuild only) ──
+        // The symbol tail flush above is the LAST symbol write, so at this point ALL
+        // symbol rows are durable. Rebuild `idx_symbol_file` + `idx_symbol_name`
+        // synchronously (no CONCURRENTLY) so the index is fully available before this
+        // function returns — i.e. before Phase 2 edge resolution, which reads symbols
+        // by name (load_all_symbols / find_symbols_by_names_with_pos), and before any
+        // query (query-time name lookup uses idx_symbol_name — store/ops.rs ~542). This
+        // is the one-shot bulk build that replaces the ~6.2M per-row index updates we
+        // skipped by dropping the indexes before the write; mirrors the calls rebuild
+        // (resolve_edges_phase2 ~pipeline.rs:1747). It is INDEPENDENT of Phase 2's own
+        // calls-index drop/rebuild (different table, different indexes) — the two must
+        // not be conflated. Gated on `is_full_rebuild` to pair with the drop above (D5).
+        if is_full_rebuild {
+            let t_sym_idx_rebuild = Instant::now();
+            db.query(
+                "DEFINE INDEX idx_symbol_file ON symbol FIELDS file; \
+                 DEFINE INDEX idx_symbol_name ON symbol FIELDS name;"
+            ).await.context("streaming_index: rebuild symbol indexes")?;
+            sym_idx_rebuild_ms = t_sym_idx_rebuild.elapsed().as_millis() as u64;
+            info!(repo = %self.repo, sym_idx_rebuild_ms, "stage3: rebuilt symbol indexes synchronously (full rebuild)");
+        }
+
         if !pending_chunk_batch.is_empty() {
             let t2 = Instant::now();
             let t_db = Instant::now();
@@ -1328,6 +1402,8 @@ impl IndexPipeline {
         info!(
             stage3_total_ms,
             sym_ms,
+            sym_idx_drop_ms,
+            sym_idx_rebuild_ms,
             rawedge_ms,
             chunk_ms,
             chunk_db_ms,
@@ -1364,6 +1440,8 @@ impl IndexPipeline {
             stage3_chunk_cpu_ms: chunk_cpu_ms,
             stage3_chunk_idx_drop_ms: 0,
             stage3_chunk_idx_rebuild_ms: 0,
+            stage3_sym_idx_drop_ms: sym_idx_drop_ms,
+            stage3_sym_idx_rebuild_ms: sym_idx_rebuild_ms,
         };
 
         Ok((all_chunk_vectors, stats, ram_raw_edges, ram_edges_overflowed))
@@ -2987,6 +3065,362 @@ mod end_to_end_persist {
 
         let marker = get_meta(&db, EDGES_RESOLVED_KEY).await.unwrap();
         assert!(marker.is_some(), "edges_resolved marker must be set after full_rebuild");
+    }
+}
+
+// ─── Symbol-index drop/rebuild (optimize-symbol-write-throughput) ─────────
+//
+// These pin the full-rebuild-only drop→bulk-write→rebuild of the two secondary
+// symbol indexes (idx_symbol_file, idx_symbol_name). The optimization moves
+// index maintenance OFF the per-row write path; correctness rests on: dedup is
+// on the PRIMARY KEY (FQN) not the secondary indexes (D3), the indexes are
+// present and usable after a full build (D2), and the incremental path NEVER
+// touches the global indexes (D5).
+#[cfg(test)]
+mod symbol_index_drop_rebuild {
+    use super::*;
+    use crate::parsing::symbols::{QualifiedSymbol, SymbolKind};
+    use crate::store::open_db;
+    use crate::store::ops::{count_symbols, find_symbols_by_names_with_pos};
+    use tempfile::TempDir;
+
+    /// Read the set of defined index names on the `symbol` table via INFO FOR TABLE.
+    /// SurrealDB returns `{ "indexes": { "idx_symbol_name": "DEFINE INDEX ...", ... } }`.
+    async fn symbol_index_names(db: &Surreal<Db>) -> Vec<String> {
+        let info: Option<serde_json::Value> = db
+            .query("INFO FOR TABLE symbol")
+            .await
+            .expect("INFO FOR TABLE symbol")
+            .take(0)
+            .ok()
+            .flatten();
+        info.and_then(|v| v.get("indexes").and_then(|i| i.as_object()).cloned())
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// 5.1 — A full rebuild via the drop/rebuild path produces the SAME symbol set
+    /// as writing through live indexes would, including the C++ same-FQN dedup case.
+    /// Dropping the two secondary indexes cannot change row contents because dedup
+    /// is on the PRIMARY KEY (record id = FQN), proving D3.
+    #[tokio::test]
+    async fn full_rebuild_symbol_set_and_cpp_dedup_unchanged() {
+        let home = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+
+        // A C++ declaration in a .h and its definition in a .cpp share one FQN
+        // (file is part of the FQN only via the per-file path — here we force the
+        // SAME FQN by giving both the declaration of `compute` the same qualified
+        // name through identical file-relative scoping). To exercise the documented
+        // .h/.cpp last-write-wins dedup deterministically, we feed the symbol batch
+        // a duplicate FQN directly through the same flush path the pipeline uses.
+        let repo = repo_dir.path().to_str().unwrap().replace('\\', "/");
+        let db = open_db(home.path(), &repo, 0).await.expect("open db");
+
+        // Drop the indexes (as a full rebuild would) then bulk-write a batch that
+        // contains a duplicate FQN — the second row must collapse onto the first
+        // via ON DUPLICATE KEY UPDATE, regardless of secondary-index presence.
+        db.query(
+            "REMOVE INDEX IF EXISTS idx_symbol_file ON symbol; \
+             REMOVE INDEX IF EXISTS idx_symbol_name ON symbol;"
+        ).await.expect("drop symbol indexes");
+
+        let header = format!("{repo}/widget.h");
+        let mk = |file: &str, name: &str, ls: u32, le: u32, sig: &str| Symbol {
+            qualified: QualifiedSymbol {
+                file: file.to_string(),
+                scope_path: vec![],
+                name: name.to_string(),
+            },
+            kind: SymbolKind::Function,
+            line_start: ls,
+            line_end: le,
+            signature: Some(sig.to_string()),
+            parent_fqn: None,
+        };
+        // Two symbols with the SAME FQN (same file + name) — the .h/.cpp dup case.
+        // Last write (line 42, sig "definition") must win.
+        let batch = vec![
+            mk(&header, "compute", 10, 12, "declaration"),
+            mk(&header, "compute", 40, 42, "definition"),
+            mk(&format!("{repo}/other.cpp"), "render", 1, 5, "void render()"),
+        ];
+        flush_symbol_batch_native(&db, &batch).await.expect("flush symbols");
+
+        // Rebuild the indexes (as the post-tail-flush step does).
+        db.query(
+            "DEFINE INDEX idx_symbol_file ON symbol FIELDS file; \
+             DEFINE INDEX idx_symbol_name ON symbol FIELDS name;"
+        ).await.expect("rebuild symbol indexes");
+
+        // Dedup outcome: 3 rows written, 1 duplicate FQN → exactly 2 rows persisted.
+        let total = count_symbols(&db).await.expect("count symbols");
+        assert_eq!(total, 2, "same-FQN duplicate must collapse to one row (got {total})");
+
+        // The surviving `compute` row must be the last write (line_start 40).
+        let rows = find_symbols_by_names_with_pos(&db, &["compute".to_string()])
+            .await
+            .expect("lookup compute");
+        assert_eq!(rows.len(), 1, "exactly one compute row");
+        assert_eq!(rows[0].line_start, 40, "last-write-wins on duplicate FQN");
+    }
+
+    /// 5.2 — After a full rebuild the secondary symbol indexes are present and a
+    /// name lookup (the path Phase 2 and queries use) returns the expected rows.
+    /// Proves the rebuild actually ran and the index is usable (D2).
+    #[tokio::test]
+    async fn full_rebuild_leaves_symbol_indexes_present_and_usable() {
+        let home = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        let path = repo_dir.path().join("sample.rs");
+        std::fs::write(
+            &path,
+            "fn alpha() -> i32 {\n    1\n}\n\nfn beta() -> i32 {\n    2\n}\n",
+        )
+        .expect("write source file");
+        let repo = repo_dir.path().to_str().unwrap().replace('\\', "/");
+
+        let db = open_db(home.path(), &repo, 0).await.expect("open db");
+        let pipeline = IndexPipeline::new(repo.clone(), None);
+        pipeline
+            .run(&db, None, true, None, None, None, &[], None)
+            .await
+            .expect("full rebuild");
+
+        // Both secondary indexes must be defined after the build (rebuild ran).
+        let names = symbol_index_names(&db).await;
+        assert!(
+            names.iter().any(|n| n == "idx_symbol_file"),
+            "idx_symbol_file must be present after full rebuild (got {names:?})"
+        );
+        assert!(
+            names.iter().any(|n| n == "idx_symbol_name"),
+            "idx_symbol_name must be present after full rebuild (got {names:?})"
+        );
+
+        // Name lookup via idx_symbol_name must return the expected symbol.
+        let rows = find_symbols_by_names_with_pos(&db, &["alpha".to_string()])
+            .await
+            .expect("lookup alpha");
+        assert_eq!(rows.len(), 1, "exactly one alpha symbol");
+        assert_eq!(rows[0].name, "alpha");
+    }
+
+    /// 5.3 — An incremental run must NOT drop the global symbol indexes (D5).
+    /// We seed a built index, then run an incremental update for one changed file
+    /// and assert both secondary indexes remain defined throughout.
+    #[tokio::test]
+    async fn incremental_does_not_drop_symbol_indexes() {
+        let home = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        let path = repo_dir.path().join("lib.rs");
+        std::fs::write(&path, "fn one() {}\n").expect("write file");
+        let repo = repo_dir.path().to_str().unwrap().replace('\\', "/");
+
+        let db = open_db(home.path(), &repo, 0).await.expect("open db");
+        let pipeline = IndexPipeline::new(repo.clone(), None);
+
+        // Initial full rebuild establishes the indexes.
+        pipeline
+            .run(&db, None, true, None, None, None, &[], None)
+            .await
+            .expect("initial full rebuild");
+        let before = symbol_index_names(&db).await;
+        assert!(before.iter().any(|n| n == "idx_symbol_file"));
+        assert!(before.iter().any(|n| n == "idx_symbol_name"));
+
+        // Modify the file and run an incremental update (force_rebuild = false).
+        std::fs::write(&path, "fn one() {}\n\nfn two() {}\n").expect("modify file");
+        let changes = vec![FileChange {
+            path: path.to_str().unwrap().replace('\\', "/"),
+            kind: ChangeKind::Modified,
+        }];
+        pipeline
+            .run(&db, Some(changes), false, None, None, None, &[], None)
+            .await
+            .expect("incremental run");
+
+        // Both global symbol indexes must still be present — incremental must not
+        // have dropped/rebuilt them (would turn O(changed) into O(repo)).
+        let after = symbol_index_names(&db).await;
+        assert!(
+            after.iter().any(|n| n == "idx_symbol_file"),
+            "idx_symbol_file must remain after incremental (got {after:?})"
+        );
+        assert!(
+            after.iter().any(|n| n == "idx_symbol_name"),
+            "idx_symbol_name must remain after incremental (got {after:?})"
+        );
+
+        // And the incremental's new symbol must be reachable by name lookup.
+        let rows = find_symbols_by_names_with_pos(&db, &["two".to_string()])
+            .await
+            .expect("lookup two");
+        assert_eq!(rows.len(), 1, "incremental symbol must be indexed/queryable");
+    }
+
+    /// 5.5 — Crash-safety of the drop/rebuild window (D4). If the process dies
+    /// AFTER the secondary symbol indexes are dropped but BEFORE the post-build
+    /// rebuild, the indexes are missing on disk while rows exist. The next
+    /// `open_db` runs `SCHEMA_DDL` (`DEFINE INDEX IF NOT EXISTS idx_symbol_file/
+    /// idx_symbol_name`) which re-defines both indexes over the existing rows —
+    /// self-healing the crash window with no manual rebuild and no data loss.
+    ///
+    /// This exercises the EXACT crash window rather than reading the DDL:
+    ///   open → drop indexes → write rows → assert ABSENT (in the window) →
+    ///   PROCESS DEATH (flush to disk) → next boot reads the crash image →
+    ///   assert indexes restored + rows intact.
+    ///
+    /// Why we open a COPY of the on-disk image instead of reopening the same
+    /// path: SurrealDB's embedded RocksDB engine holds an exclusive per-dir LOCK
+    /// for the WHOLE process — the `rocksdb::DB` instance is kept alive by the
+    /// engine layer, so within one process a second open of the same path fails
+    /// on LOCK even after the `Surreal<Db>` handle drops and its runtime tears
+    /// down (this is exactly why the store documents "production never
+    /// drops+reopens" — `get_or_open` keeps one cached handle for the repo's
+    /// lifetime). In production, boot 2 is a fresh OS process where that path is
+    /// unlocked. We reproduce a fresh boot faithfully: build the crash-window
+    /// state inside a DEDICATED runtime/thread, fully tear it down so RocksDB
+    /// flushes its WAL/MANIFEST/SSTs to disk (a clean quiesced crash image), then
+    /// COPY that on-disk image (minus the LOCK marker, which a new boot recreates)
+    /// to a fresh data dir and `open_db` there. That is the bytes-that-survived
+    /// opened by a new process — real crash recovery, not a weakened assertion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn crash_between_drop_and_rebuild_self_heals_on_next_open() {
+        // Recursively copy `src` → `dst`, skipping any RocksDB `LOCK` file (a new
+        // boot recreates it). Mirrors what survives on disk after a crash.
+        fn copy_crash_image(src: &std::path::Path, dst: &std::path::Path) {
+            std::fs::create_dir_all(dst).expect("mkdir crash-image dst");
+            for entry in std::fs::read_dir(src).expect("read crash-image src") {
+                let entry = entry.expect("dir entry");
+                let name = entry.file_name();
+                let ty = entry.file_type().expect("file type");
+                let to = dst.join(&name);
+                if ty.is_dir() {
+                    copy_crash_image(&entry.path(), &to);
+                } else if name != "LOCK" {
+                    std::fs::copy(entry.path(), &to).expect("copy crash-image file");
+                }
+            }
+        }
+
+        let crash_home = TempDir::new().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        let repo = repo_dir.path().to_str().unwrap().replace('\\', "/");
+
+        // ── Boot 1 + crash window, in a sacrificial runtime/thread ──────────────
+        // Everything up to and including "process death" happens here. When this
+        // thread returns, its runtime is dropped, deterministically tearing down
+        // the SurrealDB engine so RocksDB flushes a clean on-disk image. The
+        // assertions inside cover steps 1-4; a failure panics the thread and is
+        // surfaced by the join unwrap below.
+        let crash_home_path = crash_home.path().to_path_buf();
+        let repo_for_thread = repo.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build sacrificial runtime");
+            rt.block_on(async move {
+                // Step 1 — first boot: open_db runs SCHEMA_DDL, defining both indexes.
+                let db = open_db(&crash_home_path, &repo_for_thread, 0)
+                    .await
+                    .expect("open db (boot 1)");
+                let initial = symbol_index_names(&db).await;
+                assert!(
+                    initial.iter().any(|n| n == "idx_symbol_file")
+                        && initial.iter().any(|n| n == "idx_symbol_name"),
+                    "fresh open_db must define both symbol indexes (got {initial:?})"
+                );
+
+                // Step 2 — reproduce the post-drop state: the full rebuild drops
+                // both secondary indexes before its bulk symbol write.
+                db.query(
+                    "REMOVE INDEX IF EXISTS idx_symbol_file ON symbol; \
+                     REMOVE INDEX IF EXISTS idx_symbol_name ON symbol;",
+                )
+                .await
+                .expect("drop symbol indexes (enter crash window)");
+
+                // Step 3 — write symbol rows through the SAME flush path the
+                // pipeline uses, with indexes dropped: "dropped, rows written, NOT
+                // yet rebuilt" — the precise state at the moment of a crash.
+                let mk = |file: &str, name: &str, ls: u32, le: u32, sig: &str| Symbol {
+                    qualified: QualifiedSymbol {
+                        file: file.to_string(),
+                        scope_path: vec![],
+                        name: name.to_string(),
+                    },
+                    kind: SymbolKind::Function,
+                    line_start: ls,
+                    line_end: le,
+                    signature: Some(sig.to_string()),
+                    parent_fqn: None,
+                };
+                let batch = vec![
+                    mk(&format!("{repo_for_thread}/a.rs"), "alpha", 1, 3, "fn alpha()"),
+                    mk(&format!("{repo_for_thread}/b.rs"), "beta", 5, 9, "fn beta()"),
+                ];
+                flush_symbol_batch_native(&db, &batch)
+                    .await
+                    .expect("flush symbols in crash window");
+
+                // Step 4 — confirm we are genuinely IN the crash window: both
+                // secondary indexes must be ABSENT right now (dropped, rebuild
+                // never ran).
+                let in_window = symbol_index_names(&db).await;
+                assert!(
+                    !in_window.iter().any(|n| n == "idx_symbol_file"),
+                    "idx_symbol_file must be ABSENT in the crash window (got {in_window:?})"
+                );
+                assert!(
+                    !in_window.iter().any(|n| n == "idx_symbol_name"),
+                    "idx_symbol_name must be ABSENT in the crash window (got {in_window:?})"
+                );
+
+                // Step 5 — process death: drop the handle WITHOUT rebuilding.
+                drop(db);
+            });
+            // Runtime drops here → engine task gone → RocksDB flushed a clean image.
+        })
+        .join()
+        .expect("crash-window thread must not panic (its assertions are steps 1-4)");
+
+        // ── Boot 2: a fresh process reads the bytes that survived the crash ─────
+        // Copy the quiesced on-disk image to a brand-new data dir (a path never
+        // opened in this process → no held LOCK), the faithful analog of a new OS
+        // process booting on the crashed repo's directory.
+        let boot2_home = TempDir::new().unwrap();
+        copy_crash_image(crash_home.path(), boot2_home.path());
+
+        // Step 6 — next boot: open_db on the crash image; it runs SCHEMA_DDL again.
+        let db = open_db(boot2_home.path(), &repo, 0)
+            .await
+            .expect("open db (boot 2, post-crash)");
+
+        // Step 7 — self-heal: SCHEMA_DDL's IF NOT EXISTS re-defined BOTH indexes
+        // over the existing rows.
+        let healed = symbol_index_names(&db).await;
+        assert!(
+            healed.iter().any(|n| n == "idx_symbol_file"),
+            "idx_symbol_file must be restored on next open (got {healed:?})"
+        );
+        assert!(
+            healed.iter().any(|n| n == "idx_symbol_name"),
+            "idx_symbol_name must be restored on next open (got {healed:?})"
+        );
+
+        // Step 8 — no data loss: rows written in the crash window survived, and a
+        // name lookup (the path Phase 2/queries use) returns the expected row via
+        // the restored index.
+        let total = count_symbols(&db).await.expect("count symbols post-heal");
+        assert_eq!(total, 2, "both crash-window rows must persist (got {total})");
+        let rows = find_symbols_by_names_with_pos(&db, &["beta".to_string()])
+            .await
+            .expect("lookup beta post-heal");
+        assert_eq!(rows.len(), 1, "exactly one beta symbol after self-heal");
+        assert_eq!(rows[0].name, "beta");
+        assert_eq!(rows[0].line_start, 5, "row content intact after self-heal");
     }
 }
 

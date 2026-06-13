@@ -1254,8 +1254,7 @@ const STR = {
   'plan.applied':       { en: `Applied!`, vi: `Đã áp dụng!`, zh: `已应用！` },
   'plan.providerHint':  { en: `Your LLM provider is set to Google. To use this key for reranking, switch to OpenAI above.`, vi: `LLM provider đang là Google. Để dùng key này cho rerank, chuyển sang OpenAI ở trên.`, zh: `LLM 提供商当前为 Google。要使用此密钥进行重排序，请在上方切换到 OpenAI。` },
   'plan.duration':      { en: `{n} days`, vi: `{n} ngày`, zh: `{n} 天` },
-  'plan.voyage':        { en: `Voyage budget`, vi: `Voyage budget`, zh: `Voyage 预算` },
-  'plan.openai':        { en: `OpenAI budget`, vi: `OpenAI budget`, zh: `OpenAI 预算` },
+  'plan.openai':        { en: `Search`, vi: `Search`, zh: `Search` },
   'plan.timeout':       { en: `Payment not confirmed. Check your email or try again.`, vi: `Chưa xác nhận được thanh toán. Kiểm tra email hoặc thử lại.`, zh: `付款未确认。请检查邮件或重试。` },
   'plan.purchased':     { en: `Purchased Plans`, vi: `Gói đã mua`, zh: `已购套餐` },
   'plan.purchased.lookup': { en: `Lookup by invoice`, vi: `Tra cứu theo invoice`, zh: `按发票号查询` },
@@ -1271,7 +1270,7 @@ const STR = {
   'plan.freeTrial.heading': { en: `Free Trial`, vi: `Free Trial`, zh: `免费试用` },
   'plan.freeTrial.claim': { en: `Claim Free Trial`, vi: `Nhận Free Trial`, zh: `领取免费试用` },
   'plan.freeTrial.claiming': { en: `Claiming…`, vi: `Đang nhận…`, zh: `领取中…` },
-  'plan.freeTrial.budget': { en: `Voyage budget: {voyage} requests · OpenAI budget: {openai} requests`, vi: `Voyage budget: {voyage} requests · OpenAI budget: {openai} requests`, zh: `Voyage 预算：{voyage} 次请求 · OpenAI 预算：{openai} 次请求` },
+  'plan.freeTrial.budget': { en: `Search: {openai}`, vi: `Search: {openai}`, zh: `Search: {openai}` },
   'plan.freeTrial.machineHint': { en: `A hashed machine identifier (not your raw hardware ID) is sent to ensure each machine can claim the free trial only once.`, vi: `Một machine ID đã được hash (không phải ID phần cứng thô) sẽ được gửi để đảm bảo mỗi máy chỉ nhận free trial 1 lần.`, zh: `系统会发送一个经过哈希处理的机器标识符（而非原始硬件 ID），以确保每台机器只能领取一次免费试用。` },
   'plan.freeTrial.expired': { en: `Free trial expired`, vi: `Free trial đã hết hạn`, zh: `免费试用已过期` },
   'plan.freeTrial.expiredHint': { en: `Your free trial has ended. Buy a plan below to keep going.`, vi: `Free trial của bạn đã kết thúc. Mua một gói bên dưới để tiếp tục.`, zh: `您的免费试用已结束。购买下方的套餐以继续使用。` },
@@ -2336,7 +2335,7 @@ async function planFetchPackages() {
           <div class="font-medium text-sm text-gray-900 dark:text-wiki-heading">${escHtml(pkg.name)}</div>
           <div class="text-xs text-gray-500 dark:text-wiki-text-muted mt-0.5">${escHtml(pkg.description || '')}</div>
           <div class="text-xs text-gray-400 dark:text-wiki-text-muted mt-1">
-            ${t('plan.voyage')}: ${pkg.voyage_budget.toLocaleString()} requests · ${t('plan.openai')}: ${pkg.openai_budget.toLocaleString()} requests
+            ${t('plan.openai')}: ${pkg.openai_budget.toLocaleString()}
             ${pkg.duration_days > 0 ? ` · ${t('plan.duration', { n: pkg.duration_days })}` : ''}
           </div>
         </div>
