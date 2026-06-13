@@ -283,7 +283,7 @@ mod tests {
 
     #[test]
     fn encode_decode_round_trip() {
-        let original: Vec<f32> = vec![-1.5, 0.0, 3.14, -0.001, 1e30, 255.0, -128.0];
+        let original: Vec<f32> = vec![-1.5, 0.0, 2.5, -0.001, 1e30, 255.0, -128.0];
         let bytes = EmbeddingCache::encode_embedding(&original);
         let decoded = EmbeddingCache::decode_embedding(&bytes).expect("decode must succeed");
         assert_eq!(decoded, original);
@@ -314,7 +314,7 @@ mod tests {
 
         // Create the shard directory and write a non-multiple-of-4 byte file.
         std::fs::create_dir_all(path.parent().unwrap()).expect("shard dir");
-        std::fs::write(&path, &[1u8, 2, 3, 4, 5]).expect("write corrupt file");
+        std::fs::write(&path, [1u8, 2, 3, 4, 5]).expect("write corrupt file");
         assert!(path.exists(), "corrupt file should exist before get_many");
 
         let (hits, misses) = cache.get_many(&[text]);

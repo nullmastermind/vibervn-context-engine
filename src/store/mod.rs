@@ -1976,7 +1976,7 @@ mod schemaless_tests {
         // Old-format row: array<float> via literal INSERT.
         let old_emb = emb_1024(1.0);
         let old_str: String = old_emb.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ");
-        db.query(&format!(
+        db.query(format!(
             "INSERT INTO chunk {{ file: '/repo/old.rs', line_start: 1, line_end: 5, \
              content: 'old', embedding: [{}], symbol_ref: NONE }}",
             old_str
@@ -2021,7 +2021,7 @@ mod schemaless_tests {
         for (i, s) in seeds.iter().enumerate() {
             let emb = emb_1024(*s);
             let emb_str: String = emb.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ");
-            db.query(&format!(
+            db.query(format!(
                 "INSERT INTO chunk {{ file: '/repo/m_{i}.rs', line_start: 1, line_end: 5, \
                  content: 'c', embedding: [{}], symbol_ref: NONE }}",
                 emb_str
@@ -2066,7 +2066,7 @@ mod schemaless_tests {
         for i in 0..5_usize {
             let emb = emb_1024(i as f32 + 1.0);
             let emb_str: String = emb.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ");
-            db.query(&format!(
+            db.query(format!(
                 "INSERT INTO chunk {{ file: '/repo/r_{i}.rs', line_start: 1, line_end: 5, \
                  content: 'c', embedding: [{}], symbol_ref: NONE }}",
                 emb_str

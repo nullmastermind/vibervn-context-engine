@@ -1,3 +1,9 @@
+// Pre-existing layout: a few helpers live AFTER the inline #[cfg(test)]
+// `tests` module rather than before it. Clippy flags this as
+// `items_after_test_module`. Reordering the file is out of scope for the
+// current change; suppress the lint at module level.
+#![allow(clippy::items_after_test_module)]
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

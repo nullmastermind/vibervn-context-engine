@@ -1040,7 +1040,7 @@ mod load_repos_tests {
         // Exactly the seeded 3 vectors — coalescing means no doubled inserts.
         let mut q = vec![0.0f32; 4];
         q[0] = 1.0;
-        let out = vi.search(&q, 100, Some(&repo), &[repo.clone()]);
+        let out = vi.search(&q, 100, Some(&repo), std::slice::from_ref(&repo));
         assert_eq!(
             out.results.len(),
             3,

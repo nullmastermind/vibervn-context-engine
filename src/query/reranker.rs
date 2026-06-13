@@ -1897,6 +1897,7 @@ mod tests {
     }
 
     /// An `add_chunks` call carrying a single chunk with line ranges.
+    #[allow(dead_code)]
     fn add_chunk_call_lines(idx: usize, ranges: serde_json::Value) -> ToolCall {
         ToolCall {
             name: "add_chunks".to_owned(),

@@ -3534,6 +3534,6 @@ mod liquid_tests {
         let result = parse_file("test.liquid", src);
         // Liquid parsing should not crash, and ideally find symbols
         // The exact grammar behavior depends on the vendored parser
-        assert!(result.chunks.len() > 0, "expected at least one chunk from liquid file");
+        assert!(!result.chunks.is_empty(), "expected at least one chunk from liquid file");
     }
 }

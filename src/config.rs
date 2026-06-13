@@ -343,7 +343,32 @@ pub struct Settings {
     /// generation instead of resetting to 0 and racing the old LOCK again.
     #[serde(default)]
     pub repo_generations: HashMap<String, u32>,
+    /// Stable per-machine identifier used to dedup payment + free-trial flows
+    /// against a single user (one machine = one user). Computed once on first
+    /// boot via `ensure_machine_id` and persisted; never recomputed at runtime.
+    ///
+    /// Seed value: `sha256(MACHINE_ID_SALT ‖ \0 ‖ hardware_uid)` as hex when
+    /// `machine_uid::get()` succeeds. This intentionally matches the legacy
+    /// formula used by the free-trial claim flow before persistence — old
+    /// claims tied to a hardware-derived id keep matching after the upgrade.
+    /// On the rare host where `machine_uid::get()` fails we fall back to a
+    /// random UUIDv4. The fallback is only "safe" because the result is
+    /// persisted: every subsequent run reads the same value, so idempotency
+    /// (one machine → one user) holds across restarts.
+    ///
+    /// `None` on the in-memory struct only ever occurs *during boot* between
+    /// `ensure_dir_and_load` and `ensure_machine_id`. After boot the field is
+    /// always `Some` — handlers can `unwrap_or_default` defensively but should
+    /// never see empty.
+    #[serde(default)]
+    pub machine_id: Option<String>,
 }
+
+/// Salt mixed into the machine-id hash. A fixed compile-in constant: it must
+/// stay byte-identical across versions/restarts so the seed value computed by
+/// `ensure_machine_id` matches what the legacy free-trial claim flow used to
+/// compute on the fly. Changing this breaks every existing free-trial claim.
+pub const MACHINE_ID_SALT: &str = "vibervn-context-engine::free-trial::v1";
 
 impl Default for Settings {
     fn default() -> Self {
@@ -361,6 +386,7 @@ impl Default for Settings {
             custom_extensions: Vec::new(),
             index_ignore_filenames: default_index_ignore_filenames(),
             repo_generations: HashMap::new(),
+            machine_id: None,
         }
     }
 }
@@ -623,6 +649,73 @@ pub fn ensure_dir_and_load(home_dir: &Path) -> Result<Settings, ConfigError> {
     }
 
     Ok(settings)
+}
+
+/// Ensure `settings.machine_id` is `Some(...)` and persisted on disk. Called
+/// once at boot, after `ensure_dir_and_load`. Mutates `settings` in place.
+///
+/// First boot (or upgrades from a settings file written before this field
+/// existed): compute `sha256(MACHINE_ID_SALT ‖ \0 ‖ hardware_uid)` as hex,
+/// matching the legacy free-trial claim formula so machines that already
+/// claimed pick the SAME id and continue to dedup against their existing user.
+/// If `machine_uid::get()` fails (rare hosts where no hardware uid is
+/// reachable), fall back to a random UUIDv4. The fallback is only sound
+/// BECAUSE we persist it immediately — the next boot reads the same value, so
+/// "one machine = one user" still holds across restarts.
+///
+/// Subsequent boots: field already populated → no-op (don't recompute, don't
+/// rewrite).
+pub fn ensure_machine_id(home_dir: &Path, settings: &mut Settings) -> Result<(), ConfigError> {
+    if settings
+        .machine_id
+        .as_deref()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+
+    let id = compute_seed_machine_id();
+    settings.machine_id = Some(id);
+    let path = config_path(home_dir);
+    write_settings_atomic(&path, settings)
+}
+
+/// Compute the machine-id seed used by `ensure_machine_id`. Public-in-crate so
+/// tests can assert the legacy formula is preserved.
+fn compute_seed_machine_id() -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(MACHINE_ID_SALT.as_bytes());
+    hasher.update(b"\x00");
+    match machine_uid::get() {
+        Ok(uid) => {
+            hasher.update(uid.as_bytes());
+        }
+        Err(_) => {
+            // Fallback only — not the common path. Mix high-entropy host signals
+            // (system time + process id + a fresh allocation address) into the
+            // hash so the result is unique per first-boot. Acceptable here
+            // because we persist it on the same call: the next boot reads the
+            // same value, preserving idempotency.
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            hasher.update(b"fallback-v1\x00");
+            hasher.update(nanos.to_le_bytes());
+            hasher.update(std::process::id().to_le_bytes());
+            let probe: Box<u8> = Box::new(0);
+            hasher.update((Box::as_ref(&probe) as *const u8 as usize).to_le_bytes());
+        }
+    }
+    let bytes = hasher.finalize();
+    let mut s = String::with_capacity(bytes.len() * 2);
+    use std::fmt::Write as _;
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────────
@@ -1059,5 +1152,36 @@ mod tests {
             "voyage_base_url must round-trip through write+load"
         );
         assert_eq!(loaded.version, CURRENT_VERSION);
+    }
+
+    /// `ensure_machine_id` populates the field on first call, persists it to
+    /// disk, and is a no-op on the next call (same value, no rewrite).
+    #[test]
+    fn ensure_machine_id_persists_and_is_idempotent() {
+        let home = TempDir::new().expect("tempdir");
+        let mut s = ensure_dir_and_load(home.path()).expect("load default");
+        // Default settings have no machine_id yet (file just bootstrapped, but
+        // the on-disk default does not include this field).
+        assert!(
+            s.machine_id.as_deref().map(str::is_empty).unwrap_or(true),
+            "fresh settings should have no machine_id"
+        );
+
+        ensure_machine_id(home.path(), &mut s).expect("first ensure");
+        let id = s.machine_id.clone().expect("populated");
+        assert!(!id.is_empty());
+
+        // Reload from disk — value persisted.
+        let reloaded = ensure_dir_and_load(home.path()).expect("reload");
+        assert_eq!(
+            reloaded.machine_id.as_deref(),
+            Some(id.as_str()),
+            "machine_id must persist across reload"
+        );
+
+        // Second ensure on the same in-memory struct is a no-op.
+        let mut s2 = reloaded;
+        ensure_machine_id(home.path(), &mut s2).expect("second ensure");
+        assert_eq!(s2.machine_id.as_deref(), Some(id.as_str()));
     }
 }

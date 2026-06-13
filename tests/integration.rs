@@ -20,7 +20,14 @@ async fn start_server(home: &TempDir) -> SocketAddr {
         .await
         .expect("failed to bind ephemeral port");
     let addr = listener.local_addr().expect("no local addr");
-    let settings = Settings::default();
+    let settings = Settings {
+        // Seed a deterministic machine_id so the plan-proxy handlers (free-trial
+        // claim, checkout) have a value to forward without depending on the
+        // host's hardware uid. Production calls `ensure_machine_id` at boot to
+        // guarantee `Some(...)`; tests do the same shortcut here.
+        machine_id: Some("test-machine-id".to_string()),
+        ..Settings::default()
+    };
     let settings_handle = Arc::new(RwLock::new(settings.clone()));
     let repo_dbs: RepoDbMap = Arc::new(RwLock::new(HashMap::new()));
     // Tests pass the same TempDir as both home_dir and data_dir — settings.json
@@ -147,7 +154,7 @@ async fn test_put_round_trips() {
     assert_eq!(put_body, get_body, "PUT response and subsequent GET should be equal");
     let expected_repos: Vec<String> = vec!["/home/user/myproject", "/home/user/other"]
         .into_iter()
-        .map(|r| context_engine_rs::store::normalize_repo_path(r))
+        .map(context_engine_rs::store::normalize_repo_path)
         .collect();
     assert_eq!(get_body.repos, expected_repos);
     assert_eq!(get_body.embedding.model, "voyage-code-3");
@@ -411,14 +418,11 @@ async fn test_cancel_index_and_reindex() {
             .await
             .expect("SSE connect");
         let mut stream = sse_res.bytes_stream();
-        loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(10), stream.next()).await {
-                Ok(Some(Ok(bytes))) => {
-                    let text = String::from_utf8_lossy(&bytes).to_string();
-                    sse_collected_clone.lock().await.push(text);
-                }
-                _ => break,
-            }
+        while let Ok(Some(Ok(bytes))) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), stream.next()).await
+        {
+            let text = String::from_utf8_lossy(&bytes).to_string();
+            sse_collected_clone.lock().await.push(text);
         }
     });
 
@@ -1004,17 +1008,15 @@ async fn test_put_data_dir_persists_but_does_not_relocate() {
     );
 }
 
-// ─── Free-trial proxy ────────────────────────────────────────────────────
-// The engine's /api/plan/free-trial[/claim] routes proxy to the admin gateway
-// at CONTEXT_ENGINE_ADMIN_URL. We boot a tiny mock gateway, point the env var
-// at it, and assert the engine forwards correctly and injects base_url. This
-// is the only test that exercises the plan proxy, so the process-global env
-// mutation does not collide with other tests.
+// ─── Plan-proxy routes ──────────────────────────────────────────────────
+// The engine's /api/plan/* routes proxy to the admin gateway at
+// CONTEXT_ENGINE_ADMIN_URL. We boot a tiny mock gateway covering free-trial
+// AND checkout, point the env var at it once, and exercise both flows in a
+// single test — process-global env mutation cannot race a parallel test.
 #[tokio::test]
-async fn test_free_trial_proxy_forwards_and_injects_base_url() {
+async fn test_plan_proxy_forwards_machine_id_and_injects_base_url() {
     use axum::{routing::{get, post}, Json, Router};
 
-    // Mock admin gateway.
     let mock = Router::new()
         .route(
             "/api/free-trial",
@@ -1030,16 +1032,36 @@ async fn test_free_trial_proxy_forwards_and_injects_base_url() {
         .route(
             "/api/free-trial/claim",
             post(|Json(body): Json<serde_json::Value>| async move {
-                // Echo back a key only when a non-empty machine_id was forwarded.
+                // Engine MUST forward a non-empty machine_id read from settings.
                 let mid = body
                     .get("machine_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                assert!(!mid.is_empty(), "engine must forward a machine_id");
+                assert_eq!(mid, "test-machine-id", "engine must forward machine_id");
                 Json(serde_json::json!({
                     "proxy_key": "ft_test_key",
                     "expires_at": "2099-01-01 00:00:00"
                 }))
+            }),
+        )
+        .route(
+            "/api/checkout",
+            post(|Json(body): Json<serde_json::Value>| async move {
+                // Browser only sends `package_id`; engine MUST inject machine_id
+                // before forwarding so the admin gateway can credit the right
+                // per-machine user when SePay's webhook fires.
+                let mid = body
+                    .get("machine_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                assert_eq!(mid, "test-machine-id", "engine must inject machine_id");
+                (
+                    axum::http::StatusCode::CREATED,
+                    Json(serde_json::json!({
+                        "redirect_url": "https://example.test/pay",
+                        "invoice_number": "PKG_TEST_X"
+                    })),
+                )
             }),
         );
     let mock_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
@@ -1048,8 +1070,8 @@ async fn test_free_trial_proxy_forwards_and_injects_base_url() {
         axum::serve(mock_listener, mock).await.expect("mock server");
     });
 
-    // Point the proxy at the mock. SAFETY: single-threaded test setup, this is
-    // the only test that reads CONTEXT_ENGINE_ADMIN_URL.
+    // SAFETY: single-threaded test setup, this is the only test that reads
+    // CONTEXT_ENGINE_ADMIN_URL.
     unsafe {
         std::env::set_var("CONTEXT_ENGINE_ADMIN_URL", format!("http://{mock_addr}"));
     }
@@ -1071,25 +1093,37 @@ async fn test_free_trial_proxy_forwards_and_injects_base_url() {
     assert_eq!(info["duration_days"], 7);
 
     // POST /api/plan/free-trial/claim → key + injected base_url. machine_id is
-    // derived host-side; on the rare host where it's unavailable the engine
-    // returns 500 (never a random fallback), which we tolerate here.
+    // read from persisted settings (seeded by start_server), never re-derived.
     let res = client
         .post(format!("http://{addr}/api/plan/free-trial/claim"))
         .send()
         .await
         .expect("post claim");
-    let status = res.status().as_u16();
-    if status == 200 {
-        let data: serde_json::Value = res.json().await.expect("json");
-        assert_eq!(data["proxy_key"], "ft_test_key");
-        assert_eq!(
-            data["base_url"],
-            format!("http://{mock_addr}/v1"),
-            "engine must inject base_url on success"
-        );
-    } else {
-        assert_eq!(status, 500, "claim must be 200 or a loud 500, never silent");
-    }
+    assert_eq!(res.status().as_u16(), 200);
+    let data: serde_json::Value = res.json().await.expect("json");
+    assert_eq!(data["proxy_key"], "ft_test_key");
+    assert_eq!(
+        data["base_url"],
+        format!("http://{mock_addr}/v1"),
+        "engine must inject base_url on success"
+    );
+
+    // POST /api/plan/checkout → mock returns 201 only when machine_id was
+    // injected (assertion in mock handler enforces it).
+    let res = client
+        .post(format!("http://{addr}/api/plan/checkout"))
+        .json(&serde_json::json!({ "package_id": 42 }))
+        .send()
+        .await
+        .expect("post checkout");
+    assert_eq!(res.status().as_u16(), 201);
+    let data: serde_json::Value = res.json().await.expect("json");
+    assert_eq!(data["invoice_number"], "PKG_TEST_X");
+    assert_eq!(
+        data["base_url"],
+        format!("http://{mock_addr}/v1"),
+        "engine must inject base_url on checkout success"
+    );
 
     unsafe {
         std::env::remove_var("CONTEXT_ENGINE_ADMIN_URL");

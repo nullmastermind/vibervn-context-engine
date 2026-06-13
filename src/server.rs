@@ -1357,34 +1357,28 @@ fn plan_http_client() -> reqwest::Client {
         .unwrap_or_default()
 }
 
-// Salt mixed into the machine-id hash. A fixed compile-in constant: it must
-// stay byte-identical across versions/restarts so the derived id is stable for
-// a given machine (the free-trial dedup + idempotent recovery depend on it).
-const MACHINE_ID_SALT: &str = "vibervn-context-engine::free-trial::v1";
+// Salt mixed into the machine-id hash. Now lives in `crate::config` since the
+// id is computed once at boot and persisted to settings.json. See
+// `config::ensure_machine_id` and `config::MACHINE_ID_SALT`.
 
-/// Derive a stable, opaque per-machine id: `sha256(SALT ‖ machine_uid)` as hex.
-///
-/// We never send the raw hardware uid to the server — only this hash. Returns
-/// an error (NOT a random fallback) when the hardware uid is unavailable: a
-/// random id would silently break idempotency (every claim would look like a
-/// new machine), so the claim must fail loudly instead.
-fn machine_id() -> Result<String, String> {
-    use sha2::{Digest, Sha256};
-    let uid = machine_uid::get().map_err(|e| format!("machine id unavailable: {e}"))?;
-    let mut hasher = Sha256::new();
-    hasher.update(MACHINE_ID_SALT.as_bytes());
-    hasher.update(b"\x00");
-    hasher.update(uid.as_bytes());
-    Ok(hex_encode(&hasher.finalize()))
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
+/// Read the persisted machine_id from the live settings handle. Boot guarantees
+/// `Some(...)` after `ensure_machine_id`; `None`/empty would only occur if a
+/// caller mutated the field at runtime. Returns the value or a 500 response.
+async fn machine_id_from_settings(state: &AppState) -> Result<String, Response> {
+    let id = state
+        .settings
+        .read()
+        .await
+        .machine_id
+        .clone()
+        .filter(|s| !s.is_empty());
+    id.ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "machine id unavailable: settings not initialized" })),
+        )
+            .into_response()
+    })
 }
 
 async fn plan_get_free_trial(State(_): State<AppState>) -> Response {
@@ -1411,19 +1405,15 @@ async fn plan_get_free_trial(State(_): State<AppState>) -> Response {
         .unwrap()
 }
 
-async fn plan_post_free_trial_claim(State(_): State<AppState>) -> Response {
-    // The machine id is computed here (server-side); the browser never sees it
-    // and cannot read hardware identifiers anyway. A failure to derive it is a
-    // hard error — see machine_id() for why no random fallback is allowed.
-    let machine_id = match machine_id() {
+async fn plan_post_free_trial_claim(State(state): State<AppState>) -> Response {
+    // The machine id is read from persisted settings (populated once at boot
+    // by `ensure_machine_id`). The browser never sees it. The previous
+    // implementation derived it on the fly via machine_uid::get(); now both
+    // free-trial and paid checkout share the same persisted source so a
+    // hardware-uid hiccup at runtime can never re-roll the id.
+    let machine_id = match machine_id_from_settings(&state).await {
         Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": e })),
-            )
-                .into_response();
-        }
+        Err(resp) => return resp,
     };
 
     let base = plan_admin_base();
@@ -1492,9 +1482,26 @@ async fn plan_get_packages(State(_): State<AppState>) -> Response {
 }
 
 async fn plan_post_checkout(
-    State(_): State<AppState>,
+    State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> Response {
+    // Inject the persisted machine_id into the request so the admin gateway
+    // can dedup paid purchases per machine (one machine = one user, with
+    // accumulated budgets/expiry on repeat purchase). The browser never sees
+    // or controls this — it only sends `package_id`.
+    let machine_id = match machine_id_from_settings(&state).await {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    let mut body = body;
+    if let Value::Object(ref mut obj) = body {
+        obj.insert("machine_id".to_string(), Value::String(machine_id));
+    } else {
+        // Frontend always sends a JSON object; if it doesn't, build one from
+        // scratch so the admin gateway never sees a missing machine_id.
+        body = json!({ "machine_id": machine_id });
+    }
+
     let base = plan_admin_base();
     let url = format!("{base}/api/checkout");
 

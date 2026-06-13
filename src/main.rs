@@ -7,7 +7,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use context_engine_rs::{
-    config::{default_data_dir, default_embeddings_dir, ensure_dir_and_load},
+    config::{default_data_dir, default_embeddings_dir, ensure_dir_and_load, ensure_machine_id},
     indexing::IndexEngine,
     server, store,
 };
@@ -124,13 +124,22 @@ async fn main() {
     };
 
     // Load settings (needed to know which repos to watch).
-    let settings = match ensure_dir_and_load(&home_dir) {
+    let mut settings = match ensure_dir_and_load(&home_dir) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: could not load settings: {e}");
             std::process::exit(2);
         }
     };
+
+    // Populate + persist `machine_id` if missing. First boot (or upgrade from a
+    // settings file written before this field existed) computes the seed and
+    // writes it back; subsequent boots are a no-op. Done HERE — before
+    // settings_handle is built — so every downstream reader sees `Some`.
+    if let Err(e) = ensure_machine_id(&home_dir, &mut settings) {
+        eprintln!("error: could not initialize machine_id: {e}");
+        std::process::exit(2);
+    }
 
     // Resolve data_dir with the documented precedence:
     //   CLI flag > env CONTEXT_ENGINE_DATA_DIR > Settings.data_dir > builtin default.
