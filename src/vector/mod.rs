@@ -236,12 +236,15 @@ impl VectorIndex {
             embedding: Vec<f32>,
         }
 
+        let t_select = std::time::Instant::now();
         let rows: Vec<Row> = db
             .query("SELECT file, line_start, line_end, embedding FROM chunk WHERE embedding IS NOT NONE")
             .await
             .context("load embeddings from chunk table")?
             .take(0)?;
+        let select_ms = t_select.elapsed().as_millis() as u64;
 
+        let t_decode = std::time::Instant::now();
         let mut index = VectorIndex::new();
         let pairs: Vec<(ChunkId, Vec<f32>)> = rows
             .into_iter()
@@ -256,10 +259,20 @@ impl VectorIndex {
                 )
             })
             .collect();
+        let decode_ms = t_decode.elapsed().as_millis() as u64;
 
         let count = pairs.len();
+        let t_insert = std::time::Instant::now();
         index.insert(&pairs);
-        info!(count, "loaded embeddings into VectorIndex");
+        let insert_ms = t_insert.elapsed().as_millis() as u64;
+        // PERF SUMMARY load_from_db: the cold-shard-warm cost a user's first query
+        // blocks on. select_ms = DB scan of all chunk rows; decode_ms = bytes->Vec<f32>
+        // deserialize (serde, single-threaded); insert_ms = L2-normalize + flat copy.
+        info!(
+            count, select_ms, decode_ms, insert_ms,
+            total_ms = select_ms + decode_ms + insert_ms,
+            "PERF SUMMARY load_from_db (cold shard warm breakdown)"
+        );
 
         Ok(index)
     }

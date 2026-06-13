@@ -209,31 +209,15 @@ WQ_END=$(date +%s.%N)
 WQLAT=$(python -c "print('%.0f' % ((${WQ_END} - ${WQ_START})*1000))" 2>/dev/null || echo "?")
 emit "[bench] cold_restart_warm_second_query_latency_ms=${WQLAT}  (shard already resident)"
 emit_query_timing "cold_warm2" "$WQRESP"
-# Surface the shard load_from_db warm time straight from the log (authoritative).
-# Compute the load->install delta for THIS repo: the two adjacent markers
-# "loaded embeddings into VectorIndex" then "installed vector shard repo=<repo>"
-# bracket the cold warm. This is the true "shard warm" cost, independent of the
-# query-embed network call (which the cold_first_query latency also includes).
-SHARD_WARM="$(grep -aE "loaded embeddings into VectorIndex" "$LOG" | tail -1 || true)"
-emit "[bench] shard_warm_log=${SHARD_WARM:-'(no load_from_db marker — shard may have warmed lazily mid-query)'}"
-SHARD_WARM_MS="$(python - "$LOG" "$REPO_NORM" <<'PY' 2>/dev/null || true
-import sys, re, datetime
-log, repo = sys.argv[1], sys.argv[2]
-def ts(line):
-    m = re.match(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+)', re.sub(r'\x1b\[[0-9;]*m','',line))
-    return datetime.datetime.fromisoformat(m.group(1)) if m else None
-load_t = inst_t = None
-for raw in open(log, encoding='utf-8', errors='replace'):
-    line = re.sub(r'\x1b\[[0-9;]*m','',raw)
-    if 'loaded embeddings into VectorIndex' in line:
-        load_t = ts(line)
-    elif 'installed vector shard' in line and ('repo=%s' % repo) in line and load_t:
-        inst_t = ts(line)
-        if inst_t:
-            print('%.0f' % ((inst_t - load_t).total_seconds()*1000)); break
-PY
-)"
-emit "[bench] shard_warm_ms=${SHARD_WARM_MS:-'?'}  (load_from_db -> install, repo-specific; the true cold-warm cost)"
+# Surface the authoritative shard-warm breakdown from the PERF SUMMARY load_from_db
+# log line (select_ms + decode_ms + insert_ms + total_ms). This is the REAL cold-shard
+# warm cost a user's first query blocks on — measured inside load_from_db, not a
+# fragile delta between two separate log markers (the previous approach measured only
+# install_shard, missing the entire SELECT+decode — corrected here).
+SHARD_WARM="$(grep -aE "PERF SUMMARY load_from_db" "$LOG" | tail -1 || true)"
+emit "[bench] shard_warm_load_from_db=${SHARD_WARM:-'(no load_from_db PERF SUMMARY — shard was already resident, no warm needed)'}"
+SHARD_WARM_MS="$(printf '%s' "$SHARD_WARM" | grep -oE 'total_ms=[0-9]+' | head -1 | sed 's/total_ms=//' || true)"
+emit "[bench] shard_warm_total_ms=${SHARD_WARM_MS:-'n/a (no warm)'}  (load_from_db select+decode+insert; the true cold-warm cost)"
 emit "===== TIME-TO-QUERY SUMMARY ====="
 emit "[bench] index_wall_clock_s=${WALL}  shard_warm_ms=${SHARD_WARM_MS:-?}  cold_first_query_ms=${CQLAT}  cold_warm_second_query_ms=${WQLAT}"
 emit "[bench] results_file=${RESULTS}"

@@ -5694,6 +5694,111 @@ mod symbol_write_microbench {
     }
 }
 
+// Isolated micro-benchmark for the COLD-SHARD-WARM path (the correctness bug:
+// kernel query returns EMPTY after a 50s warm-wait timeout). Measures
+// VectorIndex::load_from_db at kernel scale (909k chunks x 1024-dim) on a
+// synthetic chunk table — WITHOUT a 30-min rebuild and WITHOUT sibling-repo
+// watcher contamination. Answers hypothesis (c): "load_from_db at 3.7GB is
+// genuinely >50s". #[ignore]d — run explicitly:
+//   cargo test --release --lib load_from_db_cold_warm_microbench -- --ignored --nocapture
+#[cfg(test)]
+mod load_from_db_microbench {
+    use super::*;
+    use crate::store::open_db;
+    use crate::vector::VectorIndex;
+    use std::time::Instant;
+    use tempfile::TempDir;
+
+    /// Write `n` synthetic chunks with realistic 1024-dim packed embeddings,
+    /// mirroring the production chunk-write shape (flush_chunk_batch).
+    async fn seed_chunks(db: &Surreal<Db>, n: usize, dim: usize) {
+        use crate::store::ops::pack_embedding;
+        let mut batch: Vec<ChunkRecord> = Vec::with_capacity(4096);
+        let mut written = 0usize;
+        // A fixed pseudo-random embedding per row (deterministic, cheap).
+        for i in 0..n {
+            let emb: Vec<f32> = (0..dim)
+                .map(|j| (((i * 31 + j * 17) % 1000) as f32) / 1000.0 - 0.5)
+                .collect();
+            batch.push(ChunkRecord {
+                file: format!("/repo/sub{}/file_{}.c", i % 4096, i / 20),
+                line_start: (i % 5000) as i64,
+                line_end: (i % 5000 + 18) as i64,
+                content: String::new(), // content is not read by load_from_db
+                embedding: pack_embedding(&emb),
+                symbol_ref: None,
+            });
+            if batch.len() >= 4096 {
+                flush_chunk_batch(db, std::mem::take(&mut batch)).await.unwrap();
+                written += 4096;
+                if written.is_multiple_of(200_704) {
+                    println!("  seeded {written}/{n} chunks");
+                }
+            }
+        }
+        if !batch.is_empty() {
+            flush_chunk_batch(db, batch).await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn load_from_db_cold_warm_microbench() {
+        let n: usize = std::env::var("MICROBENCH_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(909_711); // kernel scale
+        let dim: usize = 1024;
+        println!("load_from_db microbench: seeding {n} chunks x {dim}-dim ...");
+
+        let home = TempDir::new().unwrap();
+        let db = open_db(home.path(), "/mb/warm", 0).await.unwrap();
+        let t_seed = Instant::now();
+        seed_chunks(&db, n, dim).await;
+        println!("  seed done in {} ms", t_seed.elapsed().as_millis());
+
+        // The decisive measurement: cold-shard warm at kernel scale.
+        let t = Instant::now();
+        let idx = VectorIndex::load_from_db(&db).await.unwrap();
+        let warm_ms = t.elapsed().as_millis();
+
+        // Phase split (replicates load_from_db internals) to attribute the warm cost
+        // to SELECT scan vs serde decode vs L2-normalize insert — tells us whether
+        // scalar quantization (i8) would cut warm time or only fix residency.
+        use crate::vector::ChunkId;
+        #[derive(serde::Deserialize)]
+        struct Row {
+            file: String,
+            line_start: i64,
+            line_end: i64,
+            #[serde(deserialize_with = "crate::store::ops::de_embedding_dual")]
+            embedding: Vec<f32>,
+        }
+        let t_sel = Instant::now();
+        let rows: Vec<Row> = db
+            .query("SELECT file, line_start, line_end, embedding FROM chunk WHERE embedding IS NOT NONE")
+            .await.unwrap().take(0).unwrap();
+        let select_ms = t_sel.elapsed().as_millis();
+        let t_dec = Instant::now();
+        let pairs: Vec<(ChunkId, Vec<f32>)> = rows.into_iter().map(|r| {
+            (ChunkId { file: r.file, line_start: r.line_start as u32, line_end: r.line_end as u32 }, r.embedding)
+        }).collect();
+        let decode_ms = t_dec.elapsed().as_millis();
+        let t_ins = Instant::now();
+        let mut vi = VectorIndex::new();
+        vi.insert(&pairs);
+        let insert_ms = t_ins.elapsed().as_millis();
+
+        println!(
+            "LOAD_FROM_DB RESULT n={n} loaded={} warm_ms={warm_ms} \
+             [split] select_ms={select_ms} decode_ms={decode_ms} insert_ms={insert_ms} \
+             vs_warm_wait_50000ms={}",
+            idx.len(),
+            if warm_ms > 50_000 { "EXCEEDS (timeout->empty)" } else { "under" }
+        );
+    }
+}
+
 #[cfg(test)]
 mod null_byte_skip_tests {
     use super::*;
