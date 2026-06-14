@@ -33,13 +33,10 @@ use crate::config::{
     config_path,
 };
 use crate::defender;
-use crate::embedding::voyage::VoyageClient;
 use crate::indexing::IndexEngine;
-use crate::llm::LlmClient;
 use crate::mcp::{McpHandler, RepoMcpHandler, run_codebase_retrieval};
 use crate::path_in_repo;
 use crate::store;
-use crate::query;
 
 // ─── IntoResponse for ConfigError ─────────────────────────────────────────
 
@@ -490,114 +487,53 @@ async fn delete_repo_index(
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
 
-    // Resolve the generation BEFORE the bump — this is the directory currently on
-    // disk that we must remove. The read guard is dropped immediately.
-    let current_generation = repo_generation(&state, &repo).await;
-
-    // Cancel any in-progress indexing, wait for it to finish, then drop the
-    // cached DB handle. This guarantees no pipeline holds a RocksDB lock on
-    // the directory when we attempt to remove it.
-    state.index_engine.close_repo_db(&repo).await;
-
-    // Clear in-memory state immediately — the index is functionally gone from
-    // the user's perspective regardless of whether the directory removal succeeds.
-    state.index_engine.clear_repo_index(&repo).await;
-
-    // Bump the generation and persist (disk FIRST, then memory — mirroring
-    // put_config's ordering) BEFORE touching the old directory. Ordering is the fix
-    // for a real incident: the old code removed the directory first (a gated, ~30s
-    // Windows+Defender lock-drain retry loop) and bumped only afterwards. A re-index
-    // triggered during that window read the *old* generation (bump not yet durable)
-    // and parked behind the same per-repo open gate the removal held — wedging the UI
-    // in an indeterminate "Indexing…" with a dead Cancel, then failing with "open
-    // surrealdb" once it recreated the still-draining old path. Persisting the bump
-    // first guarantees a concurrent re-index resolves the NEW generation (a pristine
-    // path the draining handle never touched) and opens immediately. Persisting to
-    // memory before responding also lets the UI's subsequent "Xóa repo" PUT
-    // /api/config preserve the bump (it reads repo_generations from the live handle;
-    // see put_config).
-    let next_generation = current_generation.saturating_add(1);
-    let target = config_path(&state.home_dir);
-    let normalized_repo = crate::store::normalize_repo_path(&repo);
-    let to_write = {
-        let mut s = state.settings.read().await.clone();
-        s.repo_generations
-            .insert(normalized_repo.clone(), next_generation);
-        // "Remove Repo": drop it from the configured list in the SAME durable
-        // write as the generation bump. Doing it here (not via a follow-up PUT
-        // /api/config) makes the removal durable BEFORE the slow lock-drain below,
-        // so a reload mid-teardown — or a lost PUT — can't resurrect the repo from
-        // disk. The generation entry is intentionally KEPT (see repo_generations
-        // doc) so a future re-add reuses the higher generation instead of racing
-        // the still-draining old LOCK.
-        if remove_repo {
-            s.repos.retain(|r| r != &normalized_repo);
-        }
-        s
-    };
-    let persist = tokio::task::spawn_blocking({
-        let to_write = to_write.clone();
-        move || write_settings_atomic(&target, &to_write)
-    })
-    .await;
-    match persist {
-        Ok(Ok(())) => {
-            // Disk write succeeded — now swap memory under the write lock so the
-            // live handle matches disk (GET /api/config reads disk; in-memory is
-            // the source of truth for indexing triggers and the put_config diff).
-            let mut guard = state.settings.write().await;
-            guard
-                .repo_generations
-                .insert(normalized_repo.clone(), next_generation);
-            if remove_repo {
-                guard.repos.retain(|r| r != &normalized_repo);
-            }
-        }
-        Ok(Err(e)) => {
-            // Persisting the bump failed. Without a durable bump a re-index could
-            // reuse the old generation path — and we have NOT removed it yet, so the
-            // old index is intact. Surface the error so the user can retry rather
-            // than silently degrade.
-            let body = json!({ "error": format!("failed to persist index generation: {e}") });
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response();
-        }
-        Err(join_err) => {
-            let body = json!({ "error": format!("internal error: {join_err}") });
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response();
-        }
-    }
-
+    // The entire remove core (close handle, clear in-memory state, atomic
+    // generation-bump persist disk-then-memory, ungated old-dir removal) lives in
+    // the shared `engine_ops::remove_index` so the CLI runs the EXACT same logic.
+    // `also_drop_repo = remove_repo` folds the "Remove Repo" repos.retain(...) into
+    // the SAME durable write as the bump (see the fn doc for the atomicity
+    // rationale). The two response shapes below are unchanged.
+    //
     // NOTE: even for a full "Remove Repo" we deliberately do NOT drop the
-    // in-memory status entry — `clear_repo_index` above reset it in place. The
-    // detached watcher has no stop handle, so the status entry is the only thing
-    // that keeps a future `register_repo` (re-add) from spawning a second watcher
-    // (unbounded growth on repeated remove/re-add). The leftover idle entry is
-    // harmless: GET /api/config (disk) no longer lists the repo, so the UI renders
-    // it gone; the poll may re-sync once per tick, the same bounded path already
-    // used to surface MCP-auto-registered repos.
-
-    // Now remove the OLD generation's directory WITHOUT the open gate. The bump above
-    // is durable, so every future open targets `next_generation` — nothing can race
-    // or recreate `current_generation`, and there is nothing to serialize against. A
-    // gate-held removal here would block the fresh generation's open for the whole
-    // ~30s drain (the gate is keyed by repo, not generation); the ungated removal lets
-    // a re-index proceed on the clean path immediately while this drains in the
-    // foreground. If it outlives the retry budget, the boot-time sweep reclaims it
-    // (store::sweep_stale_generations).
-    let removed = store::remove_old_generation_dir(&state.data_dir, &repo, current_generation).await;
-
-    if removed {
-        Json(json!({ "status": "ok" })).into_response()
-    } else {
-        // The directory wasn't fully removed yet (OS still holds the files), but the
-        // generation bump already redirected future indexing to a fresh path — so the
-        // repo is fully usable now and the orphan will be swept on next boot. Report
-        // "pending" for transparency (the UI can note the leftover), not as a blocker.
-        Json(json!({
-            "status": "pending",
-            "message": "old index directory not fully removed yet; it will be reclaimed on next restart"
-        }))
-        .into_response()
+    // in-memory status entry — `clear_repo_index` inside the shared fn reset it in
+    // place. The detached watcher has no stop handle, so the status entry is the
+    // only thing that keeps a future `register_repo` (re-add) from spawning a
+    // second watcher (unbounded growth on repeated remove/re-add). The leftover
+    // idle entry is harmless: GET /api/config (disk) no longer lists the repo, so
+    // the UI renders it gone; the poll may re-sync once per tick, the same bounded
+    // path already used to surface MCP-auto-registered repos.
+    match crate::engine_ops::remove_index(
+        &state.home_dir,
+        &state.data_dir,
+        &state.index_engine,
+        &state.settings,
+        &repo,
+        remove_repo,
+    )
+    .await
+    {
+        Ok(crate::engine_ops::RemoveOutcome::Removed) => {
+            Json(json!({ "status": "ok" })).into_response()
+        }
+        Ok(crate::engine_ops::RemoveOutcome::Pending) => {
+            // The directory wasn't fully removed yet (OS still holds the files), but the
+            // generation bump already redirected future indexing to a fresh path — so the
+            // repo is fully usable now and the orphan will be swept on next boot. Report
+            // "pending" for transparency (the UI can note the leftover), not as a blocker.
+            Json(json!({
+                "status": "pending",
+                "message": "old index directory not fully removed yet; it will be reclaimed on next restart"
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            // Persisting the bump failed (or an internal join error). Without a durable
+            // bump a re-index could reuse the old generation path — and the old index is
+            // intact (we abort before removal). Surface the error so the user can retry
+            // rather than silently degrade.
+            let body = json!({ "error": format!("failed to persist index generation: {e}") });
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
+        }
     }
 }
 
@@ -1010,28 +946,6 @@ async fn post_query(
         return (StatusCode::BAD_REQUEST, Json(body)).into_response();
     }
 
-    // Build voyage client.
-    let voyage_client = match VoyageClient::new(
-        settings.embedding.model.clone(),
-        settings.embedding.api_keys.clone(),
-        settings.embedding.voyage_base_url.as_deref(),
-    ) {
-        Ok(c) => c,
-        Err(e) => {
-            let body = json!({ "error": format!("failed to create embedding client: {e}") });
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response();
-        }
-    };
-
-    // Build LLM client for reranking (None if no keys configured or rerank disabled).
-    let llm_client = if req.rerank {
-        LlmClient::new(&settings.llm)
-    } else {
-        None
-    };
-
-    let top_k = req.top_k.max(1);
-
     // A repo is mandatory: queries are always scoped to one repository. Reject a
     // repo-less query rather than silently searching across every configured repo.
     let repo_filter = match req.repo.as_deref().map(str::trim) {
@@ -1041,21 +955,19 @@ async fn post_query(
             return (StatusCode::BAD_REQUEST, Json(body)).into_response();
         }
     };
-    let repo_filter = crate::store::normalize_repo_path(repo_filter);
 
-    match query::run_query(
-        &req.query,
-        top_k,
-        Some(&repo_filter),
-        &voyage_client,
+    // Delegate to the shared query op (VoyageClient build, optional LlmClient,
+    // repo normalization, query::run_query with all settings-derived args) so the
+    // CLI and server produce byte-identical retrieval. The `settings` snapshot was
+    // cloned above — no settings guard is held across the await below.
+    match crate::engine_ops::run_query_op(
+        &settings,
         &state.index_engine,
         &state.repo_dbs,
-        settings.llm.rerank_min_prune_lines,
-        llm_client.as_ref(),
-        std::time::Duration::from_secs(settings.mcp_index_wait_secs),
-        settings.llm.agentic_rag,
-        settings.llm.agentic_rag_max_turns,
-        settings.llm.agentic_rag_max_chunk_chars,
+        repo_filter,
+        &req.query,
+        req.top_k,
+        req.rerank,
     )
     .await
     {

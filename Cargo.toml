@@ -8,6 +8,16 @@ edition = "2024"
 # Pin the server binary as the default so the bench binary is opt-in via --bin.
 default-run = "context-engine-rs"
 
+# `bench-query` is a self-contained CLI that boots the engine through the SAME
+# shared `engine_boot::boot_engine` the server uses, then runs remove/rebuild/
+# index/query through the SAME `engine_ops` fns — so it can never drift from the
+# server. The dir is `src/bin/bench_query/` (snake_case, like chunk_bench's auto-
+# discovered dir); this explicit [[bin]] just renames the artifact to the
+# hyphenated `bench-query` invoked by the `bench-small-repo` justfile recipe.
+[[bin]]
+name = "bench-query"
+path = "src/bin/bench_query/main.rs"
+
 [dependencies]
 ignore = "0.4"
 notify = "8"
