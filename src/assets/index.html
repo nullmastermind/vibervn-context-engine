@@ -4957,7 +4957,7 @@ function appendAssistantTurn() {
 
   const status = document.createElement('div');
   status.className = 'chat-status flex items-center gap-2 text-xs text-gray-400 dark:text-wiki-text-muted';
-  status.innerHTML = '<span class="inline-block w-3 h-3 rounded-full border-2 border-gray-300 dark:border-wiki-border border-t-blue-500 animate-spin"></span><span>' + escHtml(t('chat.thinking')) + '</span>';
+  status.innerHTML = '<span class="inline-block w-3 h-3 rounded-full border-2 border-gray-300 dark:border-wiki-border border-t-blue-500 animate-spin"></span><span>' + escHtml(t('chat.thinking')) + '</span><span class="chat-elapsed font-mono tabular-nums text-gray-400 dark:text-wiki-text-muted">0.0s</span>';
 
   const answer = document.createElement('div');
   answer.className = 'chat-answer chat-md max-w-[85%] rounded-lg px-3 py-2 text-sm break-words bg-gray-100 text-gray-900 dark:bg-wiki-surface dark:text-wiki-text hidden';
@@ -4967,7 +4967,20 @@ function appendAssistantTurn() {
   row.appendChild(answer);
   msgs.appendChild(row);
   chatScrollToBottom();
-  return { row, steps, status, answer };
+
+  const turn = { row, steps, status, answer };
+  // Tick a live elapsed-seconds readout beside "Thinking…" until the status row goes away.
+  const startedAt = performance.now();
+  const elapsedEl = status.querySelector('.chat-elapsed');
+  turn.timer = setInterval(() => {
+    if (elapsedEl) elapsedEl.textContent = ((performance.now() - startedAt) / 1000).toFixed(1) + 's';
+  }, 100);
+  return turn;
+}
+
+// Stop the elapsed-time ticker (idempotent) — call before/whenever the status row is removed.
+function stopChatTimer(turn) {
+  if (turn && turn.timer) { clearInterval(turn.timer); turn.timer = null; }
 }
 
 function toolLabel(name) {
@@ -5017,6 +5030,7 @@ function markToolDone(step, ok) {
 }
 
 function setTurnError(turn, message) {
+  stopChatTimer(turn);
   if (turn.status) turn.status.remove();
   turn.answer.classList.remove('hidden');
   turn.answer.className = 'chat-answer max-w-[85%] rounded-lg px-3 py-2 text-sm whitespace-pre-wrap break-words bg-red-50 text-red-700 border border-red-200 dark:bg-red-900/20 dark:text-red-300 dark:border-red-800';
@@ -5083,13 +5097,14 @@ async function sendChat() {
     if (!turn.answer.textContent && !turn.row.querySelector('.chat-answer:not(.hidden)')) {
       // If we never got a terminal event, clean up the spinner gracefully.
       if (turn.status && document.body.contains(turn.status)) {
-        if (gotToken) { turn.status.remove(); }
+        if (gotToken) { stopChatTimer(turn); turn.status.remove(); }
         else { setTurnError(turn, t('chat.connErr')); }
       }
     }
   } catch (e) {
     if (e && e.name === 'AbortError') {
       // Dialog closed mid-stream — nothing to show.
+      stopChatTimer(turn);
     } else {
       setTurnError(turn, t('chat.connErr'));
     }
@@ -5119,6 +5134,7 @@ function handleChatEvent(turn, ev, activeSteps, gotToken) {
     }
     case 'token': {
       if (turn.status) {
+        stopChatTimer(turn);
         turn.status.remove();
         turn.status = null;
       }
@@ -5129,7 +5145,7 @@ function handleChatEvent(turn, ev, activeSteps, gotToken) {
       return true;
     }
     case 'done': {
-      if (turn.status) { turn.status.remove(); turn.status = null; }
+      if (turn.status) { stopChatTimer(turn); turn.status.remove(); turn.status = null; }
       return false;
     }
     case 'error': {

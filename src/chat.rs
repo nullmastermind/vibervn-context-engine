@@ -222,6 +222,123 @@ fn truncate_bytes(s: &str, max_bytes: usize) -> String {
     format!("{}…", &s[..end])
 }
 
+// ─── Project documentation injection (orientation context) ────────────────
+
+/// The project docs we seed into the system prompt, matched case-insensitively
+/// at the repo ROOT only. A fixed allowlist — never a user-supplied name — so
+/// the repo path (which comes from MCP/user input) can never be used to read an
+/// arbitrary file: we only ever read `<root>/<one-of-these>`.
+const PROJECT_DOC_NAMES: [&str; 3] = ["readme.md", "agents.md", "claude.md"];
+/// Per-file byte cap. Files larger than this are truncated on a line boundary
+/// with a marker so the model knows it saw only the head of the file.
+const PROJECT_DOC_PER_FILE_CAP: usize = 12 * 1024;
+/// Total byte cap across all injected docs combined. Bounds the cost the FIRST
+/// turn pays regardless of how big the repo's docs are (later turns ride the
+/// system-prompt cache, so they pay nothing).
+const PROJECT_DOC_TOTAL_CAP: usize = 24 * 1024;
+
+/// Truncate `content` to at most `max_bytes` on a LINE boundary (never mid-line)
+/// and append a ` … [truncated]` marker when anything was cut, so the model can
+/// tell the doc is partial. Returns the content unchanged when it already fits.
+fn truncate_doc_by_lines(content: &str, max_bytes: usize) -> String {
+    if content.len() <= max_bytes {
+        return content.to_owned();
+    }
+    let mut out = String::new();
+    for line in content.lines() {
+        // +1 for the '\n' we re-add; stop before exceeding the cap. If the very
+        // first line already overflows the cap we emit just the marker rather
+        // than splitting mid-line.
+        if out.len() + line.len() + 1 > max_bytes {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str("… [truncated]");
+    out
+}
+
+/// Read the repo's orientation docs (README/AGENTS/CLAUDE) from its root and
+/// build a single reference block for the system prompt. Returns `""` when none
+/// exist or none are readable — the caller appends nothing in that case, so the
+/// system prompt stays clean.
+///
+/// Safety / robustness contract:
+/// - Only files whose name case-insensitively matches [`PROJECT_DOC_NAMES`] at
+///   the immediate root are read. Path traversal is impossible: we enumerate the
+///   root with `read_dir` and use the entry's own path, never a joined string.
+/// - Symlinks are skipped (`symlink_metadata` does not follow), so a planted
+///   link cannot redirect the read outside the repo.
+/// - Any failure (dir unreadable, file unreadable, non-UTF-8, non-regular) is
+///   skipped silently — collecting docs must never fail a chat turn.
+/// - Output order is stable (README, then AGENTS, then CLAUDE) and bounded by
+///   the per-file and total caps.
+fn collect_project_docs(repo_root: &std::path::Path) -> String {
+    let Ok(entries) = std::fs::read_dir(repo_root) else {
+        return String::new();
+    };
+
+    // Map each present doc (by canonical lowercase name) to its path, so we can
+    // emit them in a fixed order regardless of directory iteration order.
+    let mut found: HashMap<&'static str, std::path::PathBuf> = HashMap::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let lower = name.to_ascii_lowercase();
+        let Some(&canonical) = PROJECT_DOC_NAMES.iter().find(|n| **n == lower) else {
+            continue;
+        };
+        // Reject anything that is not a regular file (dirs, symlinks). Using
+        // symlink_metadata means a symlink is seen AS a symlink and skipped,
+        // never followed outside the repo.
+        match entry.path().symlink_metadata() {
+            Ok(md) if md.is_file() => {
+                found.entry(canonical).or_insert_with(|| entry.path());
+            }
+            _ => continue,
+        }
+    }
+    if found.is_empty() {
+        return String::new();
+    }
+
+    let mut sections: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    for canonical in PROJECT_DOC_NAMES {
+        let Some(path) = found.get(canonical) else { continue };
+        // Non-UTF-8 or unreadable files are skipped silently.
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let display_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(canonical);
+        // Per-file cap, then trim to the remaining total budget on a line
+        // boundary so the combined block never exceeds the total cap.
+        let mut body = truncate_doc_by_lines(raw, PROJECT_DOC_PER_FILE_CAP);
+        let remaining = PROJECT_DOC_TOTAL_CAP.saturating_sub(total);
+        if remaining == 0 {
+            break;
+        }
+        if body.len() > remaining {
+            body = truncate_doc_by_lines(&body, remaining);
+        }
+        total += body.len();
+        sections.push(format!("--- {display_name} ---\n{body}"));
+    }
+
+    if sections.is_empty() {
+        return String::new();
+    }
+    sections.join("\n\n")
+}
+
 // ─── Tool definitions (the ONLY two the agent may call) ───────────────────
 
 /// Build the two allowed tool definitions. `workspace_full_path` is fixed to the
@@ -270,8 +387,8 @@ fn tool_defs() -> Vec<ToolDef> {
     ]
 }
 
-fn system_prompt(repo: &str) -> String {
-    format!(
+fn system_prompt(repo: &str, project_docs: &str) -> String {
+    let mut prompt = format!(
         "You are a helpful assistant answering questions about a single software repository \
 located at `{repo}`.\n\n\
 You have exactly two tools: `{TOOL_CODEBASE}` (semantic search over the whole repo index) and \
@@ -305,6 +422,13 @@ come back empty — and even then, state it as \"I could not find X via search\"
 - You decide how many searches are enough — use as many tool calls as the question needs (you \
 have a limited budget of rounds, so make each search count and stop once the blast radius is \
 truly exhausted).\n\
+- HONOR EXPLICIT SEARCH INSTRUCTIONS: if the user explicitly tells you how to search — e.g. \
+\"search N times\", \"search at least N times\", \"do more searches\", \"keep digging\", \"cover \
+the blast radius\" — treat that as a hard floor, not a suggestion. Issue at least that many \
+DISTINCT `{TOOL_CODEBASE}` searches (each with different wording or a different graph/file hop, \
+never the same query repeated) before you produce a final answer, even if you feel one search \
+already answered it. The user asked for breadth; give it to them. Only the round budget above may \
+cut this short.\n\
 - Pure chit-chat or meta turns (e.g. \"thanks\", \"explain that again\") do not need a new search \
 — answer from the conversation so far.\n\n\
 Answering:\n\
@@ -321,7 +445,28 @@ plausible-sounding details. Partial-but-honest beats complete-but-wrong.\n\
 context for this question (and suggest the user rephrase or name a specific file) rather than \
 fabricating an answer.\n\
 - Answer in the same language the user asked in. Keep technical terms in their original form."
-    )
+    );
+
+    // Seed the model with the repo's orientation docs (README/AGENTS/CLAUDE), if
+    // present. These give it the project's intent up front so it isn't searching
+    // from zero. They are reference material, NOT a substitute for verifying code
+    // behavior — but because they are real files at known paths, the model MAY
+    // cite them directly (e.g. `README.md#L1-20`) like any other evidence.
+    if !project_docs.trim().is_empty() {
+        prompt.push_str(
+            "\n\n\
+Project documentation (read these first for orientation):\n\
+The following are the repository's own docs, included verbatim (possibly truncated). \
+Use them to understand the project's purpose, structure, and conventions before you search. \
+They are reference material — for any claim about how the CODE actually behaves you must still \
+verify with a search and cite `path#Lstart-end`. You MAY cite these doc files directly by their \
+path when a claim rests on their content. A doc marked `… [truncated]` was cut on a line boundary \
+— search or use `file-retrieval` if you need the rest.\n\n",
+        );
+        prompt.push_str(project_docs);
+    }
+
+    prompt
 }
 
 // ─── Tool dispatch (hard-locked to the two allowed tools) ─────────────────
@@ -397,6 +542,85 @@ fn preview(text: &str) -> String {
     } else {
         let truncated: String = trimmed.chars().take(PREVIEW_CHARS).collect();
         format!("{truncated}…")
+    }
+}
+
+// ─── Explicit search-count floor (user-directed search depth) ─────────────
+
+/// Upper bound on the search floor a user message may demand. The loop budget
+/// is [`MAX_TURNS`]; we leave at least one round for the model to synthesize a
+/// final answer, so a user can never pin every round to a forced tool call.
+const MAX_REQUESTED_SEARCHES: usize = (MAX_TURNS as usize) - 1;
+
+/// Parse an explicit "search N times" style instruction out of the user's
+/// message and return the number of DISTINCT codebase searches they demand as a
+/// hard floor (clamped to [`MAX_REQUESTED_SEARCHES`]). Returns `None` when the
+/// message contains no such directive — the normal model-decides path.
+///
+/// This is deliberately a HARD lever, not a prompt hint: when it returns
+/// `Some(n)`, the loop keeps `tool_choice: required` on until `n` distinct
+/// searches have actually run, so the model physically cannot answer early
+/// (the provider refuses to emit prose under `required`). Matches en/vi/zh
+/// phrasings; recognizes ASCII digits and a few common number words. Conservative
+/// by design — when unsure it returns `None` and we fall back to the model's
+/// judgment rather than over-forcing an ordinary question.
+fn requested_search_floor(message: &str) -> Option<usize> {
+    let lower = message.to_lowercase();
+    // Only engage when the user is plainly talking about searching/looking, so
+    // an unrelated number in the question ("fix bug 3") never triggers forcing.
+    const SEARCH_CUES: [&str; 8] =
+        ["search", "queries", "query", "tìm", "tra cứu", "搜索", "查", "检索"];
+    if !SEARCH_CUES.iter().any(|c| lower.contains(c)) {
+        return None;
+    }
+
+    // Tokenize on non-alphanumerics, scan for a number adjacent (within a small
+    // window) to a search/count cue. "search 3 times", "tìm 3 lần", "search at
+    // least 3", "do 5 searches", "搜索3次" (the digit splits out as its own token).
+    let toks: Vec<&str> = message
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    const COUNT_CUES: [&str; 9] = [
+        "search", "searches", "times", "queries", "query", "lần", "lan", "次", "遍",
+    ];
+    let mut best: Option<usize> = None;
+    for (i, tok) in toks.iter().enumerate() {
+        let Some(n) = parse_count_token(tok) else { continue };
+        if n == 0 {
+            continue;
+        }
+        // A number counts only if a search/count cue sits within 2 tokens either
+        // side — "search 3 times" (cue before) or "3 searches" (cue after).
+        let lo = i.saturating_sub(2);
+        let hi = (i + 3).min(toks.len());
+        let near_cue = toks[lo..hi].iter().enumerate().any(|(j, t)| {
+            lo + j != i && {
+                let tl = t.to_lowercase();
+                COUNT_CUES.iter().any(|c| tl == *c || tl.starts_with(c))
+            }
+        });
+        if near_cue {
+            best = Some(best.map_or(n, |b| b.max(n)));
+        }
+    }
+    best.map(|n| n.clamp(1, MAX_REQUESTED_SEARCHES))
+}
+
+/// Parse one token as a small positive integer: ASCII digits, or a handful of
+/// number words (en/vi/zh) up to the cap we care about.
+fn parse_count_token(tok: &str) -> Option<usize> {
+    if let Ok(n) = tok.parse::<usize>() {
+        return Some(n);
+    }
+    match tok.to_lowercase().as_str() {
+        "two" | "hai" | "二" | "两" => Some(2),
+        "three" | "ba" | "三" => Some(3),
+        "four" | "bốn" | "bon" | "四" => Some(4),
+        "five" | "năm" | "nam" | "五" => Some(5),
+        "six" | "sáu" | "sau" | "六" => Some(6),
+        "seven" | "bảy" | "bay" | "七" => Some(7),
+        _ => None,
     }
 }
 
@@ -522,7 +746,19 @@ pub async fn run_chat_turn(
     tx: &mpsc::UnboundedSender<ChatEvent>,
 ) {
     let tools = tool_defs();
-    let system = system_prompt(repo);
+    // Read the repo's orientation docs (README/AGENTS/CLAUDE) fresh each turn so
+    // they reflect the current files; reading is just 3 small root files, and the
+    // result lands in the system prompt, which is cached under `cache_key`, so
+    // turns 2+ on this conversation re-use it at no token cost. Off the async
+    // runtime via spawn_blocking — std fs is blocking. Normalize the repo path so
+    // we read the canonical root (matches how the rest of the engine keys repos).
+    let project_docs = {
+        let root = std::path::PathBuf::from(crate::store::normalize_repo_path(repo));
+        tokio::task::spawn_blocking(move || collect_project_docs(&root))
+            .await
+            .unwrap_or_default()
+    };
+    let system = system_prompt(repo, &project_docs);
     let cache_key = format!("repo-chat-{}", crate::store::sanitize_repo_name(repo));
 
     // Seed the working context with the prior transcript + this question. The
@@ -538,7 +774,37 @@ pub async fn run_chat_turn(
     // the NEXT turn can reuse them. Capped again at store time.
     let mut turn_tool_context = String::new();
 
+    // HARD search floor: if the user explicitly asked for N searches ("search 3
+    // times", "tìm 3 lần", "搜索3次"), force `tool_choice: required` until N
+    // DISTINCT codebase searches have actually run — the provider then refuses to
+    // emit a final answer early, so the directive can't be silently ignored.
+    // `None` = no such instruction → the model decides as before.
+    let search_floor = requested_search_floor(message);
+    // Distinct codebase-retrieval queries run so far this turn (normalized), so
+    // the model can't satisfy the floor by repeating the same query.
+    let mut distinct_searches: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     for _turn in 0..MAX_TURNS {
+        // Force a tool call while the user-requested search floor is unmet. This
+        // is the wire-level lever (`tool_choice: required`), not a prompt hint:
+        // under it the model physically cannot return prose, so it must search.
+        let force_tool_use = match search_floor {
+            Some(n) => distinct_searches.len() < n,
+            None => false, // the model decides when to search; the prompt drives it
+        };
+
+        // `tool_choice: required` only guarantees SOME tool is called, not which.
+        // While the floor is unmet we therefore also NARROW the offered tools to
+        // codebase-search alone — forced-to-call + only-one-tool = a guaranteed
+        // codebase search that advances the floor. Without this the model could
+        // burn every forced round on `file-retrieval` and never satisfy the floor.
+        // Once the floor is met, the full tool set (incl. graph/file hops) returns.
+        let turn_tools: Vec<ToolDef> = if force_tool_use {
+            tools.iter().filter(|t| t.name == TOOL_CODEBASE).cloned().collect()
+        } else {
+            tools.clone()
+        };
+
         // Stream this turn. Text deltas are forwarded live as Token events.
         let token_tx = tx.clone();
         let on_token = move |t: &str| {
@@ -549,9 +815,9 @@ pub async fn run_chat_turn(
             .complete_with_tools_streaming(
                 &system,
                 &messages,
-                &tools,
+                &turn_tools,
                 0.2,
-                false, // the model decides when to search; the prompt drives it
+                force_tool_use,
                 Some(&cache_key),
                 &on_token,
             )
@@ -579,6 +845,19 @@ pub async fn run_chat_turn(
                     });
 
                     let (out, ok) = run_tool(deps, repo, &call.name, &call.args).await;
+
+                    // Count a DISTINCT, successful codebase search toward the
+                    // user-requested floor. Normalized so the model can't satisfy
+                    // "search 3 times" by issuing the same query thrice.
+                    if ok
+                        && call.name == TOOL_CODEBASE
+                        && let Some(q) = call.args.get("information_request").and_then(|v| v.as_str())
+                    {
+                        let norm = q.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+                        if !norm.is_empty() {
+                            distinct_searches.insert(norm);
+                        }
+                    }
 
                     let _ = tx.send(ChatEvent::ToolResult {
                         name: call.name.clone(),
@@ -722,6 +1001,37 @@ mod tests {
     #[test]
     fn preview_keeps_short_text() {
         assert_eq!(preview("  hello  "), "hello");
+    }
+
+    #[test]
+    fn search_floor_parses_explicit_counts() {
+        // en
+        assert_eq!(requested_search_floor("git features, search 3 times"), Some(3));
+        assert_eq!(requested_search_floor("do 5 searches please"), Some(5));
+        assert_eq!(requested_search_floor("search at least three times"), Some(3));
+        // vi
+        assert_eq!(requested_search_floor("các tính năng git, search 3 lần"), Some(3));
+        assert_eq!(requested_search_floor("tìm 4 lần để cover blast radius"), Some(4));
+        // zh (digit splits from 次 as its own token via the alphanumeric split)
+        assert_eq!(requested_search_floor("搜索 3 次"), Some(3));
+    }
+
+    #[test]
+    fn search_floor_ignores_unrelated_numbers() {
+        // No search cue → never engage.
+        assert_eq!(requested_search_floor("fix bug 3 in the parser"), None);
+        // Search cue but no count near it → no floor.
+        assert_eq!(requested_search_floor("search the codebase for the parser"), None);
+        // Number present but not adjacent to a count/search cue.
+        assert_eq!(requested_search_floor("search for the 42nd handler signature"), None);
+    }
+
+    #[test]
+    fn search_floor_clamps_to_budget() {
+        // A huge request is clamped to MAX_REQUESTED_SEARCHES, never the raw N.
+        assert_eq!(requested_search_floor("search 99 times"), Some(MAX_REQUESTED_SEARCHES));
+        // Zero is meaningless and ignored.
+        assert_eq!(requested_search_floor("search 0 times"), None);
     }
 
     #[tokio::test]
@@ -910,6 +1220,120 @@ mod tests {
             "total injected context must be bounded; got {} bytes",
             ctx.len()
         );
+    }
+
+    // ─── Project documentation injection ──────────────────────────────────
+
+    #[test]
+    fn truncate_doc_keeps_short_unchanged() {
+        let s = "line one\nline two\n";
+        assert_eq!(truncate_doc_by_lines(s, 1024), s);
+    }
+
+    #[test]
+    fn truncate_doc_cuts_on_line_boundary_with_marker() {
+        let s = "aaaa\nbbbb\ncccc\ndddd\n"; // each line 4 chars + newline
+        let t = truncate_doc_by_lines(s, 12);
+        assert!(t.ends_with("… [truncated]"));
+        // No partial line survives: every non-marker line is a whole original line.
+        for line in t.lines() {
+            if line == "… [truncated]" {
+                continue;
+            }
+            assert!(["aaaa", "bbbb", "cccc", "dddd"].contains(&line), "got partial line {line:?}");
+        }
+        // Bounded: kept content (excluding marker) stays under the cap.
+        assert!(t.len() <= 12 + "… [truncated]".len());
+    }
+
+    #[test]
+    fn collect_docs_empty_when_none_present() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        assert_eq!(collect_project_docs(dir.path()), "");
+    }
+
+    #[test]
+    fn collect_docs_reads_three_in_stable_order() {
+        let dir = tempfile::tempdir().unwrap();
+        // Write in a deliberately non-canonical order to prove output is sorted
+        // README → AGENTS → CLAUDE regardless of dir iteration order.
+        std::fs::write(dir.path().join("CLAUDE.md"), "claude body").unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "agents body").unwrap();
+        std::fs::write(dir.path().join("README.md"), "readme body").unwrap();
+        let out = collect_project_docs(dir.path());
+        let r = out.find("README.md").unwrap();
+        let a = out.find("AGENTS.md").unwrap();
+        let c = out.find("CLAUDE.md").unwrap();
+        assert!(r < a && a < c, "docs must be ordered README→AGENTS→CLAUDE");
+        assert!(out.contains("readme body") && out.contains("agents body") && out.contains("claude body"));
+    }
+
+    #[test]
+    fn collect_docs_matches_case_insensitively() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("readme.md"), "lower readme").unwrap();
+        let out = collect_project_docs(dir.path());
+        assert!(out.contains("lower readme"));
+        // Header uses the on-disk name verbatim.
+        assert!(out.contains("--- readme.md ---"));
+    }
+
+    #[test]
+    fn collect_docs_skips_directories_and_empty_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory named like a doc must not be read.
+        std::fs::create_dir(dir.path().join("AGENTS.md")).unwrap();
+        // An empty/whitespace doc contributes nothing.
+        std::fs::write(dir.path().join("CLAUDE.md"), "   \n  ").unwrap();
+        std::fs::write(dir.path().join("README.md"), "real readme").unwrap();
+        let out = collect_project_docs(dir.path());
+        assert!(out.contains("real readme"));
+        assert!(!out.contains("--- AGENTS.md ---"));
+        assert!(!out.contains("--- CLAUDE.md ---"));
+    }
+
+    #[test]
+    fn collect_docs_skips_non_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        // Invalid UTF-8 bytes — read_to_string fails, file is skipped silently.
+        std::fs::write(dir.path().join("README.md"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "valid claude").unwrap();
+        let out = collect_project_docs(dir.path());
+        assert!(!out.contains("--- README.md ---"));
+        assert!(out.contains("valid claude"));
+    }
+
+    #[test]
+    fn collect_docs_enforces_total_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        // Each file near the per-file cap; all three combined exceed the total
+        // cap, so the block must be trimmed to the total budget.
+        let big = "line of text padding padding padding\n".repeat(400); // > per-file cap
+        std::fs::write(dir.path().join("README.md"), &big).unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), &big).unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), &big).unwrap();
+        let out = collect_project_docs(dir.path());
+        // Allow headroom for the three section headers + truncation markers.
+        let slack = 3 * ("--- README.md ---\n".len() + "… [truncated]".len() + 8);
+        assert!(
+            out.len() <= PROJECT_DOC_TOTAL_CAP + slack,
+            "combined docs must respect the total cap; got {} bytes",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn system_prompt_omits_doc_section_when_empty() {
+        let p = system_prompt("/repo", "");
+        assert!(!p.contains("Project documentation"));
+    }
+
+    #[test]
+    fn system_prompt_includes_docs_when_present() {
+        let p = system_prompt("/repo", "--- README.md ---\nhello world");
+        assert!(p.contains("Project documentation"));
+        assert!(p.contains("hello world"));
     }
 }
 
