@@ -1,6 +1,6 @@
 [package]
 name = "context-engine-rs"
-version = "0.1.46"
+version = "0.1.47"
 edition = "2024"
 # The benchmark harness lives in src/bin/chunk_bench.rs as a second binary.
 # Without default-run, `cargo run`/`cargo watch -x 'run -r'` becomes ambiguous
