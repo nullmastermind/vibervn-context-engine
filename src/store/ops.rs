@@ -304,6 +304,85 @@ pub async fn delete_files_data_bulk(db: &Surreal<Db>, paths: &[String]) -> Resul
     Ok(())
 }
 
+/// Bulk-delete per-file data for the INCREMENTAL pipeline path, deliberately
+/// EXCLUDING the `calls` table.
+///
+/// WHY a separate function (and not `delete_files_data_bulk`): the bulk helper
+/// wipes `calls WHERE in_file IN $paths OR out_file IN $paths` — i.e. it destroys
+/// every INCOMING edge to a changed file as well as its outgoing edges. For a
+/// file that thousands of others call, a comment-only edit (which changes ZERO
+/// symbols) would then force all those thousands of incoming edges to be deleted
+/// and re-resolved, even though not one of them could possibly have changed.
+///
+/// The incremental Phase-2 (`resolve_edges_incremental`) instead deletes `calls`
+/// SURGICALLY: only the `in_file` rows of files in the computed resolve_set
+/// (changed files + callers of surface-changed files + callers of newly-added
+/// names). So the `calls` deletion is intentionally deferred to that step and
+/// MUST NOT happen here, or the surface-unchanged fast path would lose its win.
+///
+/// Everything else (the 4 non-`calls` relation tables, symbols, chunks,
+/// `raw_edge`, `file_meta`) is deleted exactly as `delete_files_data_bulk` does —
+/// those are re-written wholesale by `streaming_index` for the changed files and
+/// are not the source of the blast-radius blow-up.
+///
+/// `delete_files_data_bulk` itself is left untouched: the server's single-file
+/// delete (`server.rs`) genuinely removes a file and MUST wipe its incoming
+/// edges too, so it keeps using the OR-deleting bulk helper.
+pub async fn delete_files_data_incremental(db: &Surreal<Db>, paths: &[String]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+
+    // Non-`calls` relation tables (both directions). These are re-derived
+    // synchronously during streaming_index for the changed files, so wiping the
+    // changed files' rows on both ends is correct and bounded by the change set.
+    db.query("DELETE FROM uses WHERE in_file IN $paths OR out_file IN $paths")
+        .bind(("paths", paths.to_vec()))
+        .await
+        .context("incremental delete uses")?;
+
+    db.query("DELETE FROM imports WHERE in_file IN $paths OR out_file IN $paths")
+        .bind(("paths", paths.to_vec()))
+        .await
+        .context("incremental delete imports")?;
+
+    db.query("DELETE FROM contains WHERE in_file IN $paths OR out_file IN $paths")
+        .bind(("paths", paths.to_vec()))
+        .await
+        .context("incremental delete contains")?;
+
+    db.query("DELETE FROM implements WHERE in_file IN $paths OR out_file IN $paths")
+        .bind(("paths", paths.to_vec()))
+        .await
+        .context("incremental delete implements")?;
+
+    // Symbols.
+    db.query("DELETE FROM symbol WHERE file IN $paths")
+        .bind(("paths", paths.to_vec()))
+        .await
+        .context("incremental delete symbols")?;
+
+    // Chunks.
+    db.query("DELETE FROM chunk WHERE file IN $paths")
+        .bind(("paths", paths.to_vec()))
+        .await
+        .context("incremental delete chunks")?;
+
+    // Raw edge staging rows for affected files (re-added by streaming_index).
+    db.query("DELETE FROM raw_edge WHERE from_file IN $paths")
+        .bind(("paths", paths.to_vec()))
+        .await
+        .context("incremental delete raw_edge")?;
+
+    // file_meta.
+    db.query("DELETE FROM file_meta WHERE path IN $paths")
+        .bind(("paths", paths.to_vec()))
+        .await
+        .context("incremental delete file_meta")?;
+
+    Ok(())
+}
+
 /// Delete ALL data — used for full rebuild.
 pub async fn delete_all_data(db: &Surreal<Db>) -> Result<()> {
     // Edges first.
@@ -1163,7 +1242,7 @@ fn strip_symbol_ref(s: &str) -> Option<String> {
 /// them in `⟨` / `⟩` angle brackets. When projected with `meta::id(id) AS fqn`,
 /// a record whose ID is `symbol:⟨/foo.rs::bar⟩` returns `fqn = "⟨/foo.rs::bar⟩"`.
 /// This helper strips those brackets to recover the plain FQN string.
-fn strip_id_brackets(id: &str) -> String {
+pub(crate) fn strip_id_brackets(id: &str) -> String {
     id.strip_prefix("⟨")
         .and_then(|s| s.strip_suffix("⟩"))
         .unwrap_or(id)

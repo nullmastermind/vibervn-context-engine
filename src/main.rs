@@ -80,6 +80,8 @@ async fn main() {
     } = match boot_engine(BootOptions {
         data_dir: cli.data_dir.clone(),
         embeddings_dir: cli.embeddings_dir.clone(),
+        // Server keeps watchers ON — auto-reindex on edits is the whole point.
+        no_watchers: false,
     })
     .await
     {

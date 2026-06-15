@@ -24,7 +24,7 @@ use crate::parsing::parse_file;
 use crate::parsing::relations::{EdgeKind, EdgeTarget};
 use crate::parsing::symbols::Symbol;
 use crate::store::ops::{
-    FileMeta, delete_all_data, delete_files_data_bulk, get_all_file_meta,
+    FileMeta, delete_all_data, delete_files_data_incremental, get_all_file_meta,
     get_meta, set_meta, upsert_file_meta, find_symbols_by_names_with_pos, SymbolWithPos,
 };
 use crate::store::build_index_concurrently;
@@ -53,6 +53,24 @@ const PARSE_CHANNEL_CAP: usize = 64;
 
 /// Embed-output channel capacity (from embed stage to writer).
 const EMBED_CHANNEL_CAP: usize = 64;
+
+/// Number of resolve_set files whose scoped `calls` deletes are grouped into ONE
+/// `BEGIN/COMMIT` transaction during incremental Phase-2 edge resolution.
+///
+/// Each file contributes two single-value indexed-equality DELETE statements
+/// (`WHERE in_file = $f` and `WHERE out_file = $f` — both point-seeks on
+/// idx_calls_in_file / idx_calls_out_file). The previous code ran each statement
+/// in its OWN auto-commit, so a 2748-file resolve_set paid 5496 RocksDB
+/// commit+fsyncs (~39ms fixed apiece → 215685ms at kernel scale, commit-bound).
+/// Batching CALLS_DELETE_TXN_CHUNK files per transaction collapses that to
+/// ceil(resolve_set / chunk) commits (~14 for 2748 files) while keeping every
+/// delete an indexed point seek — measured 53018ms (~4x faster) in
+/// `delete_strategy_probe` at full kernel scale, deleting the IDENTICAL row set.
+/// 200 keeps each transaction's statement string (2×200 short statements) and
+/// its uncommitted tombstone set well within the pinned 32 MiB RocksDB write
+/// buffer; larger chunks risk a write-buffer flush mid-transaction with no
+/// further commit-amortization gain.
+const CALLS_DELETE_TXN_CHUNK: usize = 200;
 
 /// A chunk row ready for bulk INSERT via native SurrealDB value construction.
 ///
@@ -231,6 +249,65 @@ pub struct IndexPipelineStats {
     pub phase2_idx_rebuild_ms: u64,
     /// Number of resolved `calls` edges written.
     pub phase2_edges_written: u64,
+
+    // ─── Incremental-path per-stage breakdown ────────────────────────────────
+    // The incremental run (parse→embed→store of only the changed files, then a
+    // blast-radius edge re-resolution) previously emitted NO per-stage timing —
+    // `run` returned `..Default::default()` for everything but indexed/total
+    // files. These fields fill that gap so a single "PERF SUMMARY incremental"
+    // line attributes the incremental wall time to its constituent stages and
+    // the dominant cost is provable. 0 on the full-rebuild path.
+    /// Manual-path walk + detect_changes (the spawn_blocking in `run`). 0 when
+    /// the change set is watcher-supplied (no walk performed).
+    pub incr_walk_ms: u64,
+    /// `get_all_file_meta` load at the top of `run` (ms).
+    pub incr_meta_load_ms: u64,
+    /// Pre-delete caller query in `incremental_run` (ms).
+    pub incr_predelete_callers_ms: u64,
+    /// `delete_files_data_bulk` for all affected files (ms).
+    pub incr_delete_bulk_ms: u64,
+    /// `streaming_index` call in `incremental_run` (parse→embed→store) (ms).
+    pub incr_streaming_ms: u64,
+    /// Total `resolve_edges_incremental` wall time (ms).
+    pub incr_phase2_total_ms: u64,
+    /// Phase-2 sub: the `SELECT name FROM symbol WHERE file IN $files` query (ms).
+    pub incr_p2_symname_ms: u64,
+    /// Phase-2 sub: the `SELECT from_file FROM raw_edge WHERE to_name IN $names`
+    /// direction-2 expansion scan (ms). PRIME SUSPECT — timed in isolation.
+    pub incr_p2_dir2_scan_ms: u64,
+    /// Phase-2 sub: the scoped `DELETE FROM calls` (ms).
+    pub incr_p2_delete_calls_ms: u64,
+    /// Phase-2 sub: the raw_edge keyset scan + resolve loop + tail flush (ms).
+    pub incr_p2_reresolve_ms: u64,
+    /// Phase-2 sub: final `resolve_set.len()` (a count, not a time — explains cost).
+    pub incr_resolve_set_size: u64,
+}
+
+/// Per-stage timings produced INSIDE `resolve_edges_incremental` and threaded up
+/// through `incremental_run` → `run`, mirroring how `Phase2Stats` is threaded for
+/// the full-rebuild path. All times in milliseconds; `resolve_set_size` is a count.
+#[derive(Default, Debug)]
+pub struct Phase2IncrStats {
+    pub p2_symname_ms: u64,
+    pub p2_dir2_scan_ms: u64,
+    pub p2_delete_calls_ms: u64,
+    pub p2_reresolve_ms: u64,
+    pub resolve_set_size: u64,
+}
+
+/// Per-stage timings produced INSIDE `incremental_run` and threaded up to `run`.
+/// All times in milliseconds.
+#[derive(Default, Debug)]
+pub struct IncrementalRunStats {
+    /// Time loading + diffing the OLD vs NEW per-file symbol surface (ms). This
+    /// is the new gating computation that replaces the unconditional pre-delete
+    /// caller scan; reported in the PERF SUMMARY as `incr_p2_symname_ms`.
+    pub surface_delta_ms: u64,
+    pub predelete_callers_ms: u64,
+    pub delete_bulk_ms: u64,
+    pub streaming_ms: u64,
+    pub phase2_total_ms: u64,
+    pub phase2: Phase2IncrStats,
 }
 
 /// Key used to track whether Phase 2 (raw edge resolution) has completed.
@@ -403,7 +480,9 @@ impl IndexPipeline {
         cancel_token: Option<CancellationToken>,
     ) -> Result<IndexPipelineStats> {
         // Check if first run (no file_meta at all).
+        let meta_load_start = Instant::now();
         let stored_meta = get_all_file_meta(db, &self.repo).await?;
+        let incr_meta_load_ms = meta_load_start.elapsed().as_millis() as u64;
         let is_first_run = stored_meta.is_empty();
 
         if is_first_run || force_rebuild {
@@ -500,10 +579,16 @@ impl IndexPipeline {
                 phase2_idx_drop_ms: stage_stats.phase2_idx_drop_ms,
                 phase2_idx_rebuild_ms: stage_stats.phase2_idx_rebuild_ms,
                 phase2_edges_written: stage_stats.phase2_edges_written,
+                // Incremental-path fields are 0 on the full-rebuild path.
+                ..Default::default()
             });
         }
 
         // Incremental run.
+        // Time the manual-path walk + detect_changes separately. 0 when the
+        // change set is watcher-supplied (no walk performed).
+        let walk_start = Instant::now();
+        let mut incr_walk_ms: u64 = 0;
         let file_changes = match changes {
             Some(explicit) => {
                 // Watcher-supplied explicit change set: skip the walk entirely.
@@ -521,7 +606,7 @@ impl IndexPipeline {
                     .iter()
                     .map(|m| (m.path.clone(), (m.mtime, m.size, m.chunker_version)))
                     .collect();
-                tokio::task::spawn_blocking(move || {
+                let changes = tokio::task::spawn_blocking(move || {
                     let all_files = walk_repo_with(&repo_clone, &ext_clone, &ign_clone, &ign_paths_clone);
                     crate::indexing::tracker::detect_changes(
                         &all_files,
@@ -530,7 +615,9 @@ impl IndexPipeline {
                     )
                 })
                 .await
-                .context("incremental walk spawn_blocking")?
+                .context("incremental walk spawn_blocking")?;
+                incr_walk_ms = walk_start.elapsed().as_millis() as u64;
+                changes
             }
         };
 
@@ -591,7 +678,7 @@ impl IndexPipeline {
             }
             let indexed = stored_meta.len() as u64;
             let total_files = stored_meta.len() as u64;
-            return Ok(IndexPipelineStats { indexed_files: indexed, total_files, ..Default::default() });
+            return Ok(IndexPipelineStats { indexed_files: indexed, total_files, incr_walk_ms, incr_meta_load_ms, ..Default::default() });
         }
 
         // For watcher-path (changes == Some), total_files comes from stored_meta (no walk).
@@ -606,21 +693,71 @@ impl IndexPipeline {
                 is_rebuild: false,
             });
         }
-        let (removed_files, new_vectors) = self.incremental_run(db, file_changes, progress.as_ref(), event_bus, key_hints, cancel_token.as_ref()).await?;
+        let (removed_files, new_vectors, incr_stats) = self.incremental_run(db, file_changes, progress.as_ref(), event_bus, key_hints, cancel_token.as_ref()).await?;
 
+        let vi_apply_start = Instant::now();
         if let Some(vi) = vector_index {
             let mut guard = vi.write().await;
             // Empty active set — see replace_repo call above for the rationale.
             // apply_incremental protects `self.repo` internally.
             guard.apply_incremental(&self.repo, &removed_files, &new_vectors, &[]);
         }
+        let incr_vi_apply_ms = vi_apply_start.elapsed().as_millis() as u64;
         // Incremental changed the in-RAM shard → invalidate the persisted file
         // (O(1)); it is rebuilt + re-persisted on the next cold warm. We do NOT
         // rewrite the multi-GB file per incremental edit (would be O(repo)).
         self.invalidate_persisted_shard();
 
+        let post_meta_start = Instant::now();
         let indexed = get_all_file_meta(db, &self.repo).await?.len() as u64;
-        Ok(IndexPipelineStats { indexed_files: indexed, total_files, ..Default::default() })
+        let incr_post_meta_ms = post_meta_start.elapsed().as_millis() as u64;
+
+        // Per-stage PERF SUMMARY for the incremental path, mirroring the
+        // full_rebuild summary above. This is the breakdown that was previously
+        // missing — it attributes the incremental wall time to walk / meta-load /
+        // pre-delete / bulk-delete / streaming / phase2 (and phase2's sub-stages)
+        // so the dominant cost is greppable in one line.
+        let incr_phase2_total_ms = incr_stats.phase2_total_ms;
+        let p2 = &incr_stats.phase2;
+        // `incr_p2_symname_ms` now carries the surface-delta (load+diff) time —
+        // the gating computation that replaced the old unconditional symbol-name
+        // query. `p2.p2_symname_ms` is always 0 now (the query moved up here).
+        let incr_surface_delta_ms = incr_stats.surface_delta_ms;
+        info!(
+            repo = %self.repo,
+            incr_walk_ms,
+            incr_meta_load_ms,
+            incr_predelete_callers_ms = incr_stats.predelete_callers_ms,
+            incr_delete_bulk_ms = incr_stats.delete_bulk_ms,
+            incr_streaming_ms = incr_stats.streaming_ms,
+            incr_phase2_total_ms,
+            incr_p2_symname_ms = incr_surface_delta_ms,
+            incr_p2_dir2_scan_ms = p2.p2_dir2_scan_ms,
+            incr_p2_delete_calls_ms = p2.p2_delete_calls_ms,
+            incr_p2_reresolve_ms = p2.p2_reresolve_ms,
+            incr_resolve_set_size = p2.resolve_set_size,
+            incr_vi_apply_ms,
+            incr_post_meta_ms,
+            files = indexed,
+            "PERF SUMMARY incremental"
+        );
+
+        Ok(IndexPipelineStats {
+            indexed_files: indexed,
+            total_files,
+            incr_walk_ms,
+            incr_meta_load_ms,
+            incr_predelete_callers_ms: incr_stats.predelete_callers_ms,
+            incr_delete_bulk_ms: incr_stats.delete_bulk_ms,
+            incr_streaming_ms: incr_stats.streaming_ms,
+            incr_phase2_total_ms,
+            incr_p2_symname_ms: incr_surface_delta_ms,
+            incr_p2_dir2_scan_ms: p2.p2_dir2_scan_ms,
+            incr_p2_delete_calls_ms: p2.p2_delete_calls_ms,
+            incr_p2_reresolve_ms: p2.p2_reresolve_ms,
+            incr_resolve_set_size: p2.resolve_set_size,
+            ..Default::default()
+        })
     }
 
     // ─── Full rebuild ─────────────────────────────────────────────────────
@@ -710,7 +847,8 @@ impl IndexPipeline {
         event_bus: Option<&IndexEventBus>,
         key_hints: &[String],
         cancel_token: Option<&CancellationToken>,
-    ) -> Result<(Vec<String>, Vec<(ChunkId, Vec<f32>)>)> {
+    ) -> Result<(Vec<String>, Vec<(ChunkId, Vec<f32>)>, IncrementalRunStats)> {
+        let mut run_stats = IncrementalRunStats::default();
         let to_process: Vec<String> = changes
             .iter()
             .filter(|c| c.kind != ChangeKind::Deleted)
@@ -728,41 +866,42 @@ impl IndexPipeline {
             .cloned()
             .collect();
 
-        // Pre-compute: unchanged callers currently pointing INTO the affected files.
-        // These calls rows will be destroyed by delete_files_data_bulk below, so
-        // we must capture them NOW — before the delete — to avoid losing the
-        // "removal direction" (Scenario A: target removes symbol, caller must re-resolve).
-        use serde::Deserialize;
-        #[derive(Deserialize)]
-        struct PreDeleteCallerRow { in_file: String }
-        let pre_delete_caller_rows: Vec<PreDeleteCallerRow> = db
-            .query(
-                "SELECT in_file FROM calls \
-                 WHERE out_file IN $files AND in_file NOT IN $files \
-                 GROUP BY in_file",
-            )
-            .bind(("files", all_affected.clone()))
+        // ── Capture the OLD symbol surface of the modified files BEFORE deleting ──
+        // their symbols. The surface is the set of (leaf_name, fqn) pairs each file
+        // defines — precisely the part that can change any caller's `calls`
+        // resolution. We diff it against the NEW surface (after streaming_index
+        // re-writes the symbols) to gate the blast radius: a comment/body-only edit
+        // leaves the surface IDENTICAL, so direction-1 (callers of surface-changed
+        // files) and direction-2 (callers of newly-added names) both collapse to
+        // empty and the resolve_set is exactly the changed files.
+        let surface_start = Instant::now();
+        let old_surface = load_file_surface(db, &to_process)
             .await
-            .context("incremental_run: pre-delete caller query")?
-            .take(0)?;
-        let pre_delete_callers: Vec<String> = pre_delete_caller_rows
-            .into_iter()
-            .map(|r| r.in_file)
-            .collect();
+            .context("incremental_run: load old symbol surface")?;
+        run_stats.surface_delta_ms = surface_start.elapsed().as_millis() as u64;
 
-        // Bulk-delete all affected files (O(tables) round-trips instead of O(files)).
-        delete_files_data_bulk(db, &all_affected)
+        // Delete affected files' data EXCEPT `calls` (incremental helper). The
+        // `calls` deletion is deferred to resolve_edges_incremental, scoped to the
+        // computed resolve_set — wiping incoming edges here (as the OR-deleting
+        // bulk helper does) is exactly the blow-up we are fixing.
+        let delete_bulk_start = Instant::now();
+        delete_files_data_incremental(db, &all_affected)
             .await
-            .context("incremental_run: delete_files_data_bulk")?;
+            .context("incremental_run: delete_files_data_incremental")?;
+        run_stats.delete_bulk_ms = delete_bulk_start.elapsed().as_millis() as u64;
 
         // Stream parse → embed → write.
         // Raw edges go to DB (crash-safe incremental path).
+        let streaming_start = Instant::now();
         let (chunk_vectors, _stage_stats, _ram_edges, _overflowed, _ram_symbols) = self
             .streaming_index(&to_process, db, progress, event_bus, key_hints, false, cancel_token)
             .await
             .context("incremental_run: streaming_index")?;
+        run_stats.streaming_ms = streaming_start.elapsed().as_millis() as u64;
 
-        // Delete file_meta for deleted files.
+        // Delete file_meta for deleted files (their symbols/chunks/raw_edge were
+        // already cleared by delete_files_data_incremental; this is belt-and-braces
+        // for the genuinely-removed files which streaming_index does not re-add).
         for file in &to_delete {
             let escaped = escape_surreal(file);
             db.query(format!(
@@ -772,22 +911,69 @@ impl IndexPipeline {
             .context("incremental_run: delete file_meta for deleted file")?;
         }
 
-        // Phase 2: resolve only edges touching the changed files — O(changed + callers_of_changed).
+        // ── Compute the surface delta now that NEW symbols are written ──────────
+        // removed_surface_files = modified files that LOST/MOVED a (name,fqn) pair,
+        // plus every deleted file (these gate direction-1). added_names = leaf names
+        // that gained a (name,fqn) pair (these gate direction-2). A pure-addition or
+        // surface-unchanged file appears in NEITHER gate's file set.
+        let surface_start2 = Instant::now();
+        let new_surface = load_file_surface(db, &to_process)
+            .await
+            .context("incremental_run: load new symbol surface")?;
+        let delta = compute_surface_delta(&old_surface, &new_surface, &to_process, &to_delete);
+        run_stats.surface_delta_ms += surface_start2.elapsed().as_millis() as u64;
+
+        // ── Direction-1: callers pointing INTO a file that REMOVED/MOVED a symbol ─
+        // Only a file that LOST a `(name, fqn)` pair (or was deleted) can have
+        // orphaned a pre-existing incoming edge, so direction-1 is gated on
+        // `removed_surface_files`. A file that only GAINED symbols, or whose surface
+        // is unchanged, contributes NO dir1 callers — its (possibly thousands of)
+        // incoming edges all still point at still-existing, still-winning symbols
+        // and stay out of the resolve_set. Pure additions are handled solely by
+        // direction-2 (`added_names`). The query runs against the still-intact
+        // `calls` table (the incremental delete left `calls` untouched). Skipped
+        // entirely when nothing was removed — the common comment/add-symbol cases.
+        let predelete_start = Instant::now();
+        let dir1_callers: Vec<String> = if delta.removed_surface_files.is_empty() {
+            Vec::new()
+        } else {
+            #[derive(Deserialize)]
+            struct CallerRow { in_file: String }
+            let rows: Vec<CallerRow> = db
+                .query(
+                    "SELECT in_file FROM calls \
+                     WHERE out_file IN $changed AND in_file NOT IN $affected \
+                     GROUP BY in_file",
+                )
+                .bind(("changed", delta.removed_surface_files.clone()))
+                .bind(("affected", all_affected.clone()))
+                .await
+                .context("incremental_run: direction-1 caller query")?
+                .take(0)?;
+            rows.into_iter().map(|r| r.in_file).collect()
+        };
+        run_stats.predelete_callers_ms = predelete_start.elapsed().as_millis() as u64;
+
+        // Phase 2: resolve only edges in the gated blast radius —
+        // O(changed + callers_of_removed_surface + callers_of_added_names).
         if let Some(bus) = event_bus {
             bus.emit(IndexEvent::Phase2Start { repo: self.repo.clone() });
         }
         let phase2_start = Instant::now();
-        self.resolve_edges_incremental(db, &all_affected, &pre_delete_callers)
+        let phase2_stats = self
+            .resolve_edges_incremental(db, &all_affected, &dir1_callers, &delta.added_names)
             .await
             .context("incremental_run: resolve_edges_incremental")?;
+        run_stats.phase2_total_ms = phase2_start.elapsed().as_millis() as u64;
+        run_stats.phase2 = phase2_stats;
         if let Some(bus) = event_bus {
             bus.emit(IndexEvent::Phase2Done {
                 repo: self.repo.clone(),
-                elapsed_ms: phase2_start.elapsed().as_millis() as u64,
+                elapsed_ms: run_stats.phase2_total_ms,
             });
         }
 
-        Ok((all_affected, chunk_vectors))
+        Ok((all_affected, chunk_vectors, run_stats))
     }
 
     // ─── Streaming parse→embed→write pipeline ────────────────────────────
@@ -2252,25 +2438,53 @@ impl IndexPipeline {
 
     // ─── Incremental Phase 2: scoped edge resolution ──────────────────────
 
-    /// Re-resolve only the edges that touch `changed_files`.
+    /// Re-resolve only the edges that touch the blast radius of an edit.
     ///
-    /// Complexity: O(changed + callers_of_changed) — proportional to the blast
-    /// radius of the edit, not to the total repo size.
+    /// Complexity: O(changed + callers_of_removed_surface + callers_of_added_names)
+    /// — proportional to the ACTUAL symbol-surface change, NOT to the call-fan-in
+    /// of the edited file. A comment/body-only edit (which changes zero symbols)
+    /// resolves to O(changed): `dir1_callers` and `added_names` are both empty, so
+    /// the resolve_set is exactly the changed files and every incoming edge to them
+    /// survives untouched. A genuine API change pays the honest cost of re-resolving
+    /// exactly the callers it can affect.
     ///
-    /// Algorithm (Approach A from spec):
-    ///   1. Accept `pre_delete_callers`: unchanged files that previously had calls
-    ///      edges pointing into the changed set. These were captured by the caller
-    ///      BEFORE `delete_files_data_bulk` ran (the bulk delete removes those calls
-    ///      rows, so querying after the delete would miss the "removal direction").
-    ///   2. Build `resolve_set = changed_files ∪ pre_delete_callers` (deduped).
-    ///   3. Direction-2 expansion: a changed file may have GAINED a symbol whose
-    ///      name matches an edge in an unchanged caller. That caller's resolution can
-    ///      now pick a different target (the new file wins the lex-first tie-break),
-    ///      so we include it in the resolve set even though it never pointed into the
-    ///      changed file before.
-    ///   4. DELETE FROM calls WHERE in_file IN resolve_set OR out_file IN resolve_set.
-    ///      Uses the existing idx_calls_in_file / idx_calls_out_file indexes — O(changed).
-    ///   5. Re-resolve raw_edge rows WHERE from_file IN resolve_set via keyset
+    /// The blast radius is computed by the caller (`incremental_run`) from the
+    /// per-file symbol-surface delta and handed in as two gates:
+    ///
+    ///   - `dir1_callers` ("removal/identity direction"): unchanged files that had
+    ///     a `calls` edge pointing INTO a file that REMOVED or MOVED a `(name, fqn)`
+    ///     pair (or was deleted). Their resolved target may now be stale, so they
+    ///     re-resolve. A file that only GAINED symbols, or whose surface is
+    ///     unchanged, contributes NO dir1 caller — its incoming edges still point at
+    ///     still-existing, still-winning symbols. (A same-name overload ADDED to a
+    ///     file is handled by direction-2 via its leaf name, not direction-1.)
+    ///
+    ///   - `added_names` ("new target now wins" / direction-2): leaf names that
+    ///     GAINED a `(name, fqn)` pair in the changed set. A newly-added name can win
+    ///     a tie-break for an unchanged caller that never pointed into the changed
+    ///     file. We expand to those callers via `raw_edge.to_name`. Names that were
+    ///     already present (unchanged) cannot change any caller's resolution and are
+    ///     NOT expanded — the previous code expanded for ALL names defined in the
+    ///     changed files, which is what blew the resolve_set up to thousands of files
+    ///     on a comment edit.
+    ///
+    /// Algorithm:
+    ///   1. resolve_set = changed_files ∪ dir1_callers ∪ {from_file of any raw_edge
+    ///      whose to_name ∈ added_names}.
+    ///   2. DELETE the `calls` rows whose `in_file` is in resolve_set, per-file
+    ///      `WHERE in_file = $f` (a point seek on idx_calls_in_file), batched into
+    ///      transactions. We delete the OUTGOING edges of resolve_set files ONLY
+    ///      (in_file), NOT incoming (out_file): every file whose incoming edges
+    ///      could have changed is ITSELF a resolve_set member as a from_file (its
+    ///      outgoing edges are deleted+re-resolved here), or it points into a
+    ///      surface-changed/deleted file and is therefore a dir1/dir2 caller (also
+    ///      a resolve_set member, also deleted+re-resolved). An out_file delete
+    ///      would additionally destroy incoming edges from files OUTSIDE resolve_set
+    ///      — exactly the surface-unchanged callers whose edges must survive — and
+    ///      those would never be re-resolved (their from_file is not in resolve_set,
+    ///      and at repo scale their `raw_edge` rows aren't even persisted). So the
+    ///      in_file-only delete is both correct AND the lever that bounds the cost.
+    ///   3. Re-resolve raw_edge rows WHERE from_file IN resolve_set via keyset
     ///      pagination (uses idx_raw_edge_from_file).
     ///
     /// The `edges_resolved` crash-recovery marker is NOT written here — it is only
@@ -2282,53 +2496,43 @@ impl IndexPipeline {
         &self,
         db: &Surreal<Db>,
         changed_files: &[String],
-        pre_delete_callers: &[String],
-    ) -> Result<()> {
+        dir1_callers: &[String],
+        added_names: &[String],
+    ) -> Result<Phase2IncrStats> {
         use serde::Deserialize;
 
+        let mut stats = Phase2IncrStats::default();
+
         if changed_files.is_empty() {
-            return Ok(());
+            return Ok(stats);
         }
 
-        // Step 1: Build resolve_set = changed_files ∪ pre_delete_callers (deduped).
+        // Step 1: Build resolve_set = changed_files ∪ dir1_callers (deduped).
         //
-        // pre_delete_callers was captured by incremental_run BEFORE delete_files_data_bulk
-        // ran, so it correctly captures the "removal direction":
-        //   - X→bar resolved to W (out_file=W). W removes bar.
-        //   - delete_files_data_bulk deletes X's calls row (out_file=W).
-        //   - Querying calls WHERE out_file IN [W] AFTER the bulk delete → empty.
-        //   - But pre_delete_callers already contains X, so X enters the resolve set.
+        // dir1_callers was computed by incremental_run as the callers pointing into
+        // SURFACE-CHANGED (or deleted) files — the "removal/identity direction". A
+        // surface-unchanged changed file contributes no dir1 callers, so its
+        // thousands of incoming edges stay out of the resolve_set.
         let mut resolve_set: Vec<String> = changed_files.to_vec();
-        for caller in pre_delete_callers {
+        for caller in dir1_callers {
             if !resolve_set.contains(caller) {
                 resolve_set.push(caller.clone());
             }
         }
 
-        // Direction 2: "new target now wins" — a changed file may have GAINED a symbol
-        // whose name matches an edge in an unchanged caller. That caller's resolution can
-        // now pick a different target (the new file wins the lex-first tie-break), so we
-        // must include it in the resolve set even though it never pointed into the changed
-        // file before.
+        // Direction 2: "new target now wins". `added_names` are the leaf names that
+        // GAINED a (name, fqn) pair in the changed set (computed from the surface
+        // delta by incremental_run). A newly-added name can win a tie-break for an
+        // unchanged caller, so we pull those callers in via raw_edge.to_name. Names
+        // that were unchanged are NOT in added_names and are not expanded — this is
+        // the narrowing that keeps a comment edit's resolve_set == changed_files.
         //
-        // Step: collect the leaf names now defined in the changed files (the ORIGINAL
-        // changed_files parameter, NOT the already-expanded resolve_set — we want names
-        // that were added/changed, not the transitive set).
-        // We query by leaf `name` and look up raw_edge.to_name, which still stores the
-        // unresolved leaf callee name — this is correct for direction-2 expansion.
-        #[derive(Deserialize)]
-        struct SymbolNameRow { name: String }
-        let new_symbol_rows: Vec<SymbolNameRow> = db
-            .query("SELECT name FROM symbol WHERE file IN $files GROUP BY name")
-            .bind(("files", changed_files.to_vec()))
-            .await
-            .context("incremental phase2: collect symbol names in changed files")?
-            .take(0)?;
-
-        if !new_symbol_rows.is_empty() {
-            let new_names: Vec<String> = new_symbol_rows.into_iter().map(|r| r.name).collect();
-
-            // Find callers that target any of those names via raw_edge.to_name.
+        // NOTE: `p2_symname_ms` is no longer measured here — the symbol-surface
+        // load+diff that produces `added_names` now happens once in incremental_run
+        // (its time is reported as the surface-delta stage), so this method just
+        // consumes the precomputed result.
+        if !added_names.is_empty() {
+            // Find callers that target any added name via raw_edge.to_name.
             // raw_edge.to_name stores the unresolved leaf callee name, so this correctly
             // finds any file that calls a symbol with the given leaf name — including files
             // whose existing calls row points to a different definition (stale lex-first target).
@@ -2336,12 +2540,14 @@ impl IndexPipeline {
             // by the number of edges with matching callee names.
             #[derive(Deserialize)]
             struct FromFileRow { from_file: String }
+            let dir2_start = Instant::now();
             let name_exp_rows: Vec<FromFileRow> = db
                 .query("SELECT from_file FROM raw_edge WHERE to_name IN $names GROUP BY from_file")
-                .bind(("names", new_names))
+                .bind(("names", added_names.to_vec()))
                 .await
                 .context("incremental phase2: name-based expansion via raw_edge")?
                 .take(0)?;
+            stats.p2_dir2_scan_ms = dir2_start.elapsed().as_millis() as u64;
 
             for row in name_exp_rows {
                 if !resolve_set.contains(&row.from_file) {
@@ -2356,17 +2562,56 @@ impl IndexPipeline {
             resolve_set = resolve_set.len(),
             "incremental phase2: resolve_set built"
         );
+        stats.resolve_set_size = resolve_set.len() as u64;
 
-        // Step 2: Delete only the calls rows that touch the resolve set.
-        // Uses idx_calls_in_file + idx_calls_out_file — O(resolve_set).
-        db.query("DELETE FROM calls WHERE in_file IN $files OR out_file IN $files")
-            .bind(("files", resolve_set.clone()))
-            .await
-            .context("incremental phase2: delete scoped calls")?;
+        // Step 2: Delete only the OUTGOING calls rows of resolve_set files.
+        //
+        // CORRECTNESS: we delete `WHERE in_file = $f` for each resolve_set file —
+        // its outgoing edges — and re-resolve them below from raw_edge. We do NOT
+        // delete `WHERE out_file = $f` (incoming edges). Every calls row that could
+        // have CHANGED is an outgoing edge of SOME resolve_set member:
+        //   - a changed file's own outgoing edges → it is in resolve_set (changed);
+        //   - an edge into a surface-changed/deleted file from an unchanged caller →
+        //     that caller is a dir1_caller (in resolve_set), so the edge is its
+        //     outgoing edge and is deleted+re-resolved here;
+        //   - an edge whose resolution could flip to a newly-added name → its caller
+        //     is a dir2 expansion (in resolve_set), same as above.
+        // An incoming edge to a SURFACE-UNCHANGED changed file is NOT touched: its
+        // caller is not in resolve_set, it still points at a still-existing,
+        // still-winning symbol, and (at repo scale) that caller's raw_edge isn't
+        // even persisted — so re-resolving it would be both unnecessary and lossy.
+        // This in_file-only scoping is what makes the comment-edit cost O(changed).
+        //
+        // PERF (measured, isolated probe `delete_strategy_probe`, REAL schema +
+        // idx_calls_in_file, at full kernel scale): per-file `WHERE in_file = $f`
+        // is a POINT SEEK on idx_calls_in_file. Batching CALLS_DELETE_TXN_CHUNK
+        // files per BEGIN/COMMIT amortizes the per-commit fsync (~39ms) ~200x vs
+        // auto-commit-per-statement. A bare `WHERE in_file IN $list` does NOT
+        // range-scan cleanly in SurrealDB 2.6.5 (~O(list×rows)); per-file equality
+        // avoids that. Distinct $p{i} binds keep every file value parameterized
+        // (no injection, no per-row re-parse of the path string).
+        let delete_calls_start = Instant::now();
+        for chunk in resolve_set.chunks(CALLS_DELETE_TXN_CHUNK) {
+            let mut stmt = String::from("BEGIN;\n");
+            for i in 0..chunk.len() {
+                stmt.push_str(&format!("DELETE FROM calls WHERE in_file = $p{i};\n"));
+            }
+            stmt.push_str("COMMIT;");
+            let mut q = db.query(&stmt);
+            for (i, file) in chunk.iter().enumerate() {
+                q = q.bind((format!("p{i}"), file.clone()));
+            }
+            q.await
+                .context("incremental phase2: delete scoped calls (batched txn)")?
+                .check()
+                .context("incremental phase2: delete scoped calls batch had errors")?;
+        }
+        stats.p2_delete_calls_ms = delete_calls_start.elapsed().as_millis() as u64;
 
         // Step 3: Re-resolve raw_edge rows whose from_file is in the resolve set.
         // Keyset-paginated with from_file filter — uses idx_raw_edge_from_file.
 
+        let reresolve_start = Instant::now();
         let page_size: i64 = WRITE_BATCH_SIZE as i64;
         let mut cursor = String::new();
         let mut edge_batch: Vec<(String, String, i64, String, String, String, String)> = Vec::new();
@@ -2409,10 +2654,145 @@ impl IndexPipeline {
                 .await
                 .context("incremental phase2: flush tail edge batch")?;
         }
+        stats.p2_reresolve_ms = reresolve_start.elapsed().as_millis() as u64;
 
         info!(repo = %self.repo, resolve_set = resolve_set.len(), "incremental Phase 2 edge resolution complete");
-        Ok(())
+        Ok(stats)
     }
+}
+
+// ─── Incremental blast-radius gating: symbol-surface delta ────────────────
+
+/// The "symbol surface" of one file: the set of `(leaf_name, fqn)` pairs the file
+/// defines. This is precisely the part of a file's symbols that can affect how
+/// ANY caller's `calls` edge resolves:
+///
+/// - resolution buckets candidates by leaf `name` (`resolve_raw_edge_page`),
+///   so a name that is added/removed changes which candidates exist;
+/// - the chosen candidate is identified by its `fqn` (the RELATE endpoint), so
+///   a changed fqn changes the resolved target identity.
+///
+/// A symbol whose `(name, fqn)` pair is unchanged cannot change any caller's
+/// resolution. Line numbers are deliberately EXCLUDED: `calls` stores the
+/// call-site `line` from the CALLER (not the target's definition line — see the
+/// RELATE in `flush_edge_batch`/`insert_edge`), and `fqn` does not embed a line
+/// (`QualifiedSymbol::fqn` = file::scope::name). So a comment/body edit that only
+/// shifts a file's symbols up/down by N lines, keeping their `(name, fqn)` pairs
+/// identical, produces an IDENTICAL surface and an empty delta.
+type FileSurface = HashMap<String, HashSet<(String, String)>>;
+
+/// Result of diffing the OLD vs NEW symbol surface of a set of changed files.
+///
+/// The two fields gate the two independent ways an edit can invalidate a `calls`
+/// edge — and they are deliberately ASYMMETRIC, because addition and removal have
+/// asymmetric effects on resolution:
+///
+/// - REMOVING (or moving) a `(name, fqn)` pair can orphan a caller that resolved
+///   to exactly that fqn → its edge must re-resolve (direction-1).
+/// - ADDING a pair can only ever make some caller of that *leaf name* newly
+///   prefer the changed file (a tie-break win) → direction-2 re-resolves the
+///   callers of the added *names*, wherever they are. A pure addition of a name
+///   nobody calls (or a uniquely-named symbol) pulls in NOBODY.
+///
+/// Crucially, a file that ONLY GAINED symbols has every pre-existing incoming
+/// edge still pointing at a still-existing, still-winning fqn — so it is NOT
+/// direction-1 material. Conflating "added" into the direction-1 gate is what made
+/// a 10-file add-symbol burst re-resolve 2748 callers (157s) for nothing.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SurfaceDelta {
+    /// Files that REMOVED or MOVED at least one `(name, fqn)` pair (a pair present
+    /// in OLD but absent in NEW), PLUS every genuinely-deleted file. These are the
+    /// only files whose pre-existing INCOMING edges can have become stale, so
+    /// direction-1 (`dir1_callers`) is gated on exactly this set. A file that only
+    /// gained symbols, or whose surface is unchanged, is NOT here.
+    removed_surface_files: Vec<String>,
+    /// Leaf names that GAINED a `(name, fqn)` pair somewhere in the changed set
+    /// (brand-new name, new overload of an existing name, or a scope move that
+    /// produced a new fqn). A newly-added name can win a lex/locality tie-break
+    /// for an UNCHANGED caller that never pointed into the changed file — that is
+    /// the only way an ADDITION can pull an unrelated caller into the blast radius,
+    /// so direction-2 name-expansion is narrowed to exactly these names. Names that
+    /// only LOST pairs are NOT here: removing a losing candidate can never make a
+    /// caller newly prefer the changed file (it only matters for callers that
+    /// already pointed INTO it, which direction-1 covers).
+    added_names: Vec<String>,
+}
+
+/// Compute the blast-radius gates from the per-file OLD and NEW symbol surfaces.
+///
+/// `deleted_files` are files removed from the repo entirely (no NEW surface);
+/// they are always "removed surface" (their incoming edges are now dangling) and
+/// contribute no added names.
+///
+/// Pure and deterministic (sorted outputs) so it is unit-testable in isolation
+/// and the oracle can assert on it. Bounded by the number of changed files and
+/// their symbols — never touches the whole repo.
+fn compute_surface_delta(
+    old: &FileSurface,
+    new: &FileSurface,
+    modified_files: &[String],
+    deleted_files: &[String],
+) -> SurfaceDelta {
+    let empty: HashSet<(String, String)> = HashSet::new();
+    let mut removed_surface_files: Vec<String> = Vec::new();
+    let mut added_pairs_names: HashSet<String> = HashSet::new();
+
+    for file in modified_files {
+        let old_set = old.get(file).unwrap_or(&empty);
+        let new_set = new.get(file).unwrap_or(&empty);
+        // Direction-1 gate: did this file LOSE (or move) any pair? Pure additions
+        // do NOT qualify — their pre-existing incoming edges are all still valid.
+        if old_set.difference(new_set).next().is_some() {
+            removed_surface_files.push(file.clone());
+        }
+        // Direction-2 feed: added pairs = NEW minus OLD; their leaf names expand.
+        for (name, fqn) in new_set.difference(old_set) {
+            let _ = fqn; // fqn distinguishes the pair; the name drives expansion.
+            added_pairs_names.insert(name.clone());
+        }
+    }
+
+    // Deleted files: always removed-surface (dangling incoming edges), no adds.
+    for file in deleted_files {
+        removed_surface_files.push(file.clone());
+    }
+
+    removed_surface_files.sort_unstable();
+    removed_surface_files.dedup();
+    let mut added_names: Vec<String> = added_pairs_names.into_iter().collect();
+    added_names.sort_unstable();
+
+    SurfaceDelta { removed_surface_files, added_names }
+}
+
+/// Load the per-file symbol surface (`(name, fqn)` pairs) for a set of files in
+/// ONE indexed query. Returns a map keyed by file path; files with no symbols are
+/// simply absent (callers treat absence as the empty set). Uses `file IN $files`
+/// (idx_symbol_file) — bounded by the changed set's symbol count, never the repo.
+async fn load_file_surface(db: &Surreal<Db>, files: &[String]) -> Result<FileSurface> {
+    let mut surface: FileSurface = HashMap::new();
+    if files.is_empty() {
+        return Ok(surface);
+    }
+    #[derive(Deserialize)]
+    struct Row {
+        file: String,
+        name: String,
+        fqn: String,
+    }
+    let rows: Vec<Row> = db
+        .query("SELECT file, name, meta::id(id) AS fqn FROM symbol WHERE file IN $files")
+        .bind(("files", files.to_vec()))
+        .await
+        .context("load_file_surface")?
+        .take(0)?;
+    for r in rows {
+        // meta::id returns the bracketed complex id; strip to the plain fqn so OLD
+        // (from DB) and NEW (also from DB, post-streaming) compare apples-to-apples.
+        let fqn = crate::store::ops::strip_id_brackets(&r.fqn);
+        surface.entry(r.file).or_default().insert((r.name, fqn));
+    }
+    Ok(surface)
 }
 
 // ─── Phase 2: in-memory symbol map helpers ───────────────────────────────
@@ -4378,12 +4758,14 @@ mod incremental_phase2_tests {
         // Run incremental Phase 2 for changed file B.
         // pre_delete_callers is empty here because we're calling resolve_edges_incremental
         // directly (bypassing incremental_run). The test's scenario has A pointing at B,
-        // and the direction-1 path (A was a caller of B) is covered by pre_delete_callers
-        // in production; here we pass empty and verify that A is still found because
-        // it still has a surviving calls row pointing at B when we call this method
-        // (we did not call delete_files_data_bulk in this direct-call test).
+        // and the direction-1 path is gated on a surface change. Here B's symbol
+        // surface is UNCHANGED (b_fn stays), so dir1_callers and added_names are
+        // both empty: resolve_set = [B]. We delete only B's OUTGOING edge (B→C)
+        // and re-resolve it; A→B is an INCOMING edge to B and is left untouched
+        // (it still points at the still-existing b_fn). Net result is identical to
+        // the full rebuild, but the blast radius is just the changed file.
         let changed = vec!["/b.rs".to_string()];
-        pipeline.resolve_edges_incremental(&db, &changed, &[])
+        pipeline.resolve_edges_incremental(&db, &changed, &[], &[])
             .await
             .expect("incremental phase2 must succeed");
 
@@ -4471,12 +4853,14 @@ mod incremental_phase2_tests {
         insert_symbol(&db, "/a_defines_foo.rs", "foo").await;
 
         // Run incremental Phase 2 with changed_files = [W].
-        // pre_delete_callers is empty: X never pointed into W (W didn't exist yet),
-        // so the pre-delete query would return nothing for this scenario. Direction-2
-        // expansion (name-based) is what finds X here.
+        // dir1_callers is empty: X never pointed into W (W didn't exist yet), so the
+        // direction-1 caller query would return nothing for this scenario. W's
+        // surface GAINED the name `foo`, so added_names = ["foo"]; direction-2
+        // name-expansion (raw_edge.to_name = foo) is what finds X here and re-points
+        // X→foo to W (the new lex-first winner).
         let changed = vec!["/a_defines_foo.rs".to_string()];
         pipeline
-            .resolve_edges_incremental(&db, &changed, &[])
+            .resolve_edges_incremental(&db, &changed, &[], &["foo".to_string()])
             .await
             .expect("incremental phase2 must succeed");
 
@@ -4576,9 +4960,11 @@ mod incremental_phase2_tests {
         // came from X, not W, so W has no outgoing edges to re-add). W's symbol row
         // for bar is gone (deleted above). We do NOT re-add it.
 
-        // Step 4: resolve_edges_incremental with pre_delete_callers=[X].
+        // Step 4: resolve_edges_incremental with dir1_callers=[X], added_names=[].
+        // W's surface REMOVED `bar` (a removal, not an addition), so added_names is
+        // empty; X is the direction-1 caller (it pointed into W). X re-resolves to Y.
         pipeline
-            .resolve_edges_incremental(&db, &changed_files, &pre_delete_callers)
+            .resolve_edges_incremental(&db, &changed_files, &pre_delete_callers, &[])
             .await
             .expect("incremental phase2 must succeed");
 
@@ -4676,9 +5062,13 @@ mod incremental_phase2_tests {
         // Step 3: Re-index W — foo still present (no change to symbol row).
         // (Symbol already exists from initial setup; no action needed.)
 
-        // Step 4: resolve_edges_incremental([W], pre_delete_callers=[X]).
+        // Step 4: resolve_edges_incremental([W], dir1_callers=[X], added_names=[]).
+        // W KEEPS foo (surface unchanged in identity), but in production W is a
+        // surface-changed file in this scenario's framing — direction-1 supplies X
+        // so its bulk-deleted X→foo→W edge is re-resolved (back to W). added_names
+        // is empty (foo was already present — not a NEW pair).
         pipeline
-            .resolve_edges_incremental(&db, &changed_files, &pre_delete_callers)
+            .resolve_edges_incremental(&db, &changed_files, &pre_delete_callers, &[])
             .await
             .expect("incremental phase2 must succeed");
 
@@ -4700,6 +5090,402 @@ mod incremental_phase2_tests {
             final_calls.len(), 1,
             "must have exactly 1 calls edge; got {:?}", final_calls
         );
+    }
+}
+
+// ─── Correctness oracle: INCREMENTAL calls-set == FULL-REBUILD calls-set ────
+//
+// The most invariant-dense guard in the crate. For each edit scenario we build
+// the FINAL content from scratch (full rebuild) and snapshot its `calls` set,
+// then build the INITIAL content, full-rebuild it, and replay the edit through
+// the SAME DB-level sequence `incremental_run` uses (capture old surface →
+// incremental delete → re-write changed symbols/raw_edges → compute surface
+// delta → gated direction-1 query → resolve_edges_incremental). The two `calls`
+// sets MUST be EQUAL (order-insensitive). If the gating ever drops or mis-points
+// an edge, a scenario diverges and fails.
+//
+// raw_edge is populated for ALL files (not just changed ones), exactly as the
+// task requires, so unchanged callers can re-resolve in the direction-1/2 paths.
+// (Production's RAM-path full rebuild leaves raw_edge empty for unchanged files —
+// an orthogonal pre-existing limitation that only affects genuine API-change
+// incrementals, never the gated comment/body-only case where no caller is pulled
+// in. The oracle isolates and proves the GATING logic itself.)
+#[cfg(test)]
+mod incremental_correctness_oracle {
+    use super::*;
+    use crate::store::open_db;
+    use crate::store::ops::delete_files_data_incremental;
+    use serde::Deserialize;
+    use tempfile::TempDir;
+
+    #[derive(Clone)]
+    struct SymDef { file: String, name: String, fqn: String, line_start: i64, line_end: i64 }
+    #[derive(Clone)]
+    struct EdgeDef { from_file: String, from_name: String, from_fqn: String, to_name: String, line: i64 }
+
+    #[derive(Clone, Default)]
+    struct RepoState { syms: Vec<SymDef>, edges: Vec<EdgeDef> }
+
+    impl RepoState {
+        fn sym(mut self, file: &str, name: &str, line_start: i64) -> Self {
+            self.syms.push(SymDef {
+                file: file.to_string(),
+                name: name.to_string(),
+                fqn: format!("{file}::{name}"),
+                line_start,
+                line_end: line_start + 5,
+            });
+            self
+        }
+        /// A symbol with an explicit fqn (for overloads / scope moves where the
+        /// leaf name repeats but the fqn must differ).
+        #[allow(dead_code)]
+        fn sym_fqn(mut self, file: &str, name: &str, fqn: &str, line_start: i64) -> Self {
+            self.syms.push(SymDef {
+                file: file.to_string(),
+                name: name.to_string(),
+                fqn: fqn.to_string(),
+                line_start,
+                line_end: line_start + 5,
+            });
+            self
+        }
+        fn edge(mut self, from_file: &str, from_name: &str, to_name: &str, line: i64) -> Self {
+            self.edges.push(EdgeDef {
+                from_file: from_file.to_string(),
+                from_name: from_name.to_string(),
+                from_fqn: format!("{from_file}::{from_name}"),
+                to_name: to_name.to_string(),
+                line,
+            });
+            self
+        }
+    }
+
+    async fn ins_sym(db: &Surreal<Db>, s: &SymDef) {
+        db.query(format!(
+            "UPSERT symbol:`⟨{}⟩` SET name = '{}', kind = 'function', file = '{}', \
+             line_start = {}, line_end = {}, signature = NONE, parent = NONE",
+            s.fqn, s.name, s.file, s.line_start, s.line_end
+        ))
+        .await
+        .expect("ins_sym");
+    }
+
+    async fn ins_edge(db: &Surreal<Db>, e: &EdgeDef) {
+        use serde::Serialize;
+        #[derive(Serialize)]
+        struct RawEdge {
+            from_file: String,
+            from_name: String,
+            from_fqn: String,
+            to_name: String,
+            kind: String,
+            line: i64,
+        }
+        let rec = vec![RawEdge {
+            from_file: e.from_file.clone(),
+            from_name: e.from_name.clone(),
+            from_fqn: e.from_fqn.clone(),
+            to_name: e.to_name.clone(),
+            kind: "calls".to_string(),
+            line: e.line,
+        }];
+        db.query("INSERT INTO raw_edge $data RETURN NONE")
+            .bind(("data", rec))
+            .await
+            .expect("ins_edge");
+    }
+
+    async fn write_state(db: &Surreal<Db>, st: &RepoState) {
+        for s in &st.syms { ins_sym(db, s).await; }
+        for e in &st.edges { ins_edge(db, e).await; }
+    }
+
+    /// (in_file, out_file, in_name, out_name) tuples, sorted — an order-insensitive
+    /// snapshot of the `calls` table.
+    async fn calls_set(db: &Surreal<Db>) -> Vec<(String, String, String, String)> {
+        #[derive(Deserialize)]
+        struct Row { in_file: String, out_file: String, in_name: Option<String>, out_name: Option<String> }
+        let rows: Vec<Row> = db
+            .query("SELECT in_file, out_file, in_name, out_name FROM calls")
+            .await.unwrap().take(0).unwrap();
+        let mut v: Vec<(String, String, String, String)> = rows.into_iter()
+            .map(|r| (r.in_file, r.out_file, r.in_name.unwrap_or_default(), r.out_name.unwrap_or_default()))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Full rebuild of `state` from scratch → its calls set.
+    async fn full_calls(repo: &str, state: &RepoState) -> Vec<(String, String, String, String)> {
+        let home = TempDir::new().unwrap();
+        let db = open_db(home.path(), repo, 0).await.unwrap();
+        let pipeline = IndexPipeline::new(repo.to_string(), None);
+        write_state(&db, state).await;
+        pipeline.resolve_edges_phase2(&db, None).await.expect("full phase2");
+        calls_set(&db).await
+    }
+
+    /// Build `initial`, full-rebuild it, then replay the edit to `final_state`
+    /// through the production incremental DB sequence → resulting calls set.
+    /// Returns (calls_set, removed_surface_files, added_names) so scenarios can
+    /// also assert the gating shape (e.g. comment edit ⇒ both empty).
+    async fn incremental_calls(
+        repo: &str,
+        initial: &RepoState,
+        final_state: &RepoState,
+        changed: &[&str],
+        deleted: &[&str],
+    ) -> (Vec<(String, String, String, String)>, Vec<String>, Vec<String>) {
+        let home = TempDir::new().unwrap();
+        let db = open_db(home.path(), repo, 0).await.unwrap();
+        let pipeline = IndexPipeline::new(repo.to_string(), None);
+
+        // Initial state + full resolve (this populates raw_edge for ALL files).
+        write_state(&db, initial).await;
+        pipeline.resolve_edges_phase2(&db, None).await.expect("initial full phase2");
+
+        let to_process: Vec<String> = changed.iter().map(|s| s.to_string()).collect();
+        let to_delete: Vec<String> = deleted.iter().map(|s| s.to_string()).collect();
+        let all_affected: Vec<String> = to_delete.iter().chain(to_process.iter()).cloned().collect();
+
+        // 1) capture OLD surface (before deleting changed files' symbols).
+        let old_surface = load_file_surface(&db, &to_process).await.unwrap();
+
+        // 2) incremental delete (everything EXCEPT calls).
+        delete_files_data_incremental(&db, &all_affected).await.unwrap();
+
+        // 3) simulate streaming_index: re-write FINAL symbols + raw_edges for the
+        //    changed (to_process) files only.
+        for s in &final_state.syms {
+            if to_process.contains(&s.file) { ins_sym(&db, s).await; }
+        }
+        for e in &final_state.edges {
+            if to_process.contains(&e.from_file) { ins_edge(&db, e).await; }
+        }
+
+        // 4) compute surface delta.
+        let new_surface = load_file_surface(&db, &to_process).await.unwrap();
+        let delta = compute_surface_delta(&old_surface, &new_surface, &to_process, &to_delete);
+
+        // 5) gated direction-1 caller query (mirrors incremental_run).
+        let dir1_callers: Vec<String> = if delta.removed_surface_files.is_empty() {
+            Vec::new()
+        } else {
+            #[derive(Deserialize)]
+            struct CallerRow { in_file: String }
+            let rows: Vec<CallerRow> = db
+                .query(
+                    "SELECT in_file FROM calls \
+                     WHERE out_file IN $changed AND in_file NOT IN $affected GROUP BY in_file",
+                )
+                .bind(("changed", delta.removed_surface_files.clone()))
+                .bind(("affected", all_affected.clone()))
+                .await.unwrap().take(0).unwrap();
+            rows.into_iter().map(|r| r.in_file).collect()
+        };
+
+        // 6) scoped incremental resolution.
+        pipeline
+            .resolve_edges_incremental(&db, &all_affected, &dir1_callers, &delta.added_names)
+            .await
+            .expect("incremental phase2");
+
+        (calls_set(&db).await, delta.removed_surface_files, delta.added_names)
+    }
+
+    /// The shared base world: two callers, two libs each defining `helper`
+    /// (lib_x lex-first wins), lib_x also defines `util`.
+    fn base_world() -> RepoState {
+        RepoState::default()
+            .sym("/caller_a.rs", "a_fn", 1)
+            .sym("/caller_b.rs", "b_fn", 1)
+            .sym("/lib_x.rs", "helper", 10)
+            .sym("/lib_x.rs", "util", 20)
+            .sym("/lib_z.rs", "helper", 10)
+            .edge("/caller_a.rs", "a_fn", "helper", 2)
+            .edge("/caller_b.rs", "b_fn", "helper", 3)
+            .edge("/caller_b.rs", "b_fn", "util", 4)
+    }
+
+    /// Scenario 1: comment/body-only edit — lib_x's symbols shift lines but the
+    /// (name, fqn) surface is IDENTICAL. MUST be fast (empty gates) AND correct.
+    #[tokio::test]
+    async fn oracle_comment_body_only_edit() {
+        let initial = base_world();
+        // lib_x edited: helper/util shifted down (comment inserted), same surface.
+        let mut final_state = RepoState::default()
+            .sym("/caller_a.rs", "a_fn", 1)
+            .sym("/caller_b.rs", "b_fn", 1)
+            .sym("/lib_x.rs", "helper", 13)   // +3 lines
+            .sym("/lib_x.rs", "util", 23)      // +3 lines
+            .sym("/lib_z.rs", "helper", 10);
+        final_state.edges = initial.edges.clone();
+        // lib_x's own call-site lines could shift too, but lib_x has no outgoing edges.
+
+        let full = full_calls("/oracle/comment", &final_state).await;
+        let (incr, removed_surface, added) =
+            incremental_calls("/oracle/comment", &initial, &final_state, &["/lib_x.rs"], &[]).await;
+
+        assert_eq!(
+            removed_surface, Vec::<String>::new(),
+            "comment/body-only edit MUST NOT mark any file removed-surface (got {:?})", removed_surface
+        );
+        assert_eq!(
+            added, Vec::<String>::new(),
+            "comment/body-only edit MUST add no names (got {:?})", added
+        );
+        assert_eq!(incr, full, "incremental != full after comment edit");
+    }
+
+    /// Scenario 2: add a NEW file defining `helper` that is lex-first → existing
+    /// unchanged callers must re-point to it (direction-2 must fire). This is a
+    /// PURE ADDITION: NOTHING was removed, so direction-1 must NOT fire — the work
+    /// is done entirely by direction-2 on the added name `helper`.
+    #[tokio::test]
+    async fn oracle_add_symbol_wins_tiebreak() {
+        let initial = base_world();
+        // lib_a (< lib_x, lib_z) is added defining helper. caller_a/b must repoint.
+        let mut final_state = initial.clone();
+        final_state = final_state.sym("/lib_a.rs", "helper", 10);
+
+        let full = full_calls("/oracle/add", &final_state).await;
+        let (incr, removed_surface, added) =
+            incremental_calls("/oracle/add", &initial, &final_state, &["/lib_a.rs"], &[]).await;
+
+        assert_eq!(removed_surface, Vec::<String>::new(),
+            "pure addition must NOT fire direction-1 (nothing removed); got {:?}", removed_surface);
+        assert!(added.contains(&"helper".to_string()),
+            "added_names must include helper; got {:?}", added);
+        assert_eq!(incr, full, "incremental != full after add-symbol");
+        // sanity: both callers now point at lib_a (via direction-2).
+        assert!(incr.iter().any(|(i, o, _, _)| i == "/caller_a.rs" && o == "/lib_a.rs"),
+            "caller_a must repoint to lib_a; got {:?}", incr);
+    }
+
+    /// Scenario 3: remove a symbol an unchanged caller targeted (direction-1).
+    #[tokio::test]
+    async fn oracle_remove_symbol_caller_repoints() {
+        let initial = base_world();
+        // lib_x removes helper (keeps util). caller_a/b helper edges → lib_z.
+        let final_state = RepoState::default()
+            .sym("/caller_a.rs", "a_fn", 1)
+            .sym("/caller_b.rs", "b_fn", 1)
+            .sym("/lib_x.rs", "util", 20)       // helper removed
+            .sym("/lib_z.rs", "helper", 10)
+            .edge("/caller_a.rs", "a_fn", "helper", 2)
+            .edge("/caller_b.rs", "b_fn", "helper", 3)
+            .edge("/caller_b.rs", "b_fn", "util", 4);
+
+        let full = full_calls("/oracle/remove", &final_state).await;
+        let (incr, removed_surface, added) =
+            incremental_calls("/oracle/remove", &initial, &final_state, &["/lib_x.rs"], &[]).await;
+
+        assert!(removed_surface.contains(&"/lib_x.rs".to_string()),
+            "lib_x removed helper → must fire direction-1; got {:?}", removed_surface);
+        assert_eq!(added, Vec::<String>::new(), "removal adds no names; got {:?}", added);
+        assert_eq!(incr, full, "incremental != full after remove-symbol");
+        assert!(incr.iter().any(|(i, o, _, _)| i == "/caller_a.rs" && o == "/lib_z.rs"),
+            "caller_a→helper must repoint to lib_z after lib_x removed helper; got {:?}", incr);
+    }
+
+    /// Scenario 4: rename a symbol (remove old name + add new name). BOTH
+    /// directions fire: direction-1 (helper removed) + direction-2 (helper2 added).
+    #[tokio::test]
+    async fn oracle_rename_symbol() {
+        let initial = base_world();
+        // lib_x renames helper → helper2. caller_a/b helper edges → lib_z.
+        // helper2 is a new name nobody calls (added_names=[helper2], dir2 finds none).
+        let final_state = RepoState::default()
+            .sym("/caller_a.rs", "a_fn", 1)
+            .sym("/caller_b.rs", "b_fn", 1)
+            .sym("/lib_x.rs", "helper2", 10)    // renamed
+            .sym("/lib_x.rs", "util", 20)
+            .sym("/lib_z.rs", "helper", 10)
+            .edge("/caller_a.rs", "a_fn", "helper", 2)
+            .edge("/caller_b.rs", "b_fn", "helper", 3)
+            .edge("/caller_b.rs", "b_fn", "util", 4);
+
+        let full = full_calls("/oracle/rename", &final_state).await;
+        let (incr, removed_surface, added) =
+            incremental_calls("/oracle/rename", &initial, &final_state, &["/lib_x.rs"], &[]).await;
+
+        assert!(removed_surface.contains(&"/lib_x.rs".to_string()),
+            "rename removed helper → must fire direction-1; got {:?}", removed_surface);
+        assert!(added.contains(&"helper2".to_string()),
+            "rename adds the new name; got {:?}", added);
+        assert_eq!(incr, full, "incremental != full after rename");
+    }
+
+    /// Scenario 5: multi-file edit mixing a surface-UNCHANGED file (lib_x body
+    /// edit) and a PURE-ADDITION file (lib_a added defining helper). Neither fires
+    /// direction-1 (nothing removed); lib_a's `helper` drives direction-2.
+    #[tokio::test]
+    async fn oracle_mixed_surface_changed_and_unchanged() {
+        let initial = base_world();
+        let mut final_state = RepoState::default()
+            .sym("/caller_a.rs", "a_fn", 1)
+            .sym("/caller_b.rs", "b_fn", 1)
+            .sym("/lib_x.rs", "helper", 14)    // body edit: lines shift, same surface
+            .sym("/lib_x.rs", "util", 24)
+            .sym("/lib_z.rs", "helper", 10)
+            .sym("/lib_a.rs", "helper", 10);   // NEW lex-first definer
+        final_state.edges = initial.edges.clone();
+
+        let full = full_calls("/oracle/mixed", &final_state).await;
+        let (incr, removed_surface, added) = incremental_calls(
+            "/oracle/mixed", &initial, &final_state, &["/lib_x.rs", "/lib_a.rs"], &[],
+        ).await;
+
+        // Neither file removed anything → direction-1 stays empty. lib_x's body
+        // edit is inert; lib_a is a pure addition handled by direction-2.
+        assert_eq!(removed_surface, Vec::<String>::new(),
+            "mixed edit removed nothing → direction-1 must NOT fire; got {:?}", removed_surface);
+        assert!(added.contains(&"helper".to_string()),
+            "added_names must include helper from lib_a; got {:?}", added);
+        assert_eq!(incr, full, "incremental != full after mixed edit");
+    }
+
+    /// Pure-helper unit coverage for compute_surface_delta.
+    #[test]
+    fn surface_delta_pure_logic() {
+        let mut old: FileSurface = HashMap::new();
+        old.insert("/f.rs".to_string(), HashSet::from([
+            ("foo".to_string(), "/f.rs::foo".to_string()),
+            ("bar".to_string(), "/f.rs::bar".to_string()),
+        ]));
+        // Unchanged surface → empty delta.
+        let d = compute_surface_delta(&old, &old.clone(), &["/f.rs".to_string()], &[]);
+        assert!(d.removed_surface_files.is_empty());
+        assert!(d.added_names.is_empty());
+
+        // Add a name (PURE addition) → NO removed-surface, added_names=[baz].
+        let mut new = old.clone();
+        new.get_mut("/f.rs").unwrap().insert(("baz".to_string(), "/f.rs::baz".to_string()));
+        let d = compute_surface_delta(&old, &new, &["/f.rs".to_string()], &[]);
+        assert!(d.removed_surface_files.is_empty(),
+            "pure addition must NOT be removed-surface; got {:?}", d.removed_surface_files);
+        assert_eq!(d.added_names, vec!["baz".to_string()]);
+
+        // Remove a name → removed-surface, no adds.
+        let mut new2 = old.clone();
+        new2.get_mut("/f.rs").unwrap().remove(&("bar".to_string(), "/f.rs::bar".to_string()));
+        let d = compute_surface_delta(&old, &new2, &["/f.rs".to_string()], &[]);
+        assert_eq!(d.removed_surface_files, vec!["/f.rs".to_string()]);
+        assert!(d.added_names.is_empty());
+
+        // Rename (remove bar + add baz) → BOTH removed-surface and added.
+        let mut new3 = old.clone();
+        new3.get_mut("/f.rs").unwrap().remove(&("bar".to_string(), "/f.rs::bar".to_string()));
+        new3.get_mut("/f.rs").unwrap().insert(("baz".to_string(), "/f.rs::baz".to_string()));
+        let d = compute_surface_delta(&old, &new3, &["/f.rs".to_string()], &[]);
+        assert_eq!(d.removed_surface_files, vec!["/f.rs".to_string()]);
+        assert_eq!(d.added_names, vec!["baz".to_string()]);
+
+        // Deleted file → always removed-surface.
+        let d = compute_surface_delta(&old, &HashMap::new(), &[], &["/gone.rs".to_string()]);
+        assert_eq!(d.removed_surface_files, vec!["/gone.rs".to_string()]);
     }
 }
 
@@ -6069,6 +6855,253 @@ mod recall_gate {
         );
     }
 }
+
+// ─── DELETE-STRATEGY PROBE: why is `DELETE FROM calls WHERE col IN $files` slow? ─
+//
+// p2_delete_calls measured 471s (OR form) / 394s (split single-column form) on a
+// 2748-file resolve_set against a 4.44M-row calls table at kernel scale. This
+// SELF-CONTAINED probe seeds a synthetic `calls` table with the REAL schema +
+// the REAL idx_calls_in_file / idx_calls_out_file indexes, then times the
+// candidate strategies on a realistic-size resolve_set so the planner's index
+// decision (and the O(list × rows) pathology) is reproduced WITHOUT a 25-min
+// kernel rebuild and WITHOUT depending on version-locked on-disk data:
+//   (A) DELETE WHERE in_file IN $files            — the bare-IN form (suspect)
+//   (B) per-file `DELETE WHERE in_file = $f` loop — the candidate fix (ops.rs:199)
+//   (C) keyset id-scan WHERE in_file IN $files    — step-3's proven-fast pattern
+// Rows/files are scaled by env (default 500k rows / 6000 files / 2748 resolve_set)
+// to keep the probe under a minute while preserving the list×rows ratio.
+//
+// Run explicitly:
+//   cargo test --release --lib delete_strategy_probe -- --ignored --nocapture
+//   PROBE_ROWS=1000000 PROBE_FILES=8000 PROBE_RESOLVE=2748 cargo test ... (scale up)
+#[cfg(test)]
+mod delete_strategy_probe {
+    use crate::store::open_db;
+    use std::collections::BTreeMap;
+    use std::time::Instant;
+    use surrealdb::sql::{Array as SqlArray, Object as SqlObject, Thing as SqlThing, Value as SqlValue};
+    use surrealdb::engine::local::Db;
+    use surrealdb::Surreal;
+    use tempfile::TempDir;
+
+    /// Bulk-seed `n_rows` calls rows over `n_files` files via the native array
+    /// INSERT path (the same fast path flush_edge_batch uses), with the two
+    /// secondary indexes already defined so deletes plan against a live index.
+    async fn seed(db: &Surreal<Db>, n_rows: usize, n_files: usize) {
+        db.query("DEFINE INDEX IF NOT EXISTS idx_calls_in_file  ON calls FIELDS in_file; \
+                  DEFINE INDEX IF NOT EXISTS idx_calls_out_file ON calls FIELDS out_file;")
+            .await.expect("define indexes").check().expect("define check");
+        let mut written = 0usize;
+        while written < n_rows {
+            let batch = std::cmp::min(20_000, n_rows - written);
+            let records: Vec<SqlValue> = (0..batch)
+                .map(|i| {
+                    let n = written + i;
+                    let inf = n % n_files;
+                    let outf = (n * 7 + 3) % n_files;
+                    let mut m: BTreeMap<String, SqlValue> = BTreeMap::new();
+                    m.insert("line".into(), SqlValue::from(n as i64));
+                    m.insert("in_file".into(), SqlValue::from(format!("f{inf}.c")));
+                    m.insert("out_file".into(), SqlValue::from(format!("f{outf}.c")));
+                    m.insert("in_name".into(), SqlValue::from(format!("s{n}")));
+                    m.insert("out_name".into(), SqlValue::from(format!("t{n}")));
+                    SqlValue::Object(SqlObject::from(m))
+                })
+                .collect();
+            db.query("INSERT INTO calls $data RETURN NONE")
+                .bind(("data", SqlArray::from(records)))
+                .await.expect("bulk insert").check().expect("insert check");
+            written += batch;
+        }
+    }
+
+    async fn count_all(db: &Surreal<Db>) -> i64 {
+        #[derive(serde::Deserialize)]
+        struct CountRow { count: i64 }
+        let c: Vec<CountRow> = db.query("SELECT count() AS count FROM calls GROUP ALL")
+            .await.unwrap().take(0).unwrap();
+        c.first().map(|r| r.count).unwrap_or(0)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn delete_strategy_probe() {
+        let n_rows: usize = envvar("PROBE_ROWS", 500_000);
+        let n_files: usize = envvar("PROBE_FILES", 6_000);
+        let n_resolve: usize = envvar("PROBE_RESOLVE", 2_748);
+        println!("DELPROBE: seeding {n_rows} calls rows / {n_files} files; \
+                  resolve_set={n_resolve} (real schema + idx_calls_in_file/out_file)");
+
+        let home = TempDir::new().unwrap();
+        let files: Vec<String> = (0..n_resolve).map(|i| format!("f{i}.c")).collect();
+
+        // PROBE_ONLY_C=1 / PROBE_ONLY_D=1 run a single strategy alone at full
+        // scale in minutes. A bare-IN (A) is O(list×rows) ~25min at 4.44M rows;
+        // B per-file is the already-measured kernel form (215685ms); C's keyset
+        // `SELECT WHERE col IN $files` suffers the SAME IN-list pathology
+        // (measured >21min collect at 4.44M and aborted). D is the candidate.
+        let only_c = envvar("PROBE_ONLY_C", 0) != 0;
+        let only_d = envvar("PROBE_ONLY_D", 0) != 0;
+        let run_ab = !only_c && !only_d;
+
+        // ── (A) bare `IN $files` DELETE (the current/suspect form) ──────────────
+        let (mut a_ms, mut deleted_a) = (-1i128, -1i64);
+        if run_ab {
+            let dba = open_db(home.path(), "/probe/a", 0).await.expect("open a");
+            let t = Instant::now(); seed(&dba, n_rows, n_files).await;
+            println!("DELPROBE: seed A done in {} ms (rows={})",
+                t.elapsed().as_millis(), count_all(&dba).await);
+            let before_a = count_all(&dba).await;
+            let t = Instant::now();
+            dba.query("DELETE FROM calls WHERE in_file IN $files").bind(("files", files.clone()))
+                .await.expect("A in");
+            dba.query("DELETE FROM calls WHERE out_file IN $files").bind(("files", files.clone()))
+                .await.expect("A out");
+            a_ms = t.elapsed().as_millis() as i128;
+            deleted_a = before_a - count_all(&dba).await;
+            println!("DELPROBE (A) bare `IN $files` DELETE x2cols: {a_ms} ms (deleted={deleted_a})");
+        }
+
+        // ── (B) per-file equality DELETE loop (the candidate fix) ───────────────
+        let (mut b_ms, mut deleted_b) = (-1i128, -1i64);
+        if run_ab {
+            let dbb = open_db(home.path(), "/probe/b", 0).await.expect("open b");
+            let t = Instant::now(); seed(&dbb, n_rows, n_files).await;
+            println!("DELPROBE: seed B done in {} ms", t.elapsed().as_millis());
+            let before_b = count_all(&dbb).await;
+            let t = Instant::now();
+            for f in &files {
+                dbb.query("DELETE FROM calls WHERE in_file = $f").bind(("f", f.clone()))
+                    .await.expect("B in");
+                dbb.query("DELETE FROM calls WHERE out_file = $f").bind(("f", f.clone()))
+                    .await.expect("B out");
+            }
+            b_ms = t.elapsed().as_millis() as i128;
+            deleted_b = before_b - count_all(&dbb).await;
+            println!("DELPROBE (B) per-file `= $f` DELETE x2cols x{}: {b_ms} ms (deleted={deleted_b})",
+                files.len());
+        }
+
+        // ── (C) keyset-paginated id-collect + direct-record-id batch DELETE ─────
+        // The step-3 primitive applied to deletion: ONE keyset-paginated
+        // `SELECT id WHERE col IN $files` per column (the SAME index range-scan
+        // that resolves the 2748-file raw_edge set in 262ms), collecting native
+        // `Thing` record ids, then `DELETE` them by DIRECT record id in batches.
+        // Direct-record delete is O(deleted rows) and does NOT re-plan a predicate
+        // per row, so it is independent of total table size — unlike (B), whose
+        // per-`= $f` cost grows with the table (4.44M rows → ~39ms/query).
+        async fn collect_ids(db: &Surreal<Db>, col: &str, files: &[String]) -> Vec<SqlThing> {
+            let mut ids: Vec<SqlThing> = Vec::new();
+            let mut cursor = String::new();
+            let page: i64 = 5000;
+            loop {
+                let q = format!(
+                    "SELECT id, type::string(id) AS id_str FROM calls \
+                     WHERE {col} IN $files AND type::string(id) > $cursor \
+                     ORDER BY id_str LIMIT $page"
+                );
+                #[derive(serde::Deserialize)]
+                struct Row { id: SqlThing, id_str: String }
+                let rows: Vec<Row> = db.query(&q)
+                    .bind(("files", files.to_vec()))
+                    .bind(("cursor", cursor.clone()))
+                    .bind(("page", page))
+                    .await.expect("C select").take(0).expect("C take");
+                if rows.is_empty() { break; }
+                cursor = rows.last().unwrap().id_str.clone();
+                let n = rows.len();
+                ids.extend(rows.into_iter().map(|r| r.id));
+                if (n as i64) < page { break; }
+            }
+            ids
+        }
+        let dbc = open_db(home.path(), "/probe/c", 0).await.expect("open c");
+        let (mut c_ms, mut deleted_c) = (-1i128, -1i64);
+        if !only_d {
+            let t = Instant::now(); seed(&dbc, n_rows, n_files).await;
+            println!("DELPROBE: seed C done in {} ms", t.elapsed().as_millis());
+            let before_c = count_all(&dbc).await;
+            let t = Instant::now();
+            // Collect ids touching the resolve_set on EITHER column, dedup (a row
+            // may match both columns → would otherwise be deleted twice).
+            let mut all_ids = collect_ids(&dbc, "in_file", &files).await;
+            all_ids.extend(collect_ids(&dbc, "out_file", &files).await);
+            let collect_ms = t.elapsed().as_millis();
+            let id_strings: std::collections::BTreeSet<String> =
+                all_ids.iter().map(|t| t.to_string()).collect();
+            let dedup_ids: Vec<SqlThing> = {
+                let mut seen = std::collections::HashSet::new();
+                all_ids.into_iter().filter(|t| seen.insert(t.to_string())).collect()
+            };
+            let t2 = Instant::now();
+            // Direct-record-id DELETE in batches: `DELETE $ids` where $ids is an
+            // Array of Things. Direct access — no WHERE predicate, no per-row plan.
+            for chunk in dedup_ids.chunks(10_000) {
+                let arr = SqlArray::from(chunk.iter().cloned().map(SqlValue::Thing).collect::<Vec<_>>());
+                dbc.query("DELETE $ids").bind(("ids", arr)).await.expect("C delete");
+            }
+            let delete_ms = t2.elapsed().as_millis();
+            c_ms = (collect_ms + delete_ms) as i128;
+            deleted_c = before_c - count_all(&dbc).await;
+            println!("DELPROBE (C) keyset-id-collect ({} ids, {} dedup) + direct-id DELETE: \
+                      {c_ms} ms (collect={collect_ms} ms, delete={delete_ms} ms, deleted={deleted_c})",
+                id_strings.len(), dedup_ids.len());
+        }
+
+        // ── (D) per-file indexed-equality DELETE, BATCHED into one transaction ──
+        // per chunk. Keeps the proven O(resolve_set) INDEX POINT-SEEK (B's
+        // `WHERE col = $f` drives idx_calls_in_file/out_file — no IN-list, no
+        // scan) but collapses B's 5496 SEPARATE auto-commit round-trips (each its
+        // own RocksDB commit+fsync — measured ~39ms apiece, commit-bound NOT
+        // seek-bound) into ONE multi-statement BEGIN/COMMIT per chunk of files.
+        // So ~14 transactions instead of 5496 → the per-commit fixed cost (the
+        // real dominator at 215685ms) is amortized ~390x while every delete stays
+        // a single-value indexed equality. Distinct $p{i} binds per statement keep
+        // values parameterized (no injection, no per-row parse of file strings).
+        let dbd = open_db(home.path(), "/probe/d", 0).await.expect("open d");
+        let t = Instant::now(); seed(&dbd, n_rows, n_files).await;
+        println!("DELPROBE: seed D done in {} ms", t.elapsed().as_millis());
+        let before_d = count_all(&dbd).await;
+        let chunk_files: usize = envvar("PROBE_D_CHUNK", 200);
+        let t = Instant::now();
+        for chunk in files.chunks(chunk_files) {
+            let mut stmt = String::from("BEGIN;\n");
+            for i in 0..chunk.len() {
+                stmt.push_str(&format!("DELETE FROM calls WHERE in_file = $p{i};\n"));
+                stmt.push_str(&format!("DELETE FROM calls WHERE out_file = $p{i};\n"));
+            }
+            stmt.push_str("COMMIT;");
+            let mut q = dbd.query(&stmt);
+            for (i, f) in chunk.iter().enumerate() {
+                q = q.bind((format!("p{i}"), f.clone()));
+            }
+            q.await.expect("D delete chunk").check().expect("D check");
+        }
+        let d_ms = t.elapsed().as_millis() as i128;
+        let deleted_d = before_d - count_all(&dbd).await;
+        println!("DELPROBE (D) per-file-eq BATCHED in {}-file txns ({} txns): \
+                  {d_ms} ms (deleted={deleted_d})",
+            chunk_files, files.len().div_ceil(chunk_files));
+
+        // Sentinels (-1) print for any strategy a PROBE_ONLY_* flag skipped. The
+        // identical-delete-count check only compares strategies that ran.
+        let mut counts: Vec<i64> = Vec::new();
+        for v in [deleted_a, deleted_b, deleted_c, deleted_d] {
+            if v >= 0 { counts.push(v); }
+        }
+        let counts_match = counts.windows(2).all(|w| w[0] == w[1]);
+        println!("DELPROBE VERDICT: (A) bare-IN = {a_ms} ms | (B) per-file-eq = {b_ms} ms \
+                  | (C) id-collect+direct = {c_ms} ms | (D) per-file-eq batched-txn = {d_ms} ms \
+                  || identical delete count across run strategies: {} ({deleted_a}/{deleted_b}/{deleted_c}/{deleted_d})",
+            counts_match);
+    }
+
+    fn envvar(k: &str, d: usize) -> usize {
+        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    }
+}
+
+
 
 #[cfg(test)]
 mod null_byte_skip_tests {

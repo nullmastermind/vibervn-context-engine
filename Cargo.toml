@@ -18,6 +18,16 @@ default-run = "context-engine-rs"
 name = "bench-query"
 path = "src/bin/bench_query/main.rs"
 
+# `bench-incremental` is the incremental-path measurement ORACLE: it boots the
+# engine through the SAME shared `engine_boot::boot_engine` path, does a clean
+# full rebuild to set up realistic on-disk DB state, appends a sentinel line to N
+# real indexed files (guaranteeing a `Modified` classification), runs ONE manual
+# incremental index, captures the per-stage `PERF SUMMARY incremental` breakdown,
+# and ALWAYS restores the files. Measurement-only; implements no optimization.
+[[bin]]
+name = "bench-incremental"
+path = "src/bin/bench_incremental/main.rs"
+
 [dependencies]
 ignore = "0.4"
 notify = "8"

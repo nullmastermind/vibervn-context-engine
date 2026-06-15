@@ -144,6 +144,9 @@ async fn run() -> i32 {
     } = match boot_engine(BootOptions {
         data_dir: cli.data_dir.clone(),
         embeddings_dir: None,
+        // bench-query is read-only — it never mutates files, so a boot watcher
+        // has nothing to race. Keep the production default.
+        no_watchers: false,
     })
     .await
     {

@@ -41,6 +41,7 @@ async fn start_server(home: &TempDir) -> SocketAddr {
         &settings,
         repo_dbs.clone(),
         settings_handle.clone(),
+        false,
     )
     .await;
     let app = build_router(

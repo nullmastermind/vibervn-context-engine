@@ -48,6 +48,17 @@ pub struct BootOptions {
     pub data_dir: Option<PathBuf>,
     /// `--embeddings-dir` flag override.
     pub embeddings_dir: Option<PathBuf>,
+    /// Suppress the boot-time filesystem watcher spawn for ALL configured repos.
+    ///
+    /// The server leaves this false (watchers are how edits auto-reindex). The
+    /// `bench-incremental` measurement oracle sets it true: it mutates files on
+    /// disk (append sentinel / restore) to drive ONE controlled incremental and
+    /// must guarantee that the run it times is the ONLY trigger in flight. A boot
+    /// watcher on a repo already present in `settings.repos` (e.g. the kernel)
+    /// would otherwise fire its own debounced incremental on those same edits and
+    /// race the measured run for the single per-repo connection — exactly the
+    /// contamination that made the 10-file number meaningless.
+    pub no_watchers: bool,
 }
 
 /// Pin bounded RocksDB memory settings unless the operator has overridden them.
@@ -188,7 +199,8 @@ pub async fn boot_engine(opts: BootOptions) -> Result<BootedEngine> {
     // (doesn't error) any directory it still can't remove; the next boot retries.
     store::sweep_stale_generations(&data_dir, &boot_settings.repos, &boot_settings.repo_generations);
 
-    // Start IndexEngine — spawns watchers for all configured repos.
+    // Start IndexEngine — spawns watchers for all configured repos (unless
+    // `no_watchers` is set, e.g. by the bench oracle for measurement isolation).
     // It shares `repo_dbs` so indexer writes land in the handles the server reads.
     // It receives the shared settings handle so the consumer picks up post-boot changes.
     let index_engine = IndexEngine::start(
@@ -197,6 +209,7 @@ pub async fn boot_engine(opts: BootOptions) -> Result<BootedEngine> {
         &boot_settings,
         repo_dbs.clone(),
         settings_handle.clone(),
+        opts.no_watchers,
     )
     .await;
     info!("IndexEngine started ({} repos)", repo_count);
