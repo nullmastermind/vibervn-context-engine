@@ -81,6 +81,26 @@
       background: #101418; border-color: #2e3a42;
     }
     .chat-md pre code { background: none; padding: 0; font-size: 0.85em; }
+    /* GitHub-style tables — thin borders, tinted header, Wikipedia data-viz feel. */
+    .chat-md table {
+      border-collapse: collapse;
+      margin: 0.6em 0;
+      font-size: 0.9em;
+      display: block;
+      overflow-x: auto;
+      max-width: 100%;
+    }
+    .chat-md th, .chat-md td {
+      border: 1px solid #d1d5db;
+      padding: 0.3em 0.6em;
+      text-align: left;
+      vertical-align: top;
+    }
+    .dark .chat-md th, .dark .chat-md td { border-color: #2e3a42; }
+    .chat-md th { background: rgba(0, 0, 0, 0.04); font-weight: 600; }
+    .dark .chat-md th { background: rgba(255, 255, 255, 0.05); }
+    .chat-md tr:nth-child(even) td { background: rgba(0, 0, 0, 0.02); }
+    .dark .chat-md tr:nth-child(even) td { background: rgba(255, 255, 255, 0.025); }
   </style>
 </head>
 <body class="bg-gray-50 dark:bg-wiki-bg text-gray-900 dark:text-wiki-text min-h-screen transition-colors duration-200">
@@ -2224,13 +2244,39 @@ function renderMarkdown(src) {
   };
   const closeList = () => { if (listType) { html += '</' + listType + '>'; listType = null; } };
 
-  for (const line of lines) {
+  // Split a GitHub table row into cells: strip the optional leading/trailing
+  // pipe, then split on unescaped pipes. Cell text runs through mdInline so
+  // inline code/bold/links inside cells render and stay XSS-safe.
+  const splitRow = (line) => line.replace(/^\s*\|/, '').replace(/\|\s*$/, '')
+    .split(/(?<!\\)\|/).map((c) => c.replace(/\\\|/g, '|').trim());
+  // A separator row is the |---|:--:|--- line that confirms the block is a table.
+  const isTableSep = (line) => /^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)*\|?\s*$/.test(line)
+    && line.includes('-');
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
     if (inFence) {
       if (/^\s*```/.test(line)) { html += '<pre><code>' + escHtml(fence.join('\n')) + '</code></pre>'; fence = []; inFence = false; }
       else { fence.push(line); }
       continue;
     }
     if (/^\s*```/.test(line)) { flushPara(); closeList(); inFence = true; continue; }
+
+    // Table: a header row (contains a pipe) immediately followed by a separator row.
+    if (line.includes('|') && i + 1 < lines.length && isTableSep(lines[i + 1])) {
+      flushPara(); closeList();
+      const headers = splitRow(line);
+      i++; // consume separator
+      let rows = '';
+      while (i + 1 < lines.length && lines[i + 1].includes('|') && lines[i + 1].trim() !== '') {
+        i++;
+        const cells = splitRow(lines[i]);
+        rows += '<tr>' + headers.map((_, c) => '<td>' + mdInline(cells[c] || '') + '</td>').join('') + '</tr>';
+      }
+      html += '<table><thead><tr>' + headers.map((h) => '<th>' + mdInline(h) + '</th>').join('')
+        + '</tr></thead><tbody>' + rows + '</tbody></table>';
+      continue;
+    }
 
     const heading = line.match(/^(#{1,6})\s+(.*)$/);
     if (heading) {
@@ -4880,6 +4926,7 @@ let chatConversationId = null;
 let chatRepo = null;
 let chatAbort = null;     // AbortController for the in-flight stream
 let chatBusy = false;
+let chatPrevBodyOverflow = '';  // body overflow saved while the dialog is open
 
 function genConversationId() {
   if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
@@ -4896,7 +4943,16 @@ function openChat() {
   msgs.innerHTML = '';
   msgs.appendChild(buildChatEmptyState());
   document.getElementById('chat-input').value = '';
-  document.getElementById('modal-chat').classList.remove('hidden');
+  const modal = document.getElementById('modal-chat');
+  // Capture the pre-lock overflow only on a true open (dialog currently hidden).
+  // A re-entrant openChat (re-open / repo-switch while already open) must NOT
+  // re-capture, or it would save our own 'hidden' and closeChat would then
+  // restore to 'hidden' — locking scroll forever.
+  if (modal.classList.contains('hidden')) {
+    chatPrevBodyOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+  }
+  modal.classList.remove('hidden');
   setTimeout(() => document.getElementById('chat-input').focus(), 50);
 }
 
@@ -4913,6 +4969,10 @@ function buildChatEmptyState() {
 
 function closeChat() {
   document.getElementById('modal-chat').classList.add('hidden');
+  // Restore the background scroll value captured in openChat. All close paths
+  // (this fn, the ESC handler, and the repo-switch cleanup) funnel through here.
+  document.body.style.overflow = chatPrevBodyOverflow;
+  chatPrevBodyOverflow = '';
   // Abort any in-flight stream.
   if (chatAbort) { try { chatAbort.abort(); } catch (e) {} chatAbort = null; }
   chatBusy = false;
