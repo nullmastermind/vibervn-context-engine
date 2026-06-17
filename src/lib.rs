@@ -5,6 +5,7 @@ pub mod defender;
 pub mod embedding;
 pub mod engine_boot;
 pub mod engine_ops;
+pub mod fs_tools;
 pub mod indexing;
 pub mod llm;
 pub mod mcp;

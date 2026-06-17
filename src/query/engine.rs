@@ -108,11 +108,12 @@ pub async fn run_query(
     agentic_rag: bool,
     agentic_rag_max_turns: u32,
     agentic_rag_max_chunk_chars: u32,
+    agentic_rag_grep_read: bool,
 ) -> Result<QueryResult> {
     run_query_with_filters(
         query, top_k, repo_filter, voyage_client, index_engine, repo_dbs,
         min_prune_lines, llm_client, warm_wait, agentic_rag,
-        agentic_rag_max_turns, agentic_rag_max_chunk_chars, None,
+        agentic_rag_max_turns, agentic_rag_max_chunk_chars, agentic_rag_grep_read, None,
     ).await
 }
 
@@ -132,6 +133,7 @@ pub async fn run_query_with_filters(
     agentic_rag: bool,
     agentic_rag_max_turns: u32,
     agentic_rag_max_chunk_chars: u32,
+    agentic_rag_grep_read: bool,
     external_filters: Option<crate::query::filters::QueryFilters>,
 ) -> Result<QueryResult> {
     let total_start = Instant::now();
@@ -282,7 +284,7 @@ pub async fn run_query_with_filters(
         (true, Some(client), Some(repo)) => {
             let (out, pool) = reranker::rerank_agentic(
                 query, &merged, &numbered, &legacy_stats, min_prune_lines,
-                client, agentic_rag_max_turns, agentic_rag_max_chunk_chars,
+                client, agentic_rag_max_turns, agentic_rag_max_chunk_chars, agentic_rag_grep_read,
                 repo, voyage_client, index_engine, repo_dbs, warm_wait,
             ).await;
             (out, Some(pool))

@@ -204,6 +204,7 @@ pub async fn run_query_op(
         settings.llm.agentic_rag,
         settings.llm.agentic_rag_max_turns,
         settings.llm.agentic_rag_max_chunk_chars,
+        settings.llm.agentic_rag_grep_read,
     )
     .await
 }

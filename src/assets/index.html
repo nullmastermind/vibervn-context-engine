@@ -501,6 +501,17 @@
             Character budget for added chunks. The agent stops once added chunk content reaches this. 0 disables the limit.
           </p>
         </div>
+        <div id="llm-agentic-grep-read-wrapper" class="mb-4 hidden">
+          <label class="flex items-center gap-2 text-xs font-medium text-gray-500 dark:text-wiki-text-muted cursor-pointer">
+            <input id="llm-agentic-grep-read" type="checkbox"
+                   class="h-4 w-4 rounded border-gray-300 dark:border-wiki-border text-blue-600
+                          focus:outline-none focus:ring-2 focus:ring-blue-400" />
+            <span data-i18n="llm.agenticGrepRead">Use Grep/Read</span>
+          </label>
+          <p data-i18n="llm.agenticGrepReadHelp" class="mt-1 text-xs text-gray-400 dark:text-wiki-text-muted">
+            Give the agent exact grep and read tools alongside query. They search and read files directly for precise matches and verbatim line ranges. Does not count against the query budget.
+          </p>
+        </div>
         <div class="mb-4">
           <label data-i18n="field.provider" class="block text-xs font-medium text-gray-500 dark:text-wiki-text-muted mb-1">Provider</label>
           <select id="llm-provider"
@@ -1508,6 +1519,10 @@ const STR = {
   'llm.maxChunkCharsHelp': { en: `Character budget for added chunks. The agent stops once added chunk content reaches this. 0 disables the limit.`,
                          vi: `Character budget cho chunks đã add. Agent dừng khi nội dung chunks đã add đạt mức này. 0 để tắt giới hạn.`,
                          zh: `已添加 chunk 的字符预算。当已添加的 chunk 内容达到此值时代理停止。设为 0 可禁用此限制。` },
+  'llm.agenticGrepRead': { en: `Use Grep/Read`, vi: `Use Grep/Read`, zh: `使用 Grep/Read` },
+  'llm.agenticGrepReadHelp': { en: `Give the agent exact grep and read tools alongside query. They search and read files directly for precise matches and verbatim line ranges. Does not count against the query budget.`,
+                         vi: `Cấp cho agent các tool grep và read chính xác bên cạnh query. Chúng search và đọc file trực tiếp để lấy match chính xác và line range nguyên văn. Không tính vào query budget.`,
+                         zh: `在 query 之外为代理提供精确的 grep 和 read 工具。它们直接搜索和读取文件以获得精确匹配和原文 line range。不计入 query budget。` },
   'llm.openaiBaseUrl': { en: `OpenAI Base URL`, vi: `OpenAI Base URL`, zh: `OpenAI Base URL` },
   'llm.openaiBaseUrlHelp': { en: `Custom OpenAI-compatible endpoint (Ollama, LM Studio, OpenRouter, Azure, vLLM, etc.). Leave blank to use api.openai.com. Accepts either the base form (…/v1) or the full /chat/completions URL.`,
                          vi: `Endpoint OpenAI-compatible tùy chỉnh (Ollama, LM Studio, OpenRouter, Azure, vLLM, v.v.). Để trống để dùng api.openai.com. Chấp nhận dạng base (…/v1) hoặc URL /chat/completions đầy đủ.`,
@@ -2246,8 +2261,10 @@ function renderAll() {
   document.getElementById('llm-agentic-rag').checked = cfg.llm.agentic_rag ?? false;
   document.getElementById('llm-agentic-max-turns').value = cfg.llm.agentic_rag_max_turns ?? 9;
   document.getElementById('llm-agentic-max-chunk-chars').value = cfg.llm.agentic_rag_max_chunk_chars ?? 50000;
+  document.getElementById('llm-agentic-grep-read').checked = cfg.llm.agentic_rag_grep_read ?? true;
   document.getElementById('llm-agentic-max-turns-wrapper').classList.toggle('hidden', !(cfg.llm.agentic_rag ?? false));
   document.getElementById('llm-agentic-max-chunk-chars-wrapper').classList.toggle('hidden', !(cfg.llm.agentic_rag ?? false));
+  document.getElementById('llm-agentic-grep-read-wrapper').classList.toggle('hidden', !(cfg.llm.agentic_rag ?? false));
   document.getElementById('llm-openai-base-url').value = cfg.llm.openai_base_url || '';
   document.getElementById('llm-openai-base-url-wrapper').classList.toggle('hidden', (cfg.llm.provider || 'google') !== 'openai');
   document.getElementById('llm-openai-force-tool-use').checked = cfg.llm.openai_force_tool_use ?? false;
@@ -3253,6 +3270,12 @@ document.getElementById('llm-agentic-rag').addEventListener('change', (e) => {
   cfg.llm.agentic_rag = e.target.checked;
   document.getElementById('llm-agentic-max-turns-wrapper').classList.toggle('hidden', !e.target.checked);
   document.getElementById('llm-agentic-max-chunk-chars-wrapper').classList.toggle('hidden', !e.target.checked);
+  document.getElementById('llm-agentic-grep-read-wrapper').classList.toggle('hidden', !e.target.checked);
+  saveNow();
+});
+document.getElementById('llm-agentic-grep-read').addEventListener('change', (e) => {
+  if (!cfg) return;
+  cfg.llm.agentic_rag_grep_read = e.target.checked;
   saveNow();
 });
 document.getElementById('llm-agentic-max-turns').addEventListener('input', (e) => {

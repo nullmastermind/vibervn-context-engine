@@ -222,6 +222,10 @@ fn default_agentic_rag_max_chunk_chars() -> u32 {
     50_000
 }
 
+fn default_agentic_rag_grep_read() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LlmConfig {
     pub provider: String,
@@ -251,6 +255,14 @@ pub struct LlmConfig {
     /// stops. 0 disables the cap. Defaults to 50000.
     #[serde(default = "default_agentic_rag_max_chunk_chars")]
     pub agentic_rag_max_chunk_chars: u32,
+    /// When true (default), the agentic loop is additionally offered the exact
+    /// filesystem tools `grep` (text/regex search) and `read` (verbatim line
+    /// ranges) alongside `query`. Their results become addressable chunks the
+    /// agent can commit via `add_chunks`. They do not consume the query turn
+    /// budget — only the shared `agentic_rag_max_chunk_chars` budget bounds them.
+    /// Only meaningful when `agentic_rag` is true.
+    #[serde(default = "default_agentic_rag_grep_read")]
+    pub agentic_rag_grep_read: bool,
     /// Custom OpenAI-compatible endpoint (Ollama, LM Studio, OpenRouter, Azure,
     /// vLLM, etc.). Honored only when `provider == "openai"`. `None` / blank →
     /// the OpenAI client falls back to `https://api.openai.com/v1/chat/completions`.
@@ -322,6 +334,7 @@ impl Default for LlmConfig {
             agentic_rag: false,
             agentic_rag_max_turns: default_agentic_rag_max_turns(),
             agentic_rag_max_chunk_chars: default_agentic_rag_max_chunk_chars(),
+            agentic_rag_grep_read: default_agentic_rag_grep_read(),
             openai_base_url: None,
             openai_force_tool_use: false,
             chat_custom_endpoints: Vec::new(),
@@ -1110,6 +1123,10 @@ mod tests {
             loaded.llm.agentic_rag_max_chunk_chars, 50_000,
             "agentic_rag_max_chunk_chars must default to 50000 on old files"
         );
+        assert!(
+            loaded.llm.agentic_rag_grep_read,
+            "agentic_rag_grep_read must default to true on old files"
+        );
     }
 
     /// Direct deserialization guard: parsing an `LlmConfig` from JSON with the
@@ -1122,6 +1139,7 @@ mod tests {
         assert!(!cfg.agentic_rag);
         assert_eq!(cfg.agentic_rag_max_turns, 9);
         assert_eq!(cfg.agentic_rag_max_chunk_chars, 50_000);
+        assert!(cfg.agentic_rag_grep_read, "agentic_rag_grep_read defaults to true");
     }
 
     /// Backward-compat for `openai_base_url`: an existing settings.json whose

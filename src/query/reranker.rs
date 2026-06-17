@@ -200,8 +200,19 @@ pub async fn rerank(
 
 const AGENTIC_HISTORY_BYTE_CAP: usize = 1_000_000;
 
-fn agentic_tool_definitions() -> Vec<ToolDef> {
-    vec![
+/// Max times one `add_chunks` phase may be rejected for a malformed `lines`
+/// shape (a flat integer list instead of nested `[[start,end],...]` pairs)
+/// before we stop nudging and accept the call as-is (keeping whole chunks for
+/// the malformed entries rather than losing them). Bounds the reject→retry loop
+/// so a model that simply cannot produce the nested form can't spin forever.
+const MAX_FORMAT_RETRIES: u32 = 2;
+
+/// Tool surface offered to the agentic loop. `add_chunks` + `query` are always
+/// present; when `grep_read` is true the exact filesystem tools `grep` and
+/// `read` are appended. Their results become addressable chunks (Design B) the
+/// agent can commit via `add_chunks`; they don't consume the query turn budget.
+fn agentic_tool_definitions(grep_read: bool) -> Vec<ToolDef> {
+    let mut tools = vec![
         ToolDef {
             name: "add_chunks".to_owned(),
             description: "Add one or more relevant code chunks to the final results, ordered most-relevant first. \
@@ -257,7 +268,80 @@ fn agentic_tool_definitions() -> Vec<ToolDef> {
                 "required": ["information_request"]
             }),
         },
-    ]
+    ];
+
+    if grep_read {
+        tools.push(ToolDef {
+            name: "grep".to_owned(),
+            description: "Exact text/regex search over the repository's working tree (like \
+                ripgrep). Unlike query (semantic, ranked by meaning), this finds the LITERAL \
+                pattern and returns matching lines as `path:line: text`, plus addressable chunk \
+                indices you can pass to add_chunks. Use it to find every call site of a symbol, \
+                where a constant is defined, or all uses of an identifier. Does NOT consume the \
+                query turn budget. Respects .gitignore; skips binary files."
+                .to_owned(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Text or regex to search for. Regex unless `literal` is true."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Optional path or glob to scope the search, relative to the \
+                            repo root (e.g. `src/`, `src/**/*.rs`). Omit to search the whole repo."
+                    },
+                    "literal": {
+                        "type": "boolean",
+                        "description": "Match the pattern as a literal string (escape regex \
+                            metacharacters). Default false."
+                    },
+                    "ignore_case": {
+                        "type": "boolean",
+                        "description": "Case-insensitive match when true. Default false."
+                    },
+                    "context_lines": {
+                        "type": "integer",
+                        "description": "Lines of context on each side of a match (grep -C), 0-10. \
+                            Default 0."
+                    }
+                },
+                "required": ["pattern"]
+            }),
+        });
+        tools.push(ToolDef {
+            name: "read".to_owned(),
+            description: "Read the verbatim contents of ONE file in the repository as numbered \
+                lines, exactly as on disk. Unlike query (semantic chunks), this returns the raw \
+                lines with no ranking, plus an addressable chunk index for the range you read so \
+                you can pass it to add_chunks. Use it to see the actual code of a file you found \
+                via query or grep. Optionally restrict to a line range. Does NOT consume the query \
+                turn budget."
+                .to_owned(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to the file, relative to the repository root."
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "description": "First line to read (1-based, inclusive). Omit to start at 1."
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "Last line to read (1-based, inclusive). Omit to read to the \
+                            end (subject to the per-read line cap)."
+                    }
+                },
+                "required": ["file_path"]
+            }),
+        });
+    }
+
+    tools
 }
 
 /// Estimate byte size of conversation history for cap enforcement.
@@ -377,6 +461,12 @@ trait AgenticBackend {
         &self,
         information_request: &str,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<MergeChunk>>> + Send;
+
+    /// Absolute repo root for the exact filesystem tools (`grep`, `read`). The
+    /// path-traversal guard in `crate::fs_tools` is anchored here, so the agent
+    /// can never read outside it. `None` disables grep/read (mock backends that
+    /// don't exercise them return `None`).
+    fn repo_root(&self) -> Option<std::path::PathBuf>;
 }
 
 /// Production backend: forwards to the real LLM client and `run_sub_query`.
@@ -415,6 +505,13 @@ impl AgenticBackend for LiveBackend<'_> {
             self.warm_wait,
         )
     }
+
+    fn repo_root(&self) -> Option<std::path::PathBuf> {
+        // `repo_filter` is the absolute repo root (same value `path_in_repo`
+        // gates sub-query results against). Normalize so the fs_tools guard
+        // canonicalizes against the canonical root.
+        Some(std::path::PathBuf::from(crate::store::normalize_repo_path(self.repo_filter)))
+    }
 }
 
 /// Agentic rerank: multi-turn tool-calling loop. The agent selects chunks via
@@ -434,6 +531,7 @@ pub async fn rerank_agentic(
     llm_client: &LlmClient,
     max_turns: u32,
     max_chunk_chars: u32,
+    grep_read: bool,
     // Sub-query dependencies (for the `query` tool)
     repo_filter: &str,
     voyage_client: &VoyageClient,
@@ -457,7 +555,7 @@ pub async fn rerank_agentic(
         repo_dbs,
         warm_wait,
     };
-    run_agentic_loop(&backend, query, chunks, numbered, caller_stats, min_prune_lines, max_turns, max_chunk_chars).await
+    run_agentic_loop(&backend, query, chunks, numbered, caller_stats, min_prune_lines, max_turns, max_chunk_chars, grep_read).await
 }
 
 /// The real agentic loop: prompt build → turn loop → `decide_final_action` →
@@ -473,6 +571,7 @@ async fn run_agentic_loop<B: AgenticBackend>(
     min_prune_lines: u32,
     max_turns: u32,
     max_chunk_chars: u32,
+    grep_read: bool,
 ) -> (RerankOutput, ExtendedPool) {
     let n = chunks.len();
     let all_indices: Vec<usize> = (0..n).collect();
@@ -518,9 +617,42 @@ async fn run_agentic_loop<B: AgenticBackend>(
         `keep: \"all\"` is ONLY for chunks where literally EVERY line is relevant (rare — typically only for short chunks <20 lines). \
         For most chunks, only a portion matters — use `lines: [[start, end], ...]` with the absolute line numbers shown in the chunk. \
         Adding entire large chunks wastes your character budget and dilutes the results with irrelevant code.\n\
+        - DO NOT FAKE PRUNING. A range that spans the whole chunk (e.g. `[[1, 42]]` for a 42-line chunk, or `[[1, <last line>]]`) is NOT pruning — it keeps everything. \
+        If you genuinely need the entire chunk, use `keep: \"all\"` instead; otherwise pick the actual sub-ranges that matter. \
+        Each chunk's ranges must be chosen from ITS OWN content — never copy the same range (like `[[15, 52]]`) onto multiple different chunks. \
+        If you find yourself selecting almost every line of most chunks, you are being too greedy: re-read each chunk and cut to the lines that actually answer the query.\n\
+        - `lines` FORMAT — REQUIRED ON THE FIRST TRY: it MUST be an array of [start, end] PAIRS (an array OF arrays). \
+        Correct: \"lines\": [[7, 11], [20, 28]]. WRONG: \"lines\": [7, 11, 20, 28] (flat list) and WRONG: \"lines\": [7, 11] (single un-nested pair). \
+        A non-nested `lines` is REJECTED and you must redo the entire call — get it right the first time by always wrapping every pair in its own brackets. \
+        Group consecutive lines into one [start, end] pair (lines 7,8,9 → [7, 9]); use one bracketed pair per contiguous range.\n\
         - You have a limited query budget and a character budget for total added content.\n\
         - Each query MUST use a different information_request string. Repeating the same query is not allowed.\n\
         - You may respond with ONLY the text \"[DONE]\" (nothing else) ONLY after you have called query at least once and are confident the results fully cover the query topic.";
+
+    // When the exact filesystem tools are enabled, teach them as additional
+    // EXPLORATION tools (they slot into the same add→explore cadence as `query`
+    // and don't consume the query budget). Owned String so the extra block can
+    // be appended conditionally; `&system` is passed to the backend below.
+    let system: String = if grep_read {
+        format!(
+            "{system}\n\
+        EXACT TOOLS (grep, read) — use ALONGSIDE query, they do NOT consume the query budget:\n\
+        - `grep` does an EXACT text/regex search over the working tree. Use it to find every \
+        occurrence of a symbol, where a constant/identifier is defined, or all call sites — things \
+        semantic `query` ranks fuzzily. grep returns matching lines AND addressable chunk indices.\n\
+        - `read` returns the verbatim numbered lines of ONE file (optionally a range), plus an \
+        addressable chunk index for what it read. Use it to pull the exact code of a function you \
+        found via query or grep.\n\
+        - grep/read results join the same numbered pool as query results: add their reported chunk \
+        indices via `add_chunks` (with `lines`) exactly like any other chunk. They count as an \
+        exploration step (they satisfy the \"explore before [DONE]\" rule), so the cadence is \
+        add_chunks → (query | grep | read) → add_chunks → ...\n\
+        - Prefer grep/read when you need EXACT facts (a specific symbol, an exact line range); \
+        prefer query when you need to discover related code by meaning."
+        )
+    } else {
+        system.to_owned()
+    };
 
     // Build initial user prompt with chunk entries
     let mut entries = Vec::with_capacity(n);
@@ -551,7 +683,7 @@ async fn run_agentic_loop<B: AgenticBackend>(
          </system-reminder>"
     );
 
-    let tools = agentic_tool_definitions();
+    let tools = agentic_tool_definitions(grep_read);
     let mut messages: Vec<ChatMessage> = vec![ChatMessage::User(user_prompt.clone())];
 
     // Accumulated results from add_chunks calls.
@@ -593,6 +725,13 @@ async fn run_agentic_loop<B: AgenticBackend>(
     // that query's results — the model HAD its chance).
     let mut unharvested_query = false;
 
+    // Counts how many times the CURRENT add_chunks phase has been rejected for a
+    // malformed `lines` shape (flat list instead of nested pairs). Reset to 0
+    // whenever a phase is accepted or the model moves on (query/grep/read). Caps
+    // the reject→retry loop at MAX_FORMAT_RETRIES so a model that can't produce
+    // pairs eventually has its call accepted as-is (whole chunks, no data loss).
+    let mut format_retries: u32 = 0;
+
     // Hard safety ceiling on TOTAL iterations. Bounds an agent that neither
     // finishes, queries to its budget, nor trips the char budget. Derived from
     // the query budget — generous for interleaved query+add_chunks, capped.
@@ -612,7 +751,7 @@ async fn run_agentic_loop<B: AgenticBackend>(
         // After query results, model MUST call add_chunks (always forced).
         // After add_chunks with zero queries done, model MUST call query (forced).
         let force_tool_use = !awaiting_query || query_calls == 0;
-        let result = backend.next_turn(system, &messages, &tools, force_tool_use).await;
+        let result = backend.next_turn(&system, &messages, &tools, force_tool_use).await;
 
         match result {
             Err(e) => {
@@ -652,6 +791,33 @@ async fn run_agentic_loop<B: AgenticBackend>(
                                 });
                                 continue;
                             }
+                            // Reject a malformed `lines` shape (flat integer list
+                            // instead of nested [[start,end],...] pairs) and nudge
+                            // the model to re-emit — but only up to
+                            // MAX_FORMAT_RETRIES, after which we accept as-is so a
+                            // model that can't produce pairs never blocks the loop.
+                            // No commit, no cadence change: the model retries.
+                            let bad = malformed_line_chunks(&call.args);
+                            if !bad.is_empty() && format_retries < MAX_FORMAT_RETRIES {
+                                format_retries += 1;
+                                let bad_list = bad
+                                    .iter()
+                                    .map(|i| i.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                tool_results.push(ToolResult {
+                                    name: "add_chunks".to_owned(),
+                                    id: call.id.clone(),
+                                    content: format!(
+                                        "Error: the `lines` field for chunk(s) [{bad_list}] is a \
+                                         FLAT list of line numbers. It MUST be an array of \
+                                         [start, end] pairs. Example: \"lines\": [[7, 11], [20, 28]] \
+                                         (NOT [7, 8, 9, 20, 21]). Re-send this add_chunks call with \
+                                         every `lines` as nested [start, end] pairs."
+                                    ),
+                                });
+                                continue;
+                            }
                             let (result_content, added_chars) = handle_add_chunks(
                                 &call.args,
                                 &extended_chunks,
@@ -662,6 +828,7 @@ async fn run_agentic_loop<B: AgenticBackend>(
                                 char_budget,
                             );
                             accumulated_chars = accumulated_chars.saturating_add(added_chars);
+                            format_retries = 0;
                             awaiting_query = true;
                             // The model got its turn to harvest — clear the flag
                             // regardless of which set it actually pulled from.
@@ -722,6 +889,44 @@ async fn run_agentic_loop<B: AgenticBackend>(
                             let content = result_content;
                             tool_results.push(ToolResult {
                                 name: "query".to_owned(),
+                                id: call.id.clone(),
+                                content,
+                            });
+                        }
+                        "grep" | "read" if backend.repo_root().is_none() => {
+                            // grep_read disabled or no root → tool not offered.
+                            // Defensive: refuse like any unknown tool.
+                            warn!(tool = %call.name, "agentic rerank: fs tool called without repo root");
+                            tool_results.push(ToolResult {
+                                name: call.name.clone(),
+                                id: call.id.clone(),
+                                content: format!("Error: tool '{}' is not available.", call.name),
+                            });
+                        }
+                        "grep" => {
+                            // Exact search is an EXPLORATION tool: it satisfies the
+                            // add→explore cadence (reset awaiting_query) but does NOT
+                            // consume the query turn budget. Bounded only by the
+                            // shared char budget + iteration cap.
+                            awaiting_query = false;
+                            let root = backend.repo_root().expect("checked above");
+                            let content = run_grep_tool(
+                                &root, &call.args, &mut extended_chunks, &mut extended_numbered,
+                            );
+                            tool_results.push(ToolResult {
+                                name: "grep".to_owned(),
+                                id: call.id.clone(),
+                                content,
+                            });
+                        }
+                        "read" => {
+                            awaiting_query = false;
+                            let root = backend.repo_root().expect("checked above");
+                            let content = run_read_tool(
+                                &root, &call.args, &mut extended_chunks, &mut extended_numbered,
+                            );
+                            tool_results.push(ToolResult {
+                                name: "read".to_owned(),
                                 id: call.id.clone(),
                                 content,
                             });
@@ -814,7 +1019,7 @@ async fn run_agentic_loop<B: AgenticBackend>(
              Call add_chunks NOW with every relevant chunk from the results so far. \
              This is your final action — do not call query.".to_owned(),
         ));
-        match backend.next_turn(system, &messages, &tools, /*force_tool_use*/ true).await {
+        match backend.next_turn(&system, &messages, &tools, /*force_tool_use*/ true).await {
             Ok(ToolTurnResult::ToolCalls(calls)) => {
                 raw_response_log.push_str(&format!("[Final harvest] TOOL_CALLS: {}\n",
                     calls.iter().map(|c| format!("{}({})", c.name, c.args)).collect::<Vec<_>>().join(", ")));
@@ -964,6 +1169,29 @@ fn handle_add_chunks(
     (lines_out.join("\n"), added_chars)
 }
 
+/// Scan an `add_chunks` call's args for chunks whose `lines` is in the wrong
+/// (flattened) shape. Returns the list of offending `chunk_index` values (empty
+/// when every `lines` field is well-formed or absent). Used by the loop to
+/// reject-and-nudge BEFORE committing, so the model re-emits nested pairs.
+fn malformed_line_chunks(args: &serde_json::Value) -> Vec<u64> {
+    let Some(arr) = args.get("chunks").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut bad = Vec::new();
+    for item in arr {
+        if let Some(lines) = item.get("lines").and_then(|v| v.as_array())
+            && lines_shape_is_malformed(lines)
+        {
+            if let Some(idx) = item.get("chunk_index").and_then(|v| v.as_u64()) {
+                bad.push(idx);
+            } else {
+                bad.push(u64::MAX); // index missing too; still flag the entry
+            }
+        }
+    }
+    bad
+}
+
 /// Validate and accumulate a single `{chunk_index, lines?}` entry. Returns
 /// `(status_line, emitted_chars)`. `emitted_chars` is 0 for an error entry, and
 /// otherwise the character count of the content engine.rs will emit for this
@@ -1081,6 +1309,113 @@ fn format_sub_query_results(results: &[MergeChunk], start_idx: usize) -> String 
         ));
     }
     output
+}
+
+/// Build a pool chunk from a repo-relative file + 1-based line range discovered
+/// by `grep`/`read`. The chunk's `file` is the ABSOLUTE path (the pool's
+/// convention — `read_lines_from_fs` and the final formatter read from it), and
+/// its content/numbered text is read fresh from disk so `add_chunks` can prune
+/// it like any other chunk. Score 0.0 / no symbol metadata — these are exact-FS
+/// chunks, not embedding hits. Returns `None` if the lines can't be read.
+fn synth_pool_chunk(
+    root: &std::path::Path,
+    rel_path: &str,
+    line_start: u32,
+    line_end: u32,
+    extended_chunks: &mut Vec<MergeChunk>,
+    extended_numbered: &mut Vec<Option<String>>,
+) -> Option<usize> {
+    let abs = root.join(rel_path);
+    let abs_str = abs.to_string_lossy().replace('\\', "/");
+    let numbered_text = read_lines_from_fs(&abs_str, line_start, line_end).ok()?;
+    let idx = extended_chunks.len();
+    extended_chunks.push(MergeChunk {
+        file: abs_str,
+        line_start,
+        line_end,
+        score: 0.0,
+        content: numbered_text.clone(),
+        symbol: None,
+        symbol_fqn: None,
+        symbol_kind: None,
+    });
+    extended_numbered.push(Some(numbered_text));
+    Some(idx)
+}
+
+/// `grep` tool: exact text/regex search over the working tree. Each match-region
+/// becomes an addressable pool chunk (Design B); returns the raw grep output
+/// followed by the `[idx] path:start-end` chunk index map so the agent can
+/// `add_chunks` them. Does not consume the query budget.
+fn run_grep_tool(
+    root: &std::path::Path,
+    args: &serde_json::Value,
+    extended_chunks: &mut Vec<MergeChunk>,
+    extended_numbered: &mut Vec<Option<String>>,
+) -> String {
+    let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+    if pattern.trim().is_empty() {
+        return "Error: pattern is required.".to_owned();
+    }
+    let path = args.get("path").and_then(|v| v.as_str());
+    let literal = args.get("literal").and_then(|v| v.as_bool()).unwrap_or(false);
+    let ignore_case = args.get("ignore_case").and_then(|v| v.as_bool()).unwrap_or(false);
+    let context_lines = args
+        .get("context_lines")
+        .and_then(|v| v.as_u64())
+        .map(|n| (n as usize).min(crate::fs_tools::GREP_MAX_CONTEXT))
+        .unwrap_or(0);
+
+    let outcome = crate::fs_tools::run_grep(root, pattern, path, literal, ignore_case, context_lines);
+    if !outcome.ok || outcome.regions.is_empty() {
+        // Error or no matches — return the message as-is, nothing addressable.
+        return outcome.text;
+    }
+
+    let mut out = outcome.text;
+    out.push_str("\nAddressable chunks from this grep (pass chunk_index to add_chunks):\n");
+    for region in &outcome.regions {
+        match synth_pool_chunk(
+            root, &region.rel_path, region.line_start, region.line_end,
+            extended_chunks, extended_numbered,
+        ) {
+            Some(idx) => out.push_str(&format!(
+                "[{idx}] {}:{}-{}\n", region.rel_path, region.line_start, region.line_end
+            )),
+            None => continue,
+        }
+    }
+    out
+}
+
+/// `read` tool: verbatim numbered lines of one file. The emitted range becomes a
+/// single addressable pool chunk (Design B). Does not consume the query budget.
+fn run_read_tool(
+    root: &std::path::Path,
+    args: &serde_json::Value,
+    extended_chunks: &mut Vec<MergeChunk>,
+    extended_numbered: &mut Vec<Option<String>>,
+) -> String {
+    let file_path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+    if file_path.trim().is_empty() {
+        return "Error: file_path is required.".to_owned();
+    }
+    let start_line = args.get("start_line").and_then(|v| v.as_u64()).map(|n| n as usize);
+    let end_line = args.get("end_line").and_then(|v| v.as_u64()).map(|n| n as usize);
+
+    let outcome = crate::fs_tools::run_read(root, file_path, start_line, end_line);
+    let Some((rel, s, e)) = outcome.range.clone() else {
+        // Error or empty file — return the message, nothing addressable.
+        return outcome.text;
+    };
+
+    let mut out = outcome.text;
+    if let Some(idx) = synth_pool_chunk(root, &rel, s, e, extended_chunks, extended_numbered) {
+        out.push_str(&format!(
+            "\nAddressable chunk from this read (pass chunk_index to add_chunks):\n[{idx}] {rel}:{s}-{e}\n"
+        ));
+    }
+    out
 }
 
 fn parse_rerank_response(
@@ -1235,12 +1570,35 @@ fn parse_rerank_response(
     }
 }
 
+/// Detect a `lines` array the model emitted in the WRONG (flattened) shape: a
+/// flat list of bare integers like `[7, 8, 10, 11]` instead of the required
+/// nested pairs `[[7, 8], [10, 11]]`. Returns true iff the array is non-empty
+/// and any element is NOT a 2-element array — i.e. the call should be rejected
+/// and the model nudged to re-emit nested pairs (rather than the parser guessing
+/// the ambiguous meaning). An empty/absent `lines` is fine (means "whole chunk")
+/// and is never flagged here.
+fn lines_shape_is_malformed(arr: &[serde_json::Value]) -> bool {
+    if arr.is_empty() {
+        return false;
+    }
+    arr.iter().any(|v| !matches!(v.as_array(), Some(p) if p.len() == 2))
+}
+
 /// Validate and normalize the LLM's `lines` array for one chunk:
-/// - parse each [start, end] pair (skip malformed / start>end),
+/// - parse each `[start, end]` pair (skip malformed / start>end),
 /// - pad by RANGE_PAD and clamp to [chunk_start, chunk_end],
 /// - sort by start and merge overlapping/adjacent ranges (gap <= 1).
 ///
-/// Returns `None` if no valid range survives (caller keeps the whole chunk).
+/// STRICT: only nested `[start, end]` pairs are accepted — that is the schema,
+/// the prompt, and the format the model is nudged toward at runtime (see
+/// [`lines_shape_is_malformed`] and the reject-and-retry in the dispatch loop).
+/// A flattened integer list (`[7, 8, 10, 11]`) is intentionally NOT reinterpreted
+/// here: its meaning (ranges vs individual lines) is genuinely ambiguous, so the
+/// loop rejects it and asks the model to re-emit pairs instead of this parser
+/// guessing. Anything non-pair is skipped; if nothing valid survives we return
+/// `None` and the caller keeps the whole chunk (safe fallback, never data loss).
+///
+/// Returns `None` if no valid range survives.
 fn sanitize_ranges(
     arr: &[serde_json::Value],
     chunk_start: u32,
@@ -1352,8 +1710,63 @@ mod tests {
 
     #[test]
     fn sanitize_all_malformed_is_none() {
+        // Strict nested parsing: [1,2,3] wrong arity; ["a","b"] non-numeric; bare
+        // 5 not a pair; [9,4] start>end. Nothing survives → None.
         let arr = vec![json!([1, 2, 3]), json!(["a", "b"]), json!(5), json!([9, 4])];
         assert_eq!(sanitize_ranges(&arr, 100, 200), None);
+    }
+
+    #[test]
+    fn sanitize_strict_rejects_flat_list_to_none() {
+        // A flattened integer list is NOT reinterpreted by the parser (that's the
+        // dispatch loop's reject-and-nudge job). With no valid nested pair, the
+        // parser returns None → caller keeps the whole chunk (safe, no guessing).
+        let arr = vec![json!(7), json!(8), json!(10), json!(11)];
+        assert_eq!(sanitize_ranges(&arr, 1, 100), None);
+        // The wide-pair ambiguous case likewise yields None, never slivers.
+        assert_eq!(sanitize_ranges(&[json!(15), json!(52)], 1, 100), None);
+    }
+
+    #[test]
+    fn sanitize_accepts_nested_pairs() {
+        // The one true form: nested [start,end] pairs parse exactly (pad+merge).
+        let arr = vec![json!([7, 11]), json!([20, 28])];
+        let out = sanitize_ranges(&arr, 1, 100).expect("nested pairs must parse");
+        // [7,11]→[5,13]; [20,28]→[18,30]. Disjoint (gap 13→18 > 1) → two ranges.
+        assert_eq!(out, vec![(5, 13), (18, 30)]);
+        // A wide nested pair stays one contiguous range.
+        assert_eq!(sanitize_ranges(&[json!([15, 52])], 1, 100), Some(vec![(13, 54)]));
+    }
+
+    // ── lines_shape_is_malformed / malformed_line_chunks (reject-and-nudge) ──
+
+    #[test]
+    fn malformed_detects_flat_list_but_not_nested() {
+        // Flat integer lists are malformed; nested pairs and empty/absent are not.
+        assert!(lines_shape_is_malformed(&[json!(7), json!(8), json!(10)]));
+        assert!(lines_shape_is_malformed(&[json!(15), json!(52)]));
+        // A single stray bare int among pairs is still malformed (one bad elem).
+        assert!(lines_shape_is_malformed(&[json!([7, 11]), json!(20)]));
+        // Well-formed nested pairs: not malformed.
+        assert!(!lines_shape_is_malformed(&[json!([7, 11]), json!([20, 28])]));
+        // Empty array → "whole chunk", never flagged.
+        assert!(!lines_shape_is_malformed(&[]));
+    }
+
+    #[test]
+    fn malformed_line_chunks_reports_offending_indices() {
+        // chunk 2 has a flat list (bad); chunk 5 has nested pairs (ok); chunk 9
+        // has keep:"all" / no lines (ok). Only [2] is reported.
+        let args = json!({ "chunks": [
+            { "chunk_index": 2, "lines": [7, 8, 9, 20, 21] },
+            { "chunk_index": 5, "lines": [[7, 11], [20, 28]] },
+            { "chunk_index": 9, "keep": "all" },
+        ]});
+        assert_eq!(malformed_line_chunks(&args), vec![2]);
+
+        // All well-formed → empty.
+        let ok = json!({ "chunks": [{ "chunk_index": 1, "lines": [[1, 5]] }] });
+        assert!(malformed_line_chunks(&ok).is_empty());
     }
 
     // ── parse_rerank_response ────────────────────────────────────────────
@@ -1730,13 +2143,20 @@ mod tests {
 
     #[test]
     fn agentic_tool_definitions_are_valid() {
-        let tools = agentic_tool_definitions();
+        // Without grep/read: the original two tools.
+        let tools = agentic_tool_definitions(false);
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0].name, "add_chunks");
         assert_eq!(tools[1].name, "query");
-        // Verify parameters are valid JSON objects
         assert!(tools[0].parameters.is_object());
         assert!(tools[1].parameters.is_object());
+
+        // With grep/read: four tools, grep + read appended.
+        let tools = agentic_tool_definitions(true);
+        assert_eq!(tools.len(), 4);
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["add_chunks", "query", "grep", "read"]);
+        assert!(tools.iter().all(|t| t.parameters.is_object()));
     }
 
     // ── Failure-semantics matrix (decide_final_action) ──────────────────────
@@ -1846,14 +2266,19 @@ mod tests {
     struct MockBackend {
         turns: RefCell<std::collections::VecDeque<MockTurn>>,
         sub_query_chunks: Vec<MergeChunk>,
+        repo_root: Option<std::path::PathBuf>,
     }
 
     impl MockBackend {
         fn new(turns: Vec<MockTurn>) -> Self {
-            Self { turns: RefCell::new(turns.into()), sub_query_chunks: vec![] }
+            Self { turns: RefCell::new(turns.into()), sub_query_chunks: vec![], repo_root: None }
         }
         fn with_sub_query(turns: Vec<MockTurn>, sub: Vec<MergeChunk>) -> Self {
-            Self { turns: RefCell::new(turns.into()), sub_query_chunks: sub }
+            Self { turns: RefCell::new(turns.into()), sub_query_chunks: sub, repo_root: None }
+        }
+        /// Mock that exposes a real on-disk repo root so grep/read run for real.
+        fn with_root(turns: Vec<MockTurn>, root: std::path::PathBuf) -> Self {
+            Self { turns: RefCell::new(turns.into()), sub_query_chunks: vec![], repo_root: Some(root) }
         }
     }
 
@@ -1885,6 +2310,10 @@ mod tests {
             let chunks = self.sub_query_chunks.clone();
             async move { Ok(chunks) }
         }
+
+        fn repo_root(&self) -> Option<std::path::PathBuf> {
+            self.repo_root.clone()
+        }
     }
 
     /// An `add_chunks` call carrying a single chunk (one turn, one chunk).
@@ -1898,7 +2327,6 @@ mod tests {
     }
 
     /// An `add_chunks` call carrying a single chunk with line ranges.
-    #[allow(dead_code)]
     fn add_chunk_call_lines(idx: usize, ranges: serde_json::Value) -> ToolCall {
         ToolCall {
             name: "add_chunks".to_owned(),
@@ -1934,7 +2362,7 @@ mod tests {
         let caller_stats = vec![None; n];
         // Drive the REAL loop on the current-thread runtime.
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        rt.block_on(run_agentic_loop(backend, "q", &chunks, &numbered, &caller_stats, 16, max_turns, max_chunk_chars))
+        rt.block_on(run_agentic_loop(backend, "q", &chunks, &numbered, &caller_stats, 16, max_turns, max_chunk_chars, false))
     }
 
     /// Mirror of engine.rs step-7 index resolution: for each reranked index,
@@ -2348,5 +2776,195 @@ mod tests {
         assert_eq!(out.reranked_indices, vec![0], "committed chunk kept");
         assert!(!out.fallback_used);
         assert!(out.skip_reason.is_none(), "UseAccumulated, not a fallback");
+    }
+
+    // ── grep/read tools (Design B: results become addressable chunks) ───────
+
+    /// Drive the real loop with grep/read ENABLED and a real on-disk repo root,
+    /// so grep/read run for real against `root`. Base chunks use the same
+    /// distinct line coordinates as `run_loop_full` (100+i..110+i).
+    fn run_loop_grep_read(
+        backend: &MockBackend, n: usize, max_turns: u32, max_chunk_chars: u32,
+    ) -> (RerankOutput, ExtendedPool) {
+        let chunks: Vec<MergeChunk> = (0..n).map(|i| chunk(100 + i as u32, 110 + i as u32)).collect();
+        let numbered = vec![None; n];
+        let caller_stats = vec![None; n];
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(run_agentic_loop(
+            backend, "q", &chunks, &numbered, &caller_stats, 16, max_turns, max_chunk_chars, true,
+        ))
+    }
+
+    /// A `grep` tool call.
+    fn grep_call(pattern: &str) -> ToolCall {
+        ToolCall {
+            name: "grep".to_owned(),
+            id: Some("g".into()),
+            args: json!({ "pattern": pattern }),
+            ..Default::default()
+        }
+    }
+
+    /// A `read` tool call for a file + range.
+    fn read_call(file: &str, start: u32, end: u32) -> ToolCall {
+        ToolCall {
+            name: "read".to_owned(),
+            id: Some("r".into()),
+            args: json!({ "file_path": file, "start_line": start, "end_line": end }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn grep_results_are_addressable_and_committable() {
+        // A real temp repo with a file the grep will hit. The agent: add nothing
+        // initially is not allowed (first must be add_chunks) — so add base [0],
+        // then grep, then add_chunks the grepped chunk by its reported index, done.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("hit.rs"), "fn needle() {}\nother\n").unwrap();
+
+        // Base pool has 1 chunk (index 0). grep appends index 1 (the match region).
+        let backend = MockBackend::with_root(
+            vec![
+                MockTurn::Calls(vec![add_chunk_call(0)]),
+                MockTurn::Calls(vec![grep_call("needle")]),
+                MockTurn::Calls(vec![add_chunk_call(1)]), // commit the grepped chunk
+                MockTurn::Text("[DONE]".into()),
+            ],
+            dir.path().to_path_buf(),
+        );
+        let (out, pool) = run_loop_grep_read(&backend, 1, 5, 0);
+        // The grep chunk (index 1) was synthesized into the pool and committed.
+        assert!(out.reranked_indices.contains(&1), "grepped chunk must be committable");
+        assert!(pool.chunks.len() >= 2, "grep appended a pool chunk");
+        assert!(!out.fallback_used);
+        // The appended chunk points at the matched file.
+        assert!(pool.chunks[1].file.ends_with("hit.rs"));
+    }
+
+    #[test]
+    fn read_result_is_addressable_and_committable() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (1..=20).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(dir.path().join("f.rs"), body).unwrap();
+
+        let backend = MockBackend::with_root(
+            vec![
+                MockTurn::Calls(vec![add_chunk_call(0)]),
+                MockTurn::Calls(vec![read_call("f.rs", 5, 10)]),
+                MockTurn::Calls(vec![add_chunk_call(1)]),
+                MockTurn::Text("[DONE]".into()),
+            ],
+            dir.path().to_path_buf(),
+        );
+        let (out, pool) = run_loop_grep_read(&backend, 1, 5, 0);
+        assert!(out.reranked_indices.contains(&1), "read chunk must be committable");
+        assert_eq!(pool.chunks[1].line_start, 5);
+        assert_eq!(pool.chunks[1].line_end, 10);
+        assert!(pool.chunks[1].file.ends_with("f.rs"));
+    }
+
+    #[test]
+    fn grep_does_not_consume_query_budget() {
+        // query_budget = 1. The agent greps 3 times (exploration), never calling
+        // `query`, then [DONE]. grep must NOT decrement the query budget, so the
+        // loop runs to the agent's own [DONE] rather than a QueryBudget exit.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "alpha\nbeta\ngamma\n").unwrap();
+
+        let backend = MockBackend::with_root(
+            vec![
+                MockTurn::Calls(vec![add_chunk_call(0)]),
+                MockTurn::Calls(vec![grep_call("alpha")]),
+                MockTurn::Calls(vec![grep_call("beta")]),
+                MockTurn::Calls(vec![grep_call("gamma")]),
+                MockTurn::Text("[DONE]".into()),
+            ],
+            dir.path().to_path_buf(),
+        );
+        // max_turns (query budget) = 1, but 3 greps run fine because they don't count.
+        let (out, _pool) = run_loop_grep_read(&backend, 1, 1, 0);
+        assert_eq!(out.reranked_indices, vec![0], "base chunk kept; greps explored freely");
+        assert!(!out.fallback_used, "agent reached [DONE] cleanly, not a budget fallback");
+    }
+
+    #[test]
+    fn grep_read_disabled_refuses_the_tool() {
+        // No repo root (grep_read effectively off) → a grep call is refused like
+        // an unknown tool, and the loop still completes on accumulated chunks.
+        let backend = MockBackend::new(vec![
+            MockTurn::Calls(vec![add_chunk_call(0)]),
+            MockTurn::Calls(vec![grep_call("x")]), // refused (repo_root None)
+            MockTurn::Text("[DONE]".into()),
+        ]);
+        // run_loop drives with grep_read=false AND repo_root None.
+        let (out, _pool) = run_loop(&backend, 1, 5);
+        assert_eq!(out.reranked_indices, vec![0]);
+        assert!(!out.fallback_used);
+    }
+
+    // ── reject-and-nudge for malformed `lines` shape (Path A) ───────────────
+
+    /// An add_chunks call with a FLAT (malformed) lines list for one chunk.
+    fn add_chunk_flat_lines(idx: usize, flat: serde_json::Value) -> ToolCall {
+        ToolCall {
+            name: "add_chunks".to_owned(),
+            id: Some(format!("c{idx}")),
+            args: json!({ "chunks": [{ "chunk_index": idx, "lines": flat }] }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn malformed_lines_rejected_then_corrected_commits() {
+        // Turn 0: add_chunks with a FLAT list → rejected, NOT committed, cadence
+        // unchanged (still awaiting add_chunks). Turn 1: model re-emits nested
+        // pairs → committed. Turn 2: query (cadence ok). Turn 3: [DONE].
+        // Chunk 0 spans 100..200 (>min_prune_lines) so pruning actually applies.
+        let backend = MockBackend::with_sub_query(
+            vec![
+                MockTurn::Calls(vec![add_chunk_flat_lines(0, json!([110, 111, 120, 121]))]),
+                MockTurn::Calls(vec![add_chunk_call_lines(0, json!([[110, 121]]))]),
+                MockTurn::Calls(vec![ToolCall {
+                    name: "query".to_owned(), id: Some("q".into()),
+                    args: json!({ "information_request": "more" }), ..Default::default()
+                }]),
+                MockTurn::Text("[DONE]".into()),
+            ],
+            vec![],
+        );
+        // One WIDE chunk (100..200, span 100 > min_prune_lines 16) so pruning
+        // actually applies and the committed selection is observable.
+        let chunks = vec![chunk(100, 200)];
+        let numbered = vec![None];
+        let caller_stats = vec![None];
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (out, _pool) = rt.block_on(run_agentic_loop(
+            &backend, "q", &chunks, &numbered, &caller_stats, 16, 5, 0, false,
+        ));
+        // The corrected call committed chunk 0 with a real PRUNED line selection
+        // ([[110,121]] padded ±2 → [(108,123)]). If the flat call had been
+        // accepted instead, the selection would be None (whole chunk) — so this
+        // proves the flat call was rejected and only the nested retry committed.
+        assert_eq!(out.reranked_indices, vec![0]);
+        assert!(!out.fallback_used);
+        assert_eq!(out.line_selections, vec![Some(vec![(108, 123)])]);
+    }
+
+    #[test]
+    fn malformed_lines_accepted_after_retry_cap() {
+        // Model NEVER produces nested pairs. The first MAX_FORMAT_RETRIES flat
+        // calls are rejected; the next is accepted as-is (whole chunk kept, no
+        // data loss). Provide enough flat turns to exhaust the cap + 1.
+        let mut turns: Vec<MockTurn> = (0..(MAX_FORMAT_RETRIES + 1))
+            .map(|_| MockTurn::Calls(vec![add_chunk_flat_lines(0, json!([110, 120]))]))
+            .collect();
+        turns.push(MockTurn::Text("[DONE]".into()));
+        let backend = MockBackend::new(turns);
+        let (out, _pool) = run_loop(&backend, 1, 5);
+        // Accepted on the (cap+1)th try → chunk 0 committed (whole chunk: the flat
+        // lines yield no valid nested range, so selection is None = keep all).
+        assert_eq!(out.reranked_indices, vec![0]);
+        assert!(!out.fallback_used, "accepted-as-is is a real selection, not a fallback");
     }
 }
