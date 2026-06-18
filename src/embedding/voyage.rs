@@ -10,26 +10,60 @@ use tracing::{info, warn};
 use crate::embedding::InputType;
 
 const VOYAGE_ENDPOINT: &str = "https://api.voyageai.com/v1/embeddings";
+const OPENAI_ENDPOINT: &str = "https://api.openai.com/v1/embeddings";
 pub const MAX_BATCH_SIZE: usize = 128;
 /// Byte-size cap for the sum of input texts in a single batch. VoyageAI's
 /// per-batch token limit is 1M for voyage-4-lite. Worst-case for minified code
 /// is ~2 bytes/token; 1.5 MB / 2 = 750K tokens — 25% headroom under the 1M limit.
 const MAX_BATCH_BYTES: usize = 1_500_000;
 
-/// Resolve the embeddings URL from an optional user-supplied base.
+/// Embedding provider. Selected by the `embedding.provider` config field and
+/// the only thing that branches request building and the default endpoint —
+/// all retry/batching/parsing logic below is provider-agnostic and shared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provider {
+    Voyage,
+    OpenAI,
+}
+
+impl Provider {
+    /// Parse from the config `provider` string. Unknown values fall back to
+    /// `Voyage` (the historical default) so a typo never silently breaks
+    /// indexing — it just keeps the prior behavior.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "openai" => Provider::OpenAI,
+            _ => Provider::Voyage,
+        }
+    }
+
+    /// Default embeddings endpoint when no base URL is configured.
+    fn default_endpoint(self) -> &'static str {
+        match self {
+            Provider::Voyage => VOYAGE_ENDPOINT,
+            Provider::OpenAI => OPENAI_ENDPOINT,
+        }
+    }
+}
+
+/// Resolve the embeddings URL for a provider from an optional user-supplied base.
 ///
 /// Normalization rules (mirrors `llm::openai::chat_url`):
-///   * `None`, empty, or whitespace-only → `VOYAGE_ENDPOINT`.
+///   * `None`, empty, or whitespace-only → the provider's default endpoint.
 ///   * Trim whitespace, then strip a trailing `/`.
 ///   * If the path already ends in `/embeddings`, keep it as-is.
 ///   * Otherwise append `/embeddings`.
-pub fn voyage_url(base: Option<&str>) -> String {
+///
+/// The `voyage_base_url` config field is reused as a generic embedding base URL
+/// (only one provider is active at a time), so this normalization is identical
+/// across providers — only the blank-fallback default differs.
+pub fn embedding_url(provider: Provider, base: Option<&str>) -> String {
     let raw = match base {
         Some(s) => s.trim(),
         None => "",
     };
     if raw.is_empty() {
-        return VOYAGE_ENDPOINT.to_owned();
+        return provider.default_endpoint().to_owned();
     }
     let trimmed = raw.trim_end_matches('/');
     if trimmed.ends_with("/embeddings") {
@@ -39,13 +73,27 @@ pub fn voyage_url(base: Option<&str>) -> String {
     }
 }
 
+/// Backward-compatible alias resolving against the Voyage default endpoint.
+/// Retained so existing call sites/tests keep working; new code should use
+/// `embedding_url(provider, base)`.
+pub fn voyage_url(base: Option<&str>) -> String {
+    embedding_url(Provider::Voyage, base)
+}
+
 // ─── Request / response shapes ────────────────────────────────────────────
 
 #[derive(Serialize)]
 struct EmbedRequest<'a> {
     model: &'a str,
     input: &'a [String],
-    input_type: &'a str,
+    /// Voyage-only: `document`/`query` hint. Omitted entirely for OpenAI, which
+    /// rejects unknown fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_type: Option<&'a str>,
+    /// OpenAI-only: optional Matryoshka output-dimension truncation. Omitted for
+    /// Voyage and when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -70,19 +118,46 @@ struct VoyageInner {
     http: Client,
     /// Tighter-timeout client for user-facing query embedding (30s vs 120s).
     query_http: Client,
+    /// Selected embedding provider — branches request building and the default
+    /// endpoint only; all retry/batching/parsing below is provider-agnostic.
+    provider: Provider,
     model: String,
     api_keys: Vec<String>,
     /// Resolved embeddings endpoint URL.
     endpoint: String,
+    /// Optional output dimension (OpenAI Matryoshka). `None` → native dimension.
+    /// Only sent when `provider == OpenAI`.
+    dimensions: Option<u32>,
     /// Round-robin cursor — atomically advanced on each batch call.
     key_cursor: AtomicUsize,
 }
 
 impl VoyageClient {
-    /// Create a new client. Returns `Err` if `api_keys` is empty.
+    /// Create a Voyage embedding client (backward-compatible shim).
+    ///
+    /// Equivalent to `new_for_provider(Provider::Voyage, model, api_keys,
+    /// base_url, None)`. Retained for tests and any direct Voyage construction;
+    /// production call sites go through `new_for_provider` so the configured
+    /// provider is honored everywhere.
     pub fn new(model: String, api_keys: Vec<String>, base_url: Option<&str>) -> Result<Self> {
+        Self::new_for_provider(Provider::Voyage, model, api_keys, base_url, None)
+    }
+
+    /// Provider-aware factory: the single entry point every call site uses so the
+    /// `embedding.provider` dropdown is honored at indexing, query, and MCP.
+    ///
+    /// `dimensions` is the optional OpenAI output-dimension truncation; it is
+    /// stored but only emitted in the request body when `provider == OpenAI`.
+    /// Returns `Err` if `api_keys` is empty.
+    pub fn new_for_provider(
+        provider: Provider,
+        model: String,
+        api_keys: Vec<String>,
+        base_url: Option<&str>,
+        dimensions: Option<u32>,
+    ) -> Result<Self> {
         if api_keys.is_empty() {
-            bail!("VoyageAI client requires at least one API key");
+            bail!("embedding client requires at least one API key");
         }
         let http = Client::builder()
             .timeout(Duration::from_secs(120))
@@ -92,14 +167,16 @@ impl VoyageClient {
             .timeout(Duration::from_secs(30))
             .build()
             .context("build query reqwest client")?;
-        let endpoint = voyage_url(base_url);
+        let endpoint = embedding_url(provider, base_url);
         Ok(Self {
             inner: Arc::new(VoyageInner {
                 http,
                 query_http,
+                provider,
                 model,
                 api_keys,
                 endpoint,
+                dimensions,
                 key_cursor: AtomicUsize::new(0),
             }),
         })
@@ -108,6 +185,12 @@ impl VoyageClient {
     /// Return the configured embedding model name.
     pub fn model(&self) -> &str {
         &self.inner.model
+    }
+
+    /// Return the configured output dimension override, if any. `None` means the
+    /// model's native dimension. Used to isolate the on-disk cache directory.
+    pub fn dimensions(&self) -> Option<u32> {
+        self.inner.dimensions
     }
 
     /// Embed a single query string with bounded retry.
@@ -303,10 +386,19 @@ impl VoyageClient {
         texts: &[String],
         input_type: InputType,
     ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+        // Per-provider request body. Voyage carries `input_type`; OpenAI rejects
+        // unknown fields, so it omits `input_type` and instead carries an optional
+        // `dimensions`. Both are `Option` with skip_serializing_if so each provider
+        // emits exactly its own field set.
+        let (input_type_field, dimensions_field) = match self.inner.provider {
+            Provider::Voyage => (Some(input_type.as_str()), None),
+            Provider::OpenAI => (None, self.inner.dimensions),
+        };
         let body = EmbedRequest {
             model: &self.inner.model,
             input: texts,
-            input_type: input_type.as_str(),
+            input_type: input_type_field,
+            dimensions: dimensions_field,
         };
 
         let response = client
@@ -539,6 +631,96 @@ mod tests {
             voyage_url(Some("https://my-proxy.com/v1/embeddings/")),
             "https://my-proxy.com/v1/embeddings"
         );
+    }
+
+    // ── OpenAI provider endpoint resolution ─────────────────────────────────
+
+    #[test]
+    fn openai_url_default_when_none_or_blank() {
+        assert_eq!(embedding_url(Provider::OpenAI, None), OPENAI_ENDPOINT);
+        assert_eq!(embedding_url(Provider::OpenAI, Some("")), OPENAI_ENDPOINT);
+        assert_eq!(embedding_url(Provider::OpenAI, Some("   ")), OPENAI_ENDPOINT);
+    }
+
+    #[test]
+    fn voyage_url_default_via_embedding_url() {
+        assert_eq!(embedding_url(Provider::Voyage, None), VOYAGE_ENDPOINT);
+    }
+
+    #[test]
+    fn openai_url_appends_and_normalizes_base() {
+        // Non-blank base → identical normalization across providers (only the
+        // blank-fallback default differs).
+        assert_eq!(
+            embedding_url(Provider::OpenAI, Some("https://gateway.local/v1")),
+            "https://gateway.local/v1/embeddings"
+        );
+        assert_eq!(
+            embedding_url(Provider::OpenAI, Some("https://gateway.local/v1/")),
+            "https://gateway.local/v1/embeddings"
+        );
+        assert_eq!(
+            embedding_url(Provider::OpenAI, Some("https://gateway.local/v1/embeddings")),
+            "https://gateway.local/v1/embeddings"
+        );
+    }
+
+    #[test]
+    fn provider_from_str_parses_case_insensitively() {
+        assert_eq!(Provider::parse("openai"), Provider::OpenAI);
+        assert_eq!(Provider::parse("OpenAI"), Provider::OpenAI);
+        assert_eq!(Provider::parse(" openai "), Provider::OpenAI);
+        assert_eq!(Provider::parse("voyage"), Provider::Voyage);
+        // Unknown values fall back to Voyage (historical default).
+        assert_eq!(Provider::parse("something-else"), Provider::Voyage);
+        assert_eq!(Provider::parse(""), Provider::Voyage);
+    }
+
+    // ── Per-provider request body field set ─────────────────────────────────
+
+    fn serialize_body(provider: Provider, input_type: InputType, dimensions: Option<u32>) -> serde_json::Value {
+        let texts = vec!["hi".to_string()];
+        let (input_type_field, dimensions_field) = match provider {
+            Provider::Voyage => (Some(input_type.as_str()), None),
+            Provider::OpenAI => (None, dimensions),
+        };
+        let body = EmbedRequest {
+            model: "m",
+            input: &texts,
+            input_type: input_type_field,
+            dimensions: dimensions_field,
+        };
+        serde_json::to_value(&body).expect("serialize body")
+    }
+
+    #[test]
+    fn voyage_body_includes_input_type_omits_dimensions() {
+        let v = serialize_body(Provider::Voyage, InputType::Document, Some(512));
+        let obj = v.as_object().expect("object");
+        assert_eq!(obj.get("input_type").and_then(|x| x.as_str()), Some("document"));
+        assert!(!obj.contains_key("dimensions"), "Voyage must never send dimensions");
+        // Exact field set: model, input, input_type.
+        assert_eq!(obj.len(), 3, "Voyage body fields: {:?}", obj.keys().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn openai_body_omits_input_type_and_dimensions_when_unset() {
+        let v = serialize_body(Provider::OpenAI, InputType::Document, None);
+        let obj = v.as_object().expect("object");
+        assert!(!obj.contains_key("input_type"), "OpenAI must omit input_type");
+        assert!(!obj.contains_key("dimensions"), "OpenAI must omit dimensions when unset");
+        // Exact field set: model, input.
+        assert_eq!(obj.len(), 2, "OpenAI body fields: {:?}", obj.keys().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn openai_body_includes_dimensions_when_set() {
+        let v = serialize_body(Provider::OpenAI, InputType::Query, Some(256));
+        let obj = v.as_object().expect("object");
+        assert!(!obj.contains_key("input_type"), "OpenAI must omit input_type");
+        assert_eq!(obj.get("dimensions").and_then(|x| x.as_u64()), Some(256));
+        // Exact field set: model, input, dimensions.
+        assert_eq!(obj.len(), 3, "OpenAI body fields: {:?}", obj.keys().collect::<Vec<_>>());
     }
 
     #[test]

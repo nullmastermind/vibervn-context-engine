@@ -1561,10 +1561,12 @@ async fn do_query(
     information_request: &str,
     repo: &str,
 ) -> String {
-    let voyage_client = match VoyageClient::new(
+    let voyage_client = match VoyageClient::new_for_provider(
+        crate::embedding::voyage::Provider::parse(&settings.embedding.provider),
         settings.embedding.model.clone(),
         settings.embedding.api_keys.clone(),
         settings.embedding.voyage_base_url.as_deref(),
+        settings.embedding.dimensions,
     ) {
         Ok(c) => c,
         Err(e) => return format!("Error: failed to create embedding client: {e}"),
@@ -1711,10 +1713,12 @@ pub async fn run_file_retrieval(
     }
 
     // Embed the query.
-    let voyage_client = match VoyageClient::new(
+    let voyage_client = match VoyageClient::new_for_provider(
+        crate::embedding::voyage::Provider::parse(&settings.embedding.provider),
         settings.embedding.model.clone(),
         settings.embedding.api_keys.clone(),
         settings.embedding.voyage_base_url.as_deref(),
+        settings.embedding.dimensions,
     ) {
         Ok(c) => c,
         Err(e) => return format!("Error: failed to create embedding client: {e}"),

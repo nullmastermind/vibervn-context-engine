@@ -10,14 +10,14 @@ use serde_json::Value;
 use tempfile::NamedTempFile;
 
 /// Bump this when a new migration is appended to MIGRATIONS.
-pub const CURRENT_VERSION: u32 = 10;
+pub const CURRENT_VERSION: u32 = 11;
 
 /// Migration function type: transforms a JSON Value from version N to version N+1.
 pub type MigrationFn = fn(Value) -> Result<Value, ConfigError>;
 
 /// Ordered list of migration functions. Each entry migrates from version N to N+1,
 /// where N is the index into this slice (0-based, so index 0 = v1→v2, etc.).
-pub const MIGRATIONS: &[MigrationFn] = &[migrate_v1_to_v2, migrate_v2_to_v3, migrate_v3_to_v4, migrate_v4_to_v5, migrate_v5_to_v6, migrate_v6_to_v7, migrate_v7_to_v8, migrate_v8_to_v9, migrate_v9_to_v10];
+pub const MIGRATIONS: &[MigrationFn] = &[migrate_v1_to_v2, migrate_v2_to_v3, migrate_v3_to_v4, migrate_v4_to_v5, migrate_v5_to_v6, migrate_v6_to_v7, migrate_v7_to_v8, migrate_v8_to_v9, migrate_v9_to_v10, migrate_v10_to_v11];
 
 /// v1→v2: introduce `data_dir` (Option<PathBuf>). The body is a no-op stamp —
 /// `serde(default)` already handles missing fields on deserialize, but we
@@ -144,6 +144,23 @@ fn migrate_v9_to_v10(mut value: Value) -> Result<Value, ConfigError> {
     Ok(value)
 }
 
+/// v10→v11: introduce `embedding.dimensions` (Option<u32>). Optional output
+/// dimension for OpenAI's Matryoshka-capable models (`text-embedding-3-*`).
+/// `None` / null means the model's native dimension; the field is ignored for
+/// the Voyage provider. `serde(default)` already covers a missing field on
+/// deserialize; we stamp an explicit `null` + bump the file's `version` so an
+/// older binary refuses the file (VersionTooNew) instead of silently dropping
+/// the field on the next save. Mirrors the v6→v7 `voyage_base_url` migration.
+fn migrate_v10_to_v11(mut value: Value) -> Result<Value, ConfigError> {
+    if let Value::Object(ref mut obj) = value
+        && let Some(Value::Object(emb)) = obj.get_mut("embedding")
+    {
+        emb.entry("dimensions".to_string())
+            .or_insert(Value::Null);
+    }
+    Ok(value)
+}
+
 // ─── Settings ──────────────────────────────────────────────────────────────
 
 fn default_index_ignore_filenames() -> Vec<String> {
@@ -179,13 +196,23 @@ pub struct EmbeddingConfig {
     /// Defaults to 64 (network-bound pacing stage; saturates typical gateways).
     #[serde(default = "default_embed_concurrency")]
     pub embed_concurrency: usize,
-    /// Custom Voyage AI-compatible endpoint. Honored only when
-    /// `provider == "voyage"`. `None` / blank → the client falls back to
-    /// `https://api.voyageai.com/v1/embeddings`. Accepts either the base form
-    /// (`…/v1`) or the full `…/v1/embeddings` URL — normalization is
-    /// centralized in `embedding::voyage::voyage_url`.
+    /// Custom embedding endpoint base URL for whichever provider is active.
+    /// The JSON key remains `voyage_base_url` for backward compatibility (only
+    /// one provider is ever active at a time, so a per-provider rename would
+    /// force a migration for zero behavioral gain). `None` / blank → the client
+    /// falls back to the active provider's default endpoint (Voyage or OpenAI).
+    /// Accepts either the base form (`…/v1`) or the full `…/v1/embeddings` URL —
+    /// normalization is centralized in `embedding::voyage::embedding_url`.
     #[serde(default)]
     pub voyage_base_url: Option<String>,
+    /// Optional output dimension for the embedding model. Honored only when
+    /// `provider == "openai"`, where it maps to the `dimensions` request
+    /// parameter for Matryoshka-capable models (`text-embedding-3-*`). `None`
+    /// means the model's native dimension. Ignored for Voyage. A non-default
+    /// value is folded into the embedding cache subdirectory key so vectors of
+    /// differing length never share a `.bin` pool.
+    #[serde(default)]
+    pub dimensions: Option<u32>,
 }
 
 impl Default for EmbeddingConfig {
@@ -196,6 +223,7 @@ impl Default for EmbeddingConfig {
             api_keys: Vec::new(),
             embed_concurrency: default_embed_concurrency(),
             voyage_base_url: None,
+            dimensions: None,
         }
     }
 }
@@ -1485,8 +1513,96 @@ mod tests {
         assert_eq!(loaded.version, CURRENT_VERSION);
     }
 
-    /// `ensure_machine_id` populates the field on first call, persists it to
-    /// disk, and is a no-op on the next call (same value, no rewrite).
+    /// v10→v11: a settings file without `embedding.dimensions` loads, advances
+    /// its version, and gains an explicit `dimensions: null` on disk. Mirrors the
+    /// v6→v7 `voyage_base_url` migration test.
+    #[test]
+    fn test_v10_to_v11_migration_stamps_null_dimensions() {
+        let home = TempDir::new().expect("tempdir");
+        let path = config_path(home.path());
+        fs::create_dir_all(path.parent().expect("has parent")).expect("create dirs");
+
+        let v10 = r#"{
+            "version": 10,
+            "repos": [],
+            "embedding": {"provider":"voyage","model":"voyage-4-lite","api_keys":[],"embed_concurrency":16,"voyage_base_url":null},
+            "llm": {"provider":"google","rerank_model":"gemini-3.1-flash-lite","api_keys":[],"chat_custom_endpoints":[]},
+            "data_dir": null,
+            "embeddings_dir": null,
+            "enabled_mcp_tools": ["codebase-retrieval","file-retrieval"],
+            "custom_extensions": [],
+            "index_ignore_filenames": ["CLAUDE.md","AGENTS.md"],
+            "repo_generations": {},
+            "purchased_plans": []
+        }"#;
+        fs::write(&path, v10).expect("write v10 settings.json");
+
+        let loaded = ensure_dir_and_load(home.path()).expect("load v10");
+        assert_eq!(loaded.version, CURRENT_VERSION);
+        assert!(
+            loaded.embedding.dimensions.is_none(),
+            "dimensions must default to None after v10→v11 migration"
+        );
+
+        let raw = fs::read_to_string(&path).expect("re-read");
+        let v: Value = serde_json::from_str(&raw).expect("parse re-read");
+        assert_eq!(v.get("version").and_then(|x| x.as_u64()), Some(CURRENT_VERSION as u64));
+        let emb = v.get("embedding").expect("embedding key");
+        assert!(
+            emb.get("dimensions").map(|x| x.is_null()).unwrap_or(false),
+            "on-disk dimensions should be explicit null after migration, got: {:?}",
+            emb.get("dimensions")
+        );
+    }
+
+    /// v10→v11 migration is idempotent: an already-set `dimensions` value is
+    /// preserved, not overwritten with null.
+    #[test]
+    fn test_v10_to_v11_migration_preserves_existing_dimensions() {
+        let value: Value = serde_json::from_str(
+            r#"{"embedding":{"provider":"openai","model":"text-embedding-3-large","api_keys":[],"dimensions":512}}"#,
+        )
+        .expect("parse");
+        let migrated = migrate_v10_to_v11(value).expect("migrate");
+        let dims = migrated
+            .get("embedding")
+            .and_then(|e| e.get("dimensions"))
+            .and_then(|d| d.as_u64());
+        assert_eq!(dims, Some(512), "existing dimensions value must be preserved");
+    }
+
+    #[test]
+    fn test_embedding_config_deserializes_without_dimensions() {
+        let json = r#"{"provider":"voyage","model":"voyage-4-lite","api_keys":["k"],"embed_concurrency":16}"#;
+        let cfg: EmbeddingConfig = serde_json::from_str(json).expect("deserialize old embedding block");
+        assert!(cfg.dimensions.is_none(), "dimensions must default to None on old files");
+    }
+
+    #[test]
+    fn test_embedding_config_round_trips_dimensions() {
+        let home = TempDir::new().expect("tempdir");
+        let path = config_path(home.path());
+        fs::create_dir_all(path.parent().expect("has parent")).expect("create dirs");
+
+        let s = Settings {
+            embedding: EmbeddingConfig {
+                provider: "openai".to_owned(),
+                model: "text-embedding-3-large".to_owned(),
+                dimensions: Some(1024),
+                ..EmbeddingConfig::default()
+            },
+            ..Settings::default()
+        };
+        write_settings_atomic(&path, &s).expect("write");
+
+        let loaded = ensure_dir_and_load(home.path()).expect("load");
+        assert_eq!(
+            loaded.embedding.dimensions,
+            Some(1024),
+            "dimensions must round-trip through write+load"
+        );
+        assert_eq!(loaded.version, CURRENT_VERSION);
+    }
     #[test]
     fn ensure_machine_id_persists_and_is_idempotent() {
         let home = TempDir::new().expect("tempdir");

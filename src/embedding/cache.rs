@@ -19,17 +19,34 @@ pub struct EmbeddingCache {
 }
 
 impl EmbeddingCache {
-    /// Construct a new cache rooted at `embeddings_dir/{model}/`.
+    /// Construct a new cache rooted at `embeddings_dir/{model}/` (or
+    /// `embeddings_dir/{model}@{dims}/` when a non-default output dimension is
+    /// configured).
     ///
     /// `embeddings_dir` is the boot-resolved embedding-cache root (CLI > env >
     /// `Settings.embeddings_dir` > `<data_dir>/embeddings`) — the FULL root, not
     /// a base to append `embeddings` to. Captured once at startup; MUST NOT be
     /// re-derived from `Settings` mid-run.
     ///
+    /// `dimensions` is the OpenAI output-dimension override. When `Some`, it is
+    /// folded into the subdirectory key so the same model name at two different
+    /// output dimensions cannot feed differently-sized vectors into one `.bin`
+    /// pool (which would trip the `vector/mod.rs` dimension-mismatch guard). When
+    /// `None`, the legacy model-name-only directory is preserved so pre-existing
+    /// caches stay valid.
+    ///
     /// Returns `None` if the directory cannot be created, so callers can
     /// degrade gracefully (pipeline still works, just with no cache).
-    pub fn new(embeddings_dir: &Path, model: &str) -> Option<Self> {
-        let sanitized: String = model
+    pub fn new(embeddings_dir: &Path, model: &str, dimensions: Option<u32>) -> Option<Self> {
+        // Build the cache-key string: model name, plus `@{dims}` only when a
+        // non-default dimension is set. Sanitize the whole thing so the `@` (and
+        // any model-name punctuation) is filesystem-safe and the dimension is
+        // unambiguously part of the same directory segment.
+        let key = match dimensions {
+            Some(d) => format!("{model}@{d}"),
+            None => model.to_owned(),
+        };
+        let sanitized: String = key
             .chars()
             .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
             .collect();
@@ -289,6 +306,36 @@ mod tests {
         assert_eq!(decoded, original);
     }
 
+    // ── dimension-keyed cache directory isolation ───────────────────────────
+
+    #[test]
+    fn distinct_dimensions_get_distinct_cache_dirs() {
+        let tmp = TempDir::new().expect("tempdir");
+        // Same model name, two different non-default dimensions, plus no-override.
+        let none = EmbeddingCache::new(tmp.path(), "text-embedding-3-large", None).expect("cache");
+        let d512 = EmbeddingCache::new(tmp.path(), "text-embedding-3-large", Some(512)).expect("cache");
+        let d1024 = EmbeddingCache::new(tmp.path(), "text-embedding-3-large", Some(1024)).expect("cache");
+
+        // Each resolves to a different on-disk directory so vectors of differing
+        // length never share a `.bin` pool.
+        assert_ne!(none.cache_dir, d512.cache_dir);
+        assert_ne!(none.cache_dir, d1024.cache_dir);
+        assert_ne!(d512.cache_dir, d1024.cache_dir);
+
+        // The same text in two dimension configs maps to non-overlapping paths.
+        let text = "fn main() {}".to_string();
+        let md5 = EmbeddingCache::compute_md5(&text);
+        assert_ne!(d512.entry_path(&md5), d1024.entry_path(&md5));
+    }
+
+    #[test]
+    fn no_dimension_override_uses_legacy_model_dir() {
+        let tmp = TempDir::new().expect("tempdir");
+        // No override → the legacy model-name-only directory used before this change.
+        let cache = EmbeddingCache::new(tmp.path(), "voyage-4-lite", None).expect("cache");
+        assert_eq!(cache.cache_dir, tmp.path().join("voyage-4-lite"));
+    }
+
     // ── (b) decode rejects non-multiple-of-4 lengths ────────────────────────
 
     #[test]
@@ -306,7 +353,7 @@ mod tests {
     #[test]
     fn corrupt_entry_deleted_on_get() {
         let tmp = TempDir::new().expect("tempdir");
-        let cache = EmbeddingCache::new(tmp.path(), "test-model").expect("cache");
+        let cache = EmbeddingCache::new(tmp.path(), "test-model", None).expect("cache");
 
         let text = "corrupt-text".to_string();
         let md5 = EmbeddingCache::compute_md5(&text);
@@ -329,7 +376,7 @@ mod tests {
     #[test]
     fn put_then_get_round_trip() {
         let tmp = TempDir::new().expect("tempdir");
-        let cache = EmbeddingCache::new(tmp.path(), "test-model").expect("cache");
+        let cache = EmbeddingCache::new(tmp.path(), "test-model", None).expect("cache");
 
         let texts = vec!["hello".to_string(), "world".to_string()];
         let embeddings = vec![vec![1.0f32, 2.0, 3.0], vec![4.0f32, 5.0, 6.0]];
@@ -354,7 +401,7 @@ mod tests {
     #[test]
     fn empty_embedding_not_cached() {
         let tmp = TempDir::new().expect("tempdir");
-        let cache = EmbeddingCache::new(tmp.path(), "test-model").expect("cache");
+        let cache = EmbeddingCache::new(tmp.path(), "test-model", None).expect("cache");
 
         cache.put_many(&["empty".to_string()], &[vec![]]);
 
@@ -369,7 +416,7 @@ mod tests {
     #[test]
     fn purge_global_deletes_only_stale() {
         let tmp = TempDir::new().expect("tempdir");
-        let cache = EmbeddingCache::new(tmp.path(), "test-model").expect("cache");
+        let cache = EmbeddingCache::new(tmp.path(), "test-model", None).expect("cache");
 
         let texts = vec!["fresh-text".to_string(), "stale-text".to_string()];
         let embeddings = vec![vec![1.0f32, 2.0], vec![3.0f32, 4.0]];

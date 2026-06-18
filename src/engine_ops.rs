@@ -171,11 +171,14 @@ pub async fn run_query_op(
     top_k: usize,
     rerank: bool,
 ) -> Result<QueryResult> {
-    // Build voyage client.
-    let voyage_client = VoyageClient::new(
+    // Build the embedding client through the provider-aware factory so the
+    // configured `embedding.provider` (Voyage or OpenAI) is honored.
+    let voyage_client = VoyageClient::new_for_provider(
+        crate::embedding::voyage::Provider::parse(&settings.embedding.provider),
         settings.embedding.model.clone(),
         settings.embedding.api_keys.clone(),
         settings.embedding.voyage_base_url.as_deref(),
+        settings.embedding.dimensions,
     )
     .context("failed to create embedding client")?;
 

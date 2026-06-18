@@ -80,8 +80,8 @@ async fn test_get_creates_default() {
 
     let body: serde_json::Value = res.json().await.expect("parse json");
 
-    // version should be CURRENT_VERSION (= 10 after data_dir + embeddings_dir + mcp_tools + custom_extensions + index_ignore_filenames + voyage_base_url + repo_generations + purchased_plans + chat_custom_endpoints migrations)
-    assert_eq!(body["version"], 10);
+    // version should be CURRENT_VERSION (= 11 after data_dir + embeddings_dir + mcp_tools + custom_extensions + index_ignore_filenames + voyage_base_url + repo_generations + purchased_plans + chat_custom_endpoints + embedding.dimensions migrations)
+    assert_eq!(body["version"], 11);
 
     // repos should be an empty array
     assert!(body["repos"].as_array().map(|a| a.is_empty()).unwrap_or(false));
@@ -160,7 +160,7 @@ async fn test_put_round_trips() {
     assert_eq!(get_body.repos, expected_repos);
     assert_eq!(get_body.embedding.model, "voyage-code-3");
     assert_eq!(get_body.llm.rerank_model, "gemini-2.0-flash");
-    assert_eq!(get_body.version, 10);
+    assert_eq!(get_body.version, 11);
 }
 
 // ─── Test 3 (Unix only): file mode bits should be 0o600 ───────────────────

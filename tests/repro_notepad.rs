@@ -408,7 +408,7 @@ async fn repro_full_rebuild_notepad_ade_warm_cache() {
 
     // Build EmbeddingCache pointed at the real on-disk cache.
     use context_engine_rs::embedding::cache::EmbeddingCache;
-    let cache = match EmbeddingCache::new(&data_dir, "voyage-4-lite") {
+    let cache = match EmbeddingCache::new(&data_dir, "voyage-4-lite", None) {
         Some(c) => c,
         None => {
             eprintln!("SKIP: could not open EmbeddingCache (new returned None)");

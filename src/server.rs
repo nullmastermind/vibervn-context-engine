@@ -362,6 +362,15 @@ async fn put_config(
         }
     }
 
+    // Validate embedding.dimensions if provided. Negative values are already
+    // rejected by serde (the field is u32); the only invalid in-range value is
+    // 0. Reject it with a 400 BEFORE the disk write so settings stay unmutated
+    // on rejection (the API rejects values the model can't honor at request time).
+    if settings.embedding.dimensions == Some(0) {
+        let body = json!({ "error": "embedding.dimensions must be a positive integer" });
+        return (StatusCode::BAD_REQUEST, Json(body)).into_response();
+    }
+
     // Normalize repo paths to OS-native separators so D:/foo and D:\foo unify.
     settings.repos = settings
         .repos

@@ -433,6 +433,7 @@
                   class="border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm
                          focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active">
             <option value="voyage">Voyage AI</option>
+            <option value="openai">OpenAI</option>
           </select>
         </div>
         <div class="mb-4">
@@ -452,8 +453,20 @@
                  class="w-full border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm font-mono
                         placeholder:text-gray-400 dark:placeholder:text-wiki-text-muted
                         focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active" />
-          <p data-i18n="embed.baseUrlHelp" class="mt-1 text-xs text-gray-400 dark:text-wiki-text-muted">
-            Custom Voyage AI-compatible endpoint. Leave blank to use api.voyageai.com. Accepts either the base form (…/v1) or the full /v1/embeddings URL.
+          <p id="embedding-base-url-help" data-i18n="embed.baseUrlHelp" class="mt-1 text-xs text-gray-400 dark:text-wiki-text-muted">
+            Custom embedding endpoint for the selected provider. Leave blank to use the provider default. Accepts either the base form (…/v1) or the full /v1/embeddings URL.
+          </p>
+        </div>
+        <div id="embedding-dimensions-wrapper" class="mb-4 hidden">
+          <label data-i18n="embed.dimensions" class="block text-xs font-medium text-gray-500 dark:text-wiki-text-muted mb-1" for="embedding-dimensions">
+            Output dimensions (optional)
+          </label>
+          <input id="embedding-dimensions" type="number" min="1" placeholder="e.g. 1024"
+                 class="w-full border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm
+                        placeholder:text-gray-400 dark:placeholder:text-wiki-text-muted
+                        focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active" />
+          <p data-i18n="embed.dimensionsHelp" class="mt-1 text-xs text-gray-400 dark:text-wiki-text-muted">
+            OpenAI only. Truncates Matryoshka-capable models (text-embedding-3-*) to this output dimension. Leave blank for the model's native dimension.
           </p>
         </div>
         <div class="mb-4">
@@ -1410,6 +1423,12 @@ function applyI18n() {
   // Header search-quota text carries a {n} param, so data-i18n can't re-render it;
   // do it explicitly. Guarded on cfg so it stays hidden until config loads.
   if (typeof cfg !== 'undefined' && cfg) renderHeaderQuota();
+  // The embedding base-URL help + placeholder are provider-specific (not a single
+  // static key), so re-derive them after a language switch overwrites the
+  // data-i18n default. Guarded on cfg.
+  if (typeof cfg !== 'undefined' && cfg && typeof syncEmbeddingProviderUi === 'function') {
+    syncEmbeddingProviderUi(cfg.embedding.provider || 'voyage');
+  }
 }
 
 // ─── Translation strings ────────────────────────────────────────────────────
@@ -1522,10 +1541,20 @@ const STR = {
   'embed.heading':     { en: `Embedding Provider`, vi: `Embedding Provider`, zh: `嵌入向量提供商` },
   'embed.model':       { en: `Embedding model`, vi: `Embedding model`, zh: `嵌入模型` },
   'embed.baseUrl':     { en: `Base URL`, vi: `Base URL`, zh: `Base URL` },
-  'embed.baseUrlHelp': { en: `Custom Voyage AI-compatible endpoint. Leave blank to use api.voyageai.com. Accepts either the base form (…/v1) or the full /v1/embeddings URL.`,
-                         vi: `Endpoint tương thích Voyage AI. Để trống để dùng api.voyageai.com. Chấp nhận dạng base (…/v1) hoặc URL đầy đủ /v1/embeddings.`,
-                         zh: `自定义 Voyage AI 兼容 endpoint。留空使用 api.voyageai.com。接受 base 形式（…/v1）或完整的 /v1/embeddings URL。` },
+  'embed.baseUrlHelp': { en: `Custom embedding endpoint for the selected provider. Leave blank to use the provider default. Accepts either the base form (…/v1) or the full /v1/embeddings URL.`,
+                         vi: `Custom embedding endpoint cho provider đã chọn. Để trống để dùng mặc định của provider. Chấp nhận dạng base (…/v1) hoặc URL đầy đủ /v1/embeddings.`,
+                         zh: `所选 provider 的自定义 embedding endpoint。留空使用 provider 默认值。接受 base 形式（…/v1）或完整的 /v1/embeddings URL。` },
+  'embed.baseUrlHelpVoyage': { en: `Custom embedding endpoint. Leave blank to use api.voyageai.com. Accepts either the base form (…/v1) or the full /v1/embeddings URL.`,
+                         vi: `Custom embedding endpoint. Để trống để dùng api.voyageai.com. Chấp nhận dạng base (…/v1) hoặc URL đầy đủ /v1/embeddings.`,
+                         zh: `自定义 embedding endpoint。留空使用 api.voyageai.com。接受 base 形式（…/v1）或完整的 /v1/embeddings URL。` },
+  'embed.baseUrlHelpOpenai': { en: `Custom OpenAI-compatible embedding endpoint (e.g. Azure OpenAI, vLLM, LiteLLM). Leave blank to use api.openai.com. Accepts either the base form (…/v1) or the full /v1/embeddings URL.`,
+                         vi: `Custom OpenAI-compatible embedding endpoint (vd: Azure OpenAI, vLLM, LiteLLM). Để trống để dùng api.openai.com. Chấp nhận dạng base (…/v1) hoặc URL đầy đủ /v1/embeddings.`,
+                         zh: `自定义 OpenAI 兼容 embedding endpoint（如 Azure OpenAI、vLLM、LiteLLM）。留空使用 api.openai.com。接受 base 形式（…/v1）或完整的 /v1/embeddings URL。` },
   'embed.baseUrlPlaceholder': { en: `https://api.voyageai.com/v1`, vi: `https://api.voyageai.com/v1`, zh: `https://api.voyageai.com/v1` },
+  'embed.dimensions':  { en: `Output dimensions (optional)`, vi: `Output dimensions (tùy chọn)`, zh: `输出 dimensions（可选）` },
+  'embed.dimensionsHelp': { en: `OpenAI only. Truncates Matryoshka-capable models (text-embedding-3-*) to this output dimension. Leave blank for the model's native dimension.`,
+                         vi: `Chỉ cho OpenAI. Cắt các model hỗ trợ Matryoshka (text-embedding-3-*) về output dimension này. Để trống để dùng dimension gốc của model.`,
+                         zh: `仅 OpenAI。将支持 Matryoshka 的 model（text-embedding-3-*）截断到该输出 dimension。留空则使用 model 的原生 dimension。` },
   'embed.concurrency': { en: `Concurrent batches per key`, vi: `Số batch đồng thời mỗi key`, zh: `每个密钥的并发批次数` },
   'field.provider':    { en: `Provider`, vi: `Provider`, zh: `提供商` },
   'field.apiKeys':     { en: `API keys`, vi: `API key`, zh: `API 密钥` },
@@ -2324,6 +2353,8 @@ function renderAll() {
   document.getElementById('embedding-model').value = cfg.embedding.model || '';
   document.getElementById('embedding-base-url').value = cfg.embedding.voyage_base_url || '';
   document.getElementById('embedding-concurrency').value = cfg.embedding.embed_concurrency ?? 16;
+  document.getElementById('embedding-dimensions').value = cfg.embedding.dimensions ?? '';
+  syncEmbeddingProviderUi(cfg.embedding.provider || 'voyage');
   renderKeyList('embedding-keys-list', cfg.embedding.api_keys, (idx) => {
     cfg.embedding.api_keys.splice(idx, 1);
     renderAll();
@@ -3477,8 +3508,41 @@ function syncEnabledMcpTools() {
 }
 document.getElementById('mcp-tool-codebase-retrieval').addEventListener('change', syncEnabledMcpTools);
 document.getElementById('mcp-tool-file-retrieval').addEventListener('change', syncEnabledMcpTools);
+// Provider-conditional embedding UI: reveal the OpenAI-only dimensions input and
+// drive the base-URL placeholder/help default-endpoint hint from the selected
+// provider. Mirrors the LLM `llm-openai-base-url-wrapper` conditional pattern.
+function syncEmbeddingProviderUi(provider) {
+  const isOpenAI = provider === 'openai';
+  document.getElementById('embedding-dimensions-wrapper').classList.toggle('hidden', !isOpenAI);
+  const ph = isOpenAI ? 'https://api.openai.com/v1' : 'https://api.voyageai.com/v1';
+  document.getElementById('embedding-base-url').setAttribute('placeholder', ph);
+  const helpEl = document.getElementById('embedding-base-url-help');
+  if (helpEl) helpEl.textContent = t(isOpenAI ? 'embed.baseUrlHelpOpenai' : 'embed.baseUrlHelpVoyage');
+}
 document.getElementById('embedding-provider').addEventListener('change', (e) => {
-  if (cfg) { cfg.embedding.provider = e.target.value; saveNow(); }
+  if (cfg) {
+    cfg.embedding.provider = e.target.value;
+    // A provider switch implies the dimensions knob is only meaningful for
+    // OpenAI; drop a stale value when leaving OpenAI so it is never saved.
+    if (e.target.value !== 'openai') {
+      cfg.embedding.dimensions = null;
+      document.getElementById('embedding-dimensions').value = '';
+    }
+    syncEmbeddingProviderUi(e.target.value);
+    saveNow();
+  }
+});
+document.getElementById('embedding-dimensions').addEventListener('input', (e) => {
+  if (!cfg) return;
+  const v = e.target.value.trim();
+  if (v === '') { cfg.embedding.dimensions = null; saveDebounced(); return; }
+  const n = parseInt(v, 10);
+  // Only persist a positive integer; ignore non-positive/garbage input (the
+  // server also rejects non-positive dimensions with a 400).
+  if (Number.isInteger(n) && n > 0) {
+    cfg.embedding.dimensions = n;
+    saveDebounced();
+  }
 });
 document.getElementById('llm-provider').addEventListener('change', (e) => {
   if (cfg) {

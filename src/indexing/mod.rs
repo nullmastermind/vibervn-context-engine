@@ -1083,10 +1083,12 @@ async fn run_consumer(
             engine_ref.clear_cancel_token(&repo).await;
             continue;
         } else {
-            match VoyageClient::new(
+            match VoyageClient::new_for_provider(
+                crate::embedding::voyage::Provider::parse(&settings_ref.embedding.provider),
                 settings_ref.embedding.model.clone(),
                 settings_ref.embedding.api_keys.clone(),
                 settings_ref.embedding.voyage_base_url.as_deref(),
+                settings_ref.embedding.dimensions,
             ) {
                 Ok(c) => Some(c),
                 Err(e) => {
@@ -1185,12 +1187,14 @@ async fn run_consumer(
             let configured = settings_ref.embedding.embed_concurrency;
             let embed_concurrency = configured * n_keys;
 
-            // Build the embedding cache — uses the model name from settings so
-            // different model configurations get isolated cache directories.
+            // Build the embedding cache — uses the model name (and any non-default
+            // output dimension) from the client so different model/dimension
+            // configurations get isolated cache directories.
             let embed_cache = if let Some(ref client) = voyage_client {
                 crate::embedding::cache::EmbeddingCache::new(
                     &engine_ref.embeddings_dir,
                     client.model(),
+                    client.dimensions(),
                 )
             } else {
                 None
