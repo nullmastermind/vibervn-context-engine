@@ -202,6 +202,41 @@
 
   <!-- Main content (hidden until loaded) -->
   <div id="main-content" class="hidden">
+    <!-- Hero chat entry (lives above the tabs, outside any tabpanel — always visible) -->
+    <section id="hero-chat" class="mb-8">
+      <p data-i18n="chat.heroGreeting" class="font-wiki text-xl text-gray-700 dark:text-wiki-heading text-center mb-4">
+        What do you want to know about your code?
+      </p>
+      <form id="form-hero-chat" class="border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface rounded p-3"
+            onsubmit="return false;">
+        <textarea id="hero-chat-input" rows="2" data-i18n-ph="chat.heroPlaceholder"
+                  placeholder="Ask anything about a repository…"
+                  class="w-full resize-none bg-transparent text-sm text-gray-900 dark:text-wiki-text
+                         placeholder:text-gray-400 dark:placeholder:text-wiki-text-muted
+                         focus:outline-none min-h-[3.5rem] max-h-40 overflow-y-auto mb-2"></textarea>
+        <div class="flex items-center gap-2">
+          <select id="hero-project-select" data-i18n-aria="chat.project" aria-label="Project"
+                  class="min-w-0 max-w-[35%] border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-bg text-gray-700 dark:text-wiki-text text-xs rounded px-2 py-1
+                         focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active"></select>
+          <select id="chat-model-select" data-i18n-aria="chat.model" aria-label="Model"
+                  class="min-w-0 max-w-[35%] border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-bg text-gray-700 dark:text-wiki-text text-xs rounded px-2 py-1
+                         focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active"></select>
+          <button type="button" id="btn-manage-chat-models" data-i18n-title="chat.manageModels" data-i18n-aria="chat.manageModels"
+                  aria-label="Manage models"
+                  class="shrink-0 text-gray-400 dark:text-wiki-text-muted hover:text-gray-700 dark:hover:text-wiki-text focus:outline-none focus:ring-2 focus:ring-blue-400 rounded p-1">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          </button>
+          <button type="submit" id="btn-hero-send" data-i18n-aria="chat.send" aria-label="Send"
+                  class="ml-auto shrink-0 inline-flex items-center justify-center w-8 h-8 rounded-full
+                         bg-blue-600 dark:bg-wiki-border-active/20 dark:border dark:border-wiki-border-active text-white dark:text-wiki-link
+                         hover:bg-blue-700 dark:hover:bg-wiki-border-active/30 focus:outline-none focus:ring-2 focus:ring-blue-400
+                         disabled:opacity-50 disabled:cursor-not-allowed">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+          </button>
+        </div>
+      </form>
+    </section>
+
     <!-- Tab bar (Wikipedia-style underline tabs) -->
     <div role="tablist" id="tablist-main" class="flex border-b border-gray-200 dark:border-wiki-border mb-6">
       <button role="tab" id="tab-repos" aria-selected="true" aria-controls="panel-repos" data-i18n="tab.repos"
@@ -1209,19 +1244,6 @@
     </div>
     <!-- Composer -->
     <div class="border-t border-gray-200 dark:border-wiki-border px-4 py-3">
-      <!-- Model picker row: choose the Settings default or a custom endpoint model -->
-      <div class="flex items-center gap-2 mb-2">
-        <label for="chat-model-select" data-i18n="chat.model"
-               class="text-[11px] font-medium text-gray-500 dark:text-wiki-text-muted shrink-0">Model</label>
-        <select id="chat-model-select"
-                class="flex-1 min-w-0 border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-bg text-gray-700 dark:text-wiki-text text-xs rounded px-2 py-1
-                       focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active"></select>
-        <button type="button" id="btn-manage-chat-models" data-i18n-title="chat.manageModels" data-i18n-aria="chat.manageModels"
-                aria-label="Manage models"
-                class="shrink-0 text-gray-400 dark:text-wiki-text-muted hover:text-gray-700 dark:hover:text-wiki-text focus:outline-none focus:ring-2 focus:ring-blue-400 rounded p-1">
-          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-        </button>
-      </div>
       <form id="form-chat" class="flex items-end gap-2" onsubmit="return false;">
         <textarea id="chat-input" rows="1" data-i18n-ph="chat.placeholder"
                   placeholder="Ask anything about this repo…"
@@ -1577,6 +1599,10 @@ const STR = {
   'repo.incremental':  { en: `Incremental Update`, vi: `Incremental Update`, zh: `增量更新` },
   // Repo chat
   'chat.open':         { en: `Chat`, vi: `Chat`, zh: `对话` },
+  'chat.heroGreeting': { en: `What do you want to know about your code?`, vi: `Bạn muốn biết gì về code của mình?`, zh: `想了解你的代码的什么？` },
+  'chat.heroPlaceholder': { en: `Ask anything about a repository…`, vi: `Hỏi bất cứ điều gì về một repo…`, zh: `询问关于某个仓库的任何问题…` },
+  'chat.project':      { en: `Project`, vi: `Project`, zh: `项目` },
+  'chat.projectNone':  { en: `Select a repository`, vi: `Chọn một repo`, zh: `选择仓库` },
   'chat.title':        { en: `Chat`, vi: `Chat`, zh: `对话` },
   'chat.newChat':      { en: `New chat`, vi: `Chat mới`, zh: `新对话` },
   'chat.emptyTitle':   { en: `Ask about this repository`, vi: `Hỏi về repo này`, zh: `询问此仓库` },
@@ -2252,6 +2278,8 @@ function renderKeyList(containerId, keys, onRemove) {
 
 function renderAll() {
   renderRepos();
+  renderHeroProjectSelect();
+  renderChatModelSelect();
   document.getElementById('embedding-provider').value = cfg.embedding.provider || 'voyage';
   document.getElementById('embedding-model').value = cfg.embedding.model || '';
   document.getElementById('embedding-base-url').value = cfg.embedding.voyage_base_url || '';
@@ -5071,6 +5099,28 @@ function persistChatSelectedModel() {
   } catch (_) { /* storage unavailable → in-memory only */ }
 }
 
+// The hero project selection, persisted across reloads. Empty string = none
+// chosen. Re-validated against cfg.repos in renderHeroProjectSelect() — a repo
+// removed from the project is dropped from storage there.
+const CHAT_PROJECT_LS_KEY = 'chatSelectedProject';
+let chatSelectedProject = (() => {
+  try {
+    const raw = localStorage.getItem(CHAT_PROJECT_LS_KEY);
+    return typeof raw === 'string' ? raw : '';
+  } catch (_) { return ''; }
+})();
+
+/// Persist (or clear) the current hero project selection.
+function persistChatSelectedProject() {
+  try {
+    if (chatSelectedProject) {
+      localStorage.setItem(CHAT_PROJECT_LS_KEY, chatSelectedProject);
+    } else {
+      localStorage.removeItem(CHAT_PROJECT_LS_KEY);
+    }
+  } catch (_) { /* storage unavailable → in-memory only */ }
+}
+
 function genConversationId() {
   if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
   return 'c-' + Date.now() + '-' + Math.random().toString(16).slice(2);
@@ -5112,9 +5162,9 @@ function renderChatModelSelect() {
     // URL or model name unescaped; decoded back in the change handler. (google
     // entries carry an empty base_url, so the value is `|<model>`.)
     const val = encodeURIComponent(m.base_url) + '|' + encodeURIComponent(m.model);
-    // Label: google shows the provider, openai shows the base URL.
-    const where = m.provider === 'google' ? 'Google' : m.base_url;
-    html += '<option value="' + escHtml(val) + '">' + escHtml(m.model) + '  ·  ' + escHtml(where) + '</option>';
+    // Show the model name only — the base URL/provider is disambiguated in the
+    // manage-models dialog, and the hero select stays compact.
+    html += '<option value="' + escHtml(val) + '">' + escHtml(m.model) + '</option>';
   }
   sel.innerHTML = html;
 
@@ -5136,9 +5186,38 @@ function renderChatModelSelect() {
   }
 }
 
-function openChat() {
-  if (!currentSearchRepo) return;
-  chatRepo = currentSearchRepo;
+/// Rebuild the hero project dropdown from the configured repos. Preserves the
+/// current selection when it still exists; otherwise shows the "select" prompt.
+function renderHeroProjectSelect() {
+  const sel = document.getElementById('hero-project-select');
+  if (!sel) return;
+  const repos = (cfg && cfg.repos) || [];
+  // Prefer the live selection, falling back to the persisted one on first render.
+  const want = sel.value || chatSelectedProject;
+  let html = '<option value="">' + escHtml(t('chat.projectNone')) + '</option>';
+  for (const r of repos) {
+    html += '<option value="' + escHtml(r) + '">' + escHtml(r) + '</option>';
+  }
+  sel.innerHTML = html;
+  if (want && repos.includes(want)) {
+    sel.value = want;
+    // Keep storage in sync (e.g. first render restoring from a prior session).
+    if (chatSelectedProject !== want) { chatSelectedProject = want; persistChatSelectedProject(); }
+  } else if (want) {
+    // The remembered repo was removed from the project → forget it.
+    sel.value = '';
+    chatSelectedProject = '';
+    persistChatSelectedProject();
+  }
+}
+
+// Open the chat dialog for `repo` (defaults to the repo currently being viewed,
+// for the repo-detail Chat button). When `initialMessage` is supplied (the hero
+// entry flow), the dialog opens and immediately sends that message.
+function openChat(repo, initialMessage) {
+  const target = repo || currentSearchRepo;
+  if (!target) return;
+  chatRepo = target;
   chatConversationId = genConversationId();
   document.getElementById('chat-repo-name').textContent = chatRepo;
   // Fresh conversation each open.
@@ -5157,7 +5236,16 @@ function openChat() {
     document.body.style.overflow = 'hidden';
   }
   modal.classList.remove('hidden');
-  setTimeout(() => document.getElementById('chat-input').focus(), 50);
+  const msg = (initialMessage || '').trim();
+  if (msg) {
+    // Hero flow: seed the composer and fire the send on the same tick the
+    // dialog becomes visible.
+    const input = document.getElementById('chat-input');
+    input.value = msg;
+    sendChat();
+  } else {
+    setTimeout(() => document.getElementById('chat-input').focus(), 50);
+  }
 }
 
 function buildChatEmptyState() {
@@ -5477,7 +5565,44 @@ function handleChatEvent(turn, ev, activeSteps, gotToken) {
 }
 
 // ── Wiring ──
-document.getElementById('btn-open-chat').addEventListener('click', openChat);
+document.getElementById('btn-open-chat').addEventListener('click', () => openChat());
+
+// Hero entry: pick a project, type, Send → open the dialog for that repo and
+// fire the message immediately.
+function sendHeroChat() {
+  const projectSel = document.getElementById('hero-project-select');
+  const input = document.getElementById('hero-chat-input');
+  const repo = projectSel.value;
+  const message = input.value.trim();
+  if (!repo) { showToast(t('chat.projectNone')); projectSel.focus(); return; }
+  if (!message) { input.focus(); return; }
+  input.value = '';
+  input.style.height = 'auto';
+  updateHeroSendState();
+  openChat(repo, message);
+}
+document.getElementById('form-hero-chat').addEventListener('submit', (e) => { e.preventDefault(); sendHeroChat(); });
+// Disable Send while the textarea is empty so the user gets a clear affordance
+// that there's nothing to send yet.
+function updateHeroSendState() {
+  const btn = document.getElementById('btn-hero-send');
+  const input = document.getElementById('hero-chat-input');
+  if (!btn || !input) return;
+  btn.disabled = input.value.trim() === '';
+}
+updateHeroSendState();
+document.getElementById('hero-project-select').addEventListener('change', (e) => {
+  chatSelectedProject = e.target.value || '';
+  persistChatSelectedProject();
+});
+document.getElementById('hero-chat-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendHeroChat(); }
+});
+document.getElementById('hero-chat-input').addEventListener('input', (e) => {
+  e.target.style.height = 'auto';
+  e.target.style.height = Math.min(e.target.scrollHeight, 128) + 'px';
+  updateHeroSendState();
+});
 document.getElementById('btn-close-chat').addEventListener('click', closeChat);
 document.getElementById('btn-new-chat').addEventListener('click', newChat);
 document.getElementById('form-chat').addEventListener('submit', (e) => { e.preventDefault(); sendChat(); });
