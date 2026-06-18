@@ -3050,8 +3050,8 @@ function renderUsageBar(label, remaining, budget) {
   const pct = budget > 0 ? Math.min(100, Math.round((used / budget) * 100)) : 0;
   const fmt = (n) => n.toLocaleString();
   return `<div class="flex items-center gap-2">
-    <span class="text-xs text-gray-500 dark:text-wiki-text-muted w-12">${escHtml(label)}</span>
-    <span class="inline-block w-24 h-1.5 bg-gray-200 dark:bg-wiki-border rounded overflow-hidden">
+    <span class="text-xs text-gray-500 dark:text-wiki-text-muted w-20 shrink-0 truncate">${escHtml(label)}</span>
+    <span class="inline-block w-24 h-1.5 bg-gray-200 dark:bg-wiki-border rounded overflow-hidden shrink-0">
       <span class="block h-full ${pct >= 90 ? 'bg-red-500' : pct >= 70 ? 'bg-amber-500' : 'bg-blue-600 dark:bg-wiki-border-active'} rounded transition-[width] duration-200" style="width:${pct}%"></span>
     </span>
     <span class="text-xs text-gray-400 dark:text-wiki-text-muted">${fmt(remaining)} / ${fmt(budget)}</span>
