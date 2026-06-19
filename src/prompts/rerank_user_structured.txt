@@ -1,0 +1,6 @@
+Query: {{query}}
+
+Chunks:
+{{chunks}}
+
+Now rank the chunks by relevance. Respond with a JSON object {"ranked_indices": [ ... ]} whose array holds objects — {"chunk_index":index,"lines":[[start,end]]} to narrow, or {"chunk_index":index,"keep":"full"} to keep the whole chunk — from most to least relevant.

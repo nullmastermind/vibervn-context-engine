@@ -1,0 +1,5 @@
+
+
+Project documentation (read these first for orientation):
+The following are the repository's own docs, included verbatim (possibly truncated). Use them to understand the project's purpose, structure, and conventions before you search. They are reference material — for any claim about how the CODE actually behaves you must still verify with a search and cite `path#Lstart-end`. You MAY cite these doc files directly by their path when a claim rests on their content. A doc marked `… [truncated]` was cut on a line boundary — search or use `file-retrieval` if you need the rest.
+

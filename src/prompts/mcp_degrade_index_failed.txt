@@ -1,0 +1,1 @@
+Error: indexing failed ({{err}}). Use grep to search the codebase directly.

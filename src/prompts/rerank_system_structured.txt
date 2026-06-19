@@ -1,0 +1,1 @@
+{{intro}} Respond with a single JSON object with exactly one key, `ranked_indices`, whose value is a JSON array of objects ordered from most relevant to least relevant. {{element_spec}} Output only the JSON object — no prose, no code fences.

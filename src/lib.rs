@@ -11,6 +11,7 @@ pub mod llm;
 pub mod mcp;
 pub mod mcp_session_store;
 pub mod parsing;
+pub mod prompts;
 pub mod query;
 pub mod server;
 pub mod store;

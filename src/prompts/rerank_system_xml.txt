@@ -1,0 +1,1 @@
+{{intro}} Your output MUST contain a pair of XML tags called ranked_indices. Between the opening <ranked_indices> tag and the closing </ranked_indices> tag, place a JSON array of objects, ordered from most relevant to least relevant. {{element_spec}} Do not include any other text between the tags, only the JSON array.

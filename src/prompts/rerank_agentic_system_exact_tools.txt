@@ -1,0 +1,5 @@
+EXACT TOOLS (grep, read) — use ALONGSIDE query, they do NOT consume the query budget:
+- `grep` does an EXACT text/regex search over the working tree. Use it to find every occurrence of a symbol, where a constant/identifier is defined, or all call sites — things semantic `query` ranks fuzzily. grep returns matching lines AND addressable chunk indices.
+- `read` returns the verbatim numbered lines of ONE file (optionally a range), plus an addressable chunk index for what it read. Use it to pull the exact code of a function you found via query or grep.
+- grep/read results join the same numbered pool as query results: add their reported chunk indices via `add_chunks` (with `lines`) exactly like any other chunk. They count as an exploration step (they satisfy the "explore before [DONE]" rule), so the cadence is add_chunks → (query | grep | read) → add_chunks → ...
+- Prefer grep/read when you need EXACT facts (a specific symbol, an exact line range); prefer query when you need to discover related code by meaning.

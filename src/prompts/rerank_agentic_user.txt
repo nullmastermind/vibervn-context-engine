@@ -1,0 +1,8 @@
+Query: {{query}}
+
+Chunks:
+{{chunks}}
+
+<system-reminder>
+You MUST call `add_chunks` now to select ALL relevant chunks from the list above (most relevant first). Do NOT respond with text. Use the add_chunks tool.
+</system-reminder>

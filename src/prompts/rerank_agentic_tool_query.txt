@@ -1,0 +1,1 @@
+Search for additional code context. Use when the current chunks are insufficient to answer the original query. Returns new chunks you can then add via add_chunks. Each query call counts against the turn budget.

@@ -1,0 +1,1 @@
+Add one or more relevant code chunks to the final results, ordered most-relevant first. Each call may include many chunks at once. There is a total character budget for added chunk content; once it is reached the agent stops.

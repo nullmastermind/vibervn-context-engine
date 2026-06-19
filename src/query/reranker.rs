@@ -83,40 +83,21 @@ pub async fn rerank(
 
     let structured = client.structured_output_active();
 
-    let common_intro = "You are a code search relevance ranker. \
-        Given a query and numbered code chunks with metadata (relevance score, callers count, \
-        callees count, flow membership), your job is to rank the chunks by relevance to the query. \
-        OMIT chunks that are not relevant to the query. \
-        Higher score, more callers, and flow membership indicate higher structural importance. \
-        When both source code and documentation chunks are relevant to the query, \
-        prefer source code over documentation because code is the source of truth. \
-        Documentation can be outdated or inaccurate, but the code always reflects actual behavior. \
-        Each code line is prefixed with its absolute line number (\"123: code\"). ";
-
-    let element_spec = "Each element MUST be an object identified by `chunk_index` (the chunk index), in ONE of two forms: \
-        to narrow a large chunk to the relevant parts, use \
-        {\"chunk_index\": <index>, \"lines\": [[start, end], ...]} where `lines` are absolute line-number \
-        ranges to keep from that chunk; \
-        to keep an entire chunk (small chunks, or chunks that are wholly relevant), use \
-        {\"chunk_index\": <index>, \"keep\": \"full\"}. \
-        Only include chunks that are actually relevant to the query.";
-
     let system = if structured {
-        format!(
-            "{common_intro}\
-            Respond with a single JSON object with exactly one key, `ranked_indices`, whose value \
-            is a JSON array of objects ordered from most relevant to least relevant. \
-            {element_spec} \
-            Output only the JSON object — no prose, no code fences."
+        crate::prompts::render(
+            crate::prompts::RERANK_SYSTEM_STRUCTURED,
+            &[
+                ("intro", crate::prompts::RERANK_INTRO),
+                ("element_spec", crate::prompts::RERANK_ELEMENT_SPEC),
+            ],
         )
     } else {
-        format!(
-            "{common_intro}\
-            Your output MUST contain a pair of XML tags called ranked_indices. \
-            Between the opening <ranked_indices> tag and the closing </ranked_indices> tag, \
-            place a JSON array of objects, ordered from most relevant to least relevant. \
-            {element_spec} \
-            Do not include any other text between the tags, only the JSON array."
+        crate::prompts::render(
+            crate::prompts::RERANK_SYSTEM_XML,
+            &[
+                ("intro", crate::prompts::RERANK_INTRO),
+                ("element_spec", crate::prompts::RERANK_ELEMENT_SPEC),
+            ],
         )
     };
     let system = system.as_str();
@@ -151,21 +132,14 @@ pub async fn rerank(
     let chunks_text = entries.join("\n---\n");
     let query_json = serde_json::to_string(query).unwrap_or_else(|_| format!("\"{}\"", query));
     let user_prompt = if structured {
-        format!(
-            "Query: {query_json}\n\nChunks:\n{chunks_text}\n\n\
-             Now rank the chunks by relevance. Respond with a JSON object \
-             {{\"ranked_indices\": [ ... ]}} whose array holds objects — \
-             {{\"chunk_index\":index,\"lines\":[[start,end]]}} to narrow, or {{\"chunk_index\":index,\"keep\":\"full\"}} \
-             to keep the whole chunk — from most to least relevant."
+        crate::prompts::render(
+            crate::prompts::RERANK_USER_STRUCTURED,
+            &[("query", &query_json), ("chunks", &chunks_text)],
         )
     } else {
-        format!(
-            "Query: {query_json}\n\nChunks:\n{chunks_text}\n\n\
-             Now rank the chunks by relevance. \
-             Write the opening tag <ranked_indices>, then a JSON array of objects — \
-             {{\"chunk_index\":index,\"lines\":[[start,end]]}} to narrow, or {{\"chunk_index\":index,\"keep\":\"full\"}} \
-             to keep the whole chunk — from most to least relevant, then the closing tag \
-             </ranked_indices>."
+        crate::prompts::render(
+            crate::prompts::RERANK_USER_XML,
+            &[("query", &query_json), ("chunks", &chunks_text)],
         )
     };
 
@@ -215,9 +189,7 @@ fn agentic_tool_definitions(grep_read: bool) -> Vec<ToolDef> {
     let mut tools = vec![
         ToolDef {
             name: "add_chunks".to_owned(),
-            description: "Add one or more relevant code chunks to the final results, ordered most-relevant first. \
-                Each call may include many chunks at once. There is a total character budget for added \
-                chunk content; once it is reached the agent stops.".to_owned(),
+            description: crate::prompts::RERANK_AGENTIC_TOOL_ADD_CHUNKS.to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -256,7 +228,7 @@ fn agentic_tool_definitions(grep_read: bool) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "query".to_owned(),
-            description: "Search for additional code context. Use when the current chunks are insufficient to answer the original query. Returns new chunks you can then add via add_chunks. Each query call counts against the turn budget.".to_owned(),
+            description: crate::prompts::RERANK_AGENTIC_TOOL_QUERY.to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -273,13 +245,7 @@ fn agentic_tool_definitions(grep_read: bool) -> Vec<ToolDef> {
     if grep_read {
         tools.push(ToolDef {
             name: "grep".to_owned(),
-            description: "Exact text/regex search over the repository's working tree (like \
-                ripgrep). Unlike query (semantic, ranked by meaning), this finds the LITERAL \
-                pattern and returns matching lines as `path:line: text`, plus addressable chunk \
-                indices you can pass to add_chunks. Use it to find every call site of a symbol, \
-                where a constant is defined, or all uses of an identifier. Does NOT consume the \
-                query turn budget. Respects .gitignore; skips binary files."
-                .to_owned(),
+            description: crate::prompts::RERANK_AGENTIC_TOOL_GREP.to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -312,13 +278,7 @@ fn agentic_tool_definitions(grep_read: bool) -> Vec<ToolDef> {
         });
         tools.push(ToolDef {
             name: "read".to_owned(),
-            description: "Read the verbatim contents of ONE file in the repository as numbered \
-                lines, exactly as on disk. Unlike query (semantic chunks), this returns the raw \
-                lines with no ranking, plus an addressable chunk index for the range you read so \
-                you can pass it to add_chunks. Use it to see the actual code of a file you found \
-                via query or grep. Optionally restrict to a line range. Does NOT consume the query \
-                turn budget."
-                .to_owned(),
+            description: crate::prompts::RERANK_AGENTIC_TOOL_READ.to_owned(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -592,64 +552,14 @@ async fn run_agentic_loop<B: AgenticBackend>(
         );
     }
 
-    let system = "You are a code search relevance agent. \
-        You are given a query and numbered code chunks with metadata. \
-        Your ONLY job is to select relevant chunks via tools. NEVER answer the query. NEVER explain or summarize.\n\
-        YOUR FIRST RESPONSE MUST BE a call to the `add_chunks` tool. No exceptions. No text. Call `add_chunks` immediately.\n\
-        WORKFLOW — strict alternating cadence:\n\
-        1. Call add_chunks ONCE with ALL relevant initial chunks (most relevant first). OMIT irrelevant chunks.\n\
-        2. Call query to search for RELATED code that is NOT in the initial chunks (callers, callees, dependencies, implementations, tests, types). You MUST do this at least once to cover the full blast radius.\n\
-        3. Call add_chunks ONCE with ONLY the chunks from those query results that are DIRECTLY relevant to the ORIGINAL user query (shown at the top). Do NOT add chunks just because they appeared in query results — most results will be tangential. Be highly selective.\n\
-        4. Repeat steps 2-3 with a DIFFERENT query string each time.\n\
-        The pattern is always: add_chunks → query → add_chunks → query → ...\n\
-        You CANNOT call add_chunks twice in a row. After each add_chunks you MUST either call query or stop.\n\
-        CRITICAL: Each add_chunks call is FINAL for that set of chunks. Include EVERY relevant chunk in that single call. You will NOT get another chance to add from the same set.\n\
-        IMPORTANT: The initial chunks are only a starting point. They rarely cover the full picture. \
-        You MUST use query to find related code: callers of key functions, type definitions, trait implementations, \
-        sibling modules, test files, configuration, and anything else needed to fully understand the query topic. \
-        Stopping after just the initial chunks gives an incomplete answer.\n\
-        RELEVANCE FILTER: Every chunk you add MUST directly help answer the ORIGINAL user query. \
-        Query results often contain tangentially related code — do NOT blindly add all results. \
-        Ask yourself: \"Does this chunk contain information the user needs to answer their query?\" If not, skip it.\n\
-        RULES:\n\
-        - For each chunk, you MUST specify either `lines` (to prune to specific line ranges) or `keep: \"all\"` (to keep the entire chunk). Never omit both.\n\
-        - LINE PRECISION IS MANDATORY: Default to using `lines` to select ONLY the specific line ranges that answer the query. \
-        `keep: \"all\"` is ONLY for chunks where literally EVERY line is relevant (rare — typically only for short chunks <20 lines). \
-        For most chunks, only a portion matters — use `lines: [[start, end], ...]` with the absolute line numbers shown in the chunk. \
-        Adding entire large chunks wastes your character budget and dilutes the results with irrelevant code.\n\
-        - DO NOT FAKE PRUNING. A range that spans the whole chunk (e.g. `[[1, 42]]` for a 42-line chunk, or `[[1, <last line>]]`) is NOT pruning — it keeps everything. \
-        If you genuinely need the entire chunk, use `keep: \"all\"` instead; otherwise pick the actual sub-ranges that matter. \
-        Each chunk's ranges must be chosen from ITS OWN content — never copy the same range (like `[[15, 52]]`) onto multiple different chunks. \
-        If you find yourself selecting almost every line of most chunks, you are being too greedy: re-read each chunk and cut to the lines that actually answer the query.\n\
-        - `lines` FORMAT — REQUIRED ON THE FIRST TRY: it MUST be an array of [start, end] PAIRS (an array OF arrays). \
-        Correct: \"lines\": [[7, 11], [20, 28]]. WRONG: \"lines\": [7, 11, 20, 28] (flat list) and WRONG: \"lines\": [7, 11] (single un-nested pair). \
-        A non-nested `lines` is REJECTED and you must redo the entire call — get it right the first time by always wrapping every pair in its own brackets. \
-        Group consecutive lines into one [start, end] pair (lines 7,8,9 → [7, 9]); use one bracketed pair per contiguous range.\n\
-        - You have a limited query budget and a character budget for total added content.\n\
-        - Each query MUST use a different information_request string. Repeating the same query is not allowed.\n\
-        - You may respond with ONLY the text \"[DONE]\" (nothing else) ONLY after you have called query at least once and are confident the results fully cover the query topic.";
+    let system = crate::prompts::RERANK_AGENTIC_SYSTEM;
 
     // When the exact filesystem tools are enabled, teach them as additional
     // EXPLORATION tools (they slot into the same add→explore cadence as `query`
     // and don't consume the query budget). Owned String so the extra block can
     // be appended conditionally; `&system` is passed to the backend below.
     let system: String = if grep_read {
-        format!(
-            "{system}\n\
-        EXACT TOOLS (grep, read) — use ALONGSIDE query, they do NOT consume the query budget:\n\
-        - `grep` does an EXACT text/regex search over the working tree. Use it to find every \
-        occurrence of a symbol, where a constant/identifier is defined, or all call sites — things \
-        semantic `query` ranks fuzzily. grep returns matching lines AND addressable chunk indices.\n\
-        - `read` returns the verbatim numbered lines of ONE file (optionally a range), plus an \
-        addressable chunk index for what it read. Use it to pull the exact code of a function you \
-        found via query or grep.\n\
-        - grep/read results join the same numbered pool as query results: add their reported chunk \
-        indices via `add_chunks` (with `lines`) exactly like any other chunk. They count as an \
-        exploration step (they satisfy the \"explore before [DONE]\" rule), so the cadence is \
-        add_chunks → (query | grep | read) → add_chunks → ...\n\
-        - Prefer grep/read when you need EXACT facts (a specific symbol, an exact line range); \
-        prefer query when you need to discover related code by meaning."
-        )
+        format!("{system}\n{}", crate::prompts::RERANK_AGENTIC_SYSTEM_EXACT_TOOLS)
     } else {
         system.to_owned()
     };
@@ -675,12 +585,9 @@ async fn run_agentic_loop<B: AgenticBackend>(
     let query_json = serde_json::to_string(query).unwrap_or_else(|_| format!("\"{}\"", query));
 
     let chunks_text = entries.join("\n---\n");
-    let user_prompt = format!(
-        "Query: {query_json}\n\nChunks:\n{chunks_text}\n\n\
-         <system-reminder>\n\
-         You MUST call `add_chunks` now to select ALL relevant chunks from the list above (most relevant first). \
-         Do NOT respond with text. Use the add_chunks tool.\n\
-         </system-reminder>"
+    let user_prompt = crate::prompts::render(
+        crate::prompts::RERANK_AGENTIC_USER,
+        &[("query", &query_json), ("chunks", &chunks_text)],
     );
 
     let tools = agentic_tool_definitions(grep_read);

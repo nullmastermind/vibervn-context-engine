@@ -1,0 +1,1 @@
+Search this repository's index for code and context relevant to a natural-language request. Returns ranked source snippets with file paths and line ranges. Use this first for any question about how the project works.

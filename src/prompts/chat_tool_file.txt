@@ -1,0 +1,1 @@
+Retrieve the most relevant chunks of ONE specific file in this repository for a request. Use after codebase-retrieval points you at a file and you need more of its content.

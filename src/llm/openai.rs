@@ -170,7 +170,7 @@ fn ensure_json_token(structured: bool, system: &str, user: &str) -> String {
         && !system.to_lowercase().contains("json")
         && !user.to_lowercase().contains("json");
     if missing {
-        format!("{system}\nRespond in JSON.")
+        format!("{system}\n{}", crate::prompts::LLM_RESPOND_IN_JSON)
     } else {
         system.to_owned()
     }
