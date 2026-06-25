@@ -246,6 +246,7 @@ pub fn build_router(
         .route("/api/defender-status", get(get_defender_status))
         .route("/api/defender-exclude", post(post_defender_exclude))
         .route("/api/plan/packages", get(plan_get_packages))
+        .route("/api/plan/payment-methods", get(plan_get_payment_methods))
         .route("/api/plan/checkout", post(plan_post_checkout))
         .route(
             "/api/plan/orders/:invoice/status",
@@ -1927,6 +1928,32 @@ async fn plan_post_free_trial_claim(State(state): State<AppState>) -> Response {
 async fn plan_get_packages(State(_): State<AppState>) -> Response {
     let base = plan_admin_base();
     let url = format!("{base}/api/packages");
+
+    let res = match plan_http_client().get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("admin gateway unreachable: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let status = StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let body = res.bytes().await.unwrap_or_default();
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body))
+        .unwrap()
+}
+
+/// Proxy the admin gateway's enabled-payment-methods so the engine UI popup can
+/// show only the methods the operator turned on (and nothing when both are off).
+async fn plan_get_payment_methods(State(_): State<AppState>) -> Response {
+    let base = plan_admin_base();
+    let url = format!("{base}/api/payment-methods");
 
     let res = match plan_http_client().get(&url).send().await {
         Ok(r) => r,

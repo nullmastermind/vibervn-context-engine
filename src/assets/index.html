@@ -1246,6 +1246,13 @@ const STR = {
   'plan.duration':      { en: `{n} days`, vi: `{n} ngày`, zh: `{n} 天` },
   'plan.openai':        { en: `Search`, vi: `Search`, zh: `Search` },
   'plan.timeout':       { en: `Payment not confirmed. Check your email or try again.`, vi: `Chưa xác nhận được thanh toán. Kiểm tra email hoặc thử lại.`, zh: `付款未确认。请检查邮件或重试。` },
+  'common.cancel':      { en: `Cancel`, vi: `Hủy`, zh: `取消` },
+  'plan.method.title':    { en: `Choose payment method`, vi: `Chọn phương thức thanh toán`, zh: `选择支付方式` },
+  'plan.method.subtitle': { en: `Pick how you want to pay.`, vi: `Chọn cách bạn muốn thanh toán.`, zh: `选择你想要的支付方式。` },
+  'plan.method.sepayDesc':  { en: `Bank card / QR (VND)`, vi: `Thẻ ngân hàng / QR (VND)`, zh: `银行卡 / 二维码 (VND)` },
+  'plan.method.cryptoDesc': { en: `USDT via pay.crypt.bot`, vi: `USDT qua pay.crypt.bot`, zh: `通过 pay.crypt.bot 支付 USDT` },
+  'plan.method.none':       { en: `No payment method is available right now. Please try again later.`, vi: `Hiện chưa có phương thức thanh toán nào. Vui lòng thử lại sau.`, zh: `当前没有可用的支付方式，请稍后再试。` },
+  'plan.method.loadError':  { en: `Could not load payment methods. Please try again.`, vi: `Không thể tải phương thức thanh toán. Vui lòng thử lại.`, zh: `无法加载支付方式，请重试。` },
   'plan.purchased':     { en: `Purchased Plans`, vi: `Gói đã mua`, zh: `已购套餐` },
   'plan.purchased.lookup': { en: `Lookup by invoice`, vi: `Tra cứu theo invoice`, zh: `按发票号查询` },
   'plan.purchased.lookupBtn': { en: `Lookup`, vi: `Tra cứu`, zh: `查询` },
@@ -2676,11 +2683,70 @@ function planFreeTrialSuccess(proxyKey, baseUrl, expiresAt, durationDays) {
 async function planCheckout(packageId) {
   const error = document.getElementById('plan-error');
   error.classList.add('hidden');
+  // Ask which methods are enabled, then show the picker. Only enabled methods
+  // are offered; none enabled ⇒ message, never a dead checkout.
+  let methods;
+  try {
+    const res = await fetch('/api/plan/payment-methods');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    methods = await res.json();
+  } catch (e) {
+    error.textContent = t('plan.method.loadError');
+    error.classList.remove('hidden');
+    return;
+  }
+  const available = [];
+  if (methods.sepay) available.push('SEPAY');
+  if (methods.crypto) available.push('CRYPTO');
+  if (available.length === 0) {
+    error.textContent = t('plan.method.none');
+    error.classList.remove('hidden');
+    return;
+  }
+  showPlanMethodPicker(packageId, available);
+}
+
+function showPlanMethodPicker(packageId, methods) {
+  let overlay = document.getElementById('plan-method-overlay');
+  if (overlay) overlay.remove();
+  const labels = {
+    SEPAY: { label: 'SePay', desc: t('plan.method.sepayDesc') },
+    CRYPTO: { label: 'Crypto Bot', desc: t('plan.method.cryptoDesc') },
+  };
+  overlay = document.createElement('div');
+  overlay.id = 'plan-method-overlay';
+  overlay.className = 'fixed inset-0 bg-black/40 dark:bg-black/60 flex items-center justify-center z-50 px-4';
+  overlay.innerHTML = `
+    <div class="bg-white dark:bg-wiki-bg border border-gray-200 dark:border-wiki-border rounded shadow-lg w-full max-w-sm p-5">
+      <h3 class="text-base font-semibold text-gray-900 dark:text-wiki-heading mb-1">${t('plan.method.title')}</h3>
+      <p class="text-sm text-gray-500 dark:text-wiki-text-muted mb-4">${t('plan.method.subtitle')}</p>
+      <div class="space-y-2">
+        ${methods.map(m => `
+          <button data-method="${m}" class="plan-method-opt w-full text-left p-3 border border-gray-200 dark:border-wiki-border rounded hover:border-blue-400 dark:hover:border-wiki-link focus:outline-none focus:ring-2 focus:ring-blue-400 transition-colors">
+            <div class="font-medium text-gray-900 dark:text-wiki-heading">${escHtml(labels[m].label)}</div>
+            <div class="text-xs text-gray-500 dark:text-wiki-text-muted">${escHtml(labels[m].desc)}</div>
+          </button>`).join('')}
+      </div>
+      <div id="plan-method-error" class="text-sm text-red-600 dark:text-red-400 mt-3 hidden"></div>
+      <button id="plan-method-cancel" class="mt-4 w-full text-sm text-gray-500 dark:text-wiki-text-muted hover:text-gray-700 dark:hover:text-wiki-text py-2">${t('common.cancel')}</button>
+    </div>`;
+  document.body.appendChild(overlay);
+  overlay.querySelector('#plan-method-cancel').onclick = () => overlay.remove();
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+  overlay.querySelectorAll('.plan-method-opt').forEach(btn => {
+    btn.onclick = () => planCheckoutWithMethod(packageId, btn.dataset.method, overlay);
+  });
+}
+
+async function planCheckoutWithMethod(packageId, method, overlay) {
+  const errEl = overlay.querySelector('#plan-method-error');
+  errEl.classList.add('hidden');
+  overlay.querySelectorAll('.plan-method-opt').forEach(b => b.disabled = true);
   try {
     const res = await fetch('/api/plan/checkout', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ package_id: packageId }),
+      body: JSON.stringify({ package_id: packageId, method }),
     });
     if (!res.ok) {
       const d = await res.json().catch(() => ({}));
@@ -2696,13 +2762,15 @@ async function planCheckout(packageId) {
       duration_days: planSelectedPackage ? planSelectedPackage.duration_days : 0,
     }));
 
-    // Redirect to SePay checkout page (backend already did the POST)
+    overlay.remove();
+    // Both methods return a URL to open: SePay hosted checkout / Crypto bot invoice.
     window.open(data.redirect_url, '_blank');
 
     planStartPolling();
   } catch (e) {
-    error.textContent = e.message;
-    error.classList.remove('hidden');
+    errEl.textContent = e.message;
+    errEl.classList.remove('hidden');
+    overlay.querySelectorAll('.plan-method-opt').forEach(b => b.disabled = false);
   }
 }
 
