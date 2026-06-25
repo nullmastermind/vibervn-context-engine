@@ -9,7 +9,7 @@ use serde_json::Value;
 use tempfile::NamedTempFile;
 
 /// Bump this when a new migration is appended to MIGRATIONS.
-pub const CURRENT_VERSION: u32 = 11;
+pub const CURRENT_VERSION: u32 = 12;
 
 /// Migration function type: transforms a JSON Value from version N to version N+1.
 pub type MigrationFn = fn(Value) -> Result<Value, ConfigError>;
@@ -27,6 +27,7 @@ pub const MIGRATIONS: &[MigrationFn] = &[
     migrate_v8_to_v9,
     migrate_v9_to_v10,
     migrate_v10_to_v11,
+    migrate_v11_to_v12,
 ];
 
 /// v1→v2: introduce `data_dir` (Option<PathBuf>). The body is a no-op stamp —
@@ -172,6 +173,20 @@ fn migrate_v10_to_v11(mut value: Value) -> Result<Value, ConfigError> {
     Ok(value)
 }
 
+/// v11→v12: introduce top-level `worker_idle_secs` (u64). Idle window before a
+/// process-per-project worker self-exits (scale-to-zero). `serde(default)`
+/// already covers a missing field on deserialize; we stamp the explicit default
+/// (300) + bump the file's `version` so an older binary refuses the file
+/// (VersionTooNew) rather than silently dropping the field on the next save.
+/// Mirrors the v10→v11 additive-field migration.
+fn migrate_v11_to_v12(mut value: Value) -> Result<Value, ConfigError> {
+    if let Value::Object(ref mut obj) = value {
+        obj.entry("worker_idle_secs".to_string())
+            .or_insert_with(|| Value::from(default_worker_idle_secs()));
+    }
+    Ok(value)
+}
+
 // ─── Settings ──────────────────────────────────────────────────────────────
 
 fn default_index_ignore_filenames() -> Vec<String> {
@@ -195,6 +210,13 @@ fn default_vector_resident_cap_mb() -> usize {
     // would exceed it. Cold repos are warmed lazily on query. 0 disables the cap
     // (unbounded — not recommended). Default 2048 MB (~2 GB).
     2048
+}
+
+/// Default worker idle window (seconds) before a process-per-project worker
+/// self-exits. 5 minutes balances resource reclaim against cold-start frequency
+/// (a respawn pays only the measured 0.6–1.4s cold `open_db`).
+fn default_worker_idle_secs() -> u64 {
+    300
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -455,6 +477,15 @@ pub struct Settings {
     /// repos when exceeded. 0 disables the cap. Defaults to 2048 (~2 GB).
     #[serde(default = "default_vector_resident_cap_mb")]
     pub vector_resident_cap_mb: usize,
+    /// Idle window (seconds) after which a process-per-project WORKER self-exits
+    /// to release its RocksDB handle, watcher, and resident shard (scale-to-zero).
+    /// The router respawns the worker on the next request to that repo. A `--worker
+    /// --worker-idle-secs` CLI flag / `CONTEXT_ENGINE_WORKER_IDLE_SECS` env var
+    /// override this at launch; this setting is the persisted default. Lower =
+    /// tighter resource reclaim but more cold starts (measured cold open_db is
+    /// 0.6–1.4s, so a respawn is cheap). Default 300 (5 min).
+    #[serde(default = "default_worker_idle_secs")]
+    pub worker_idle_secs: u64,
     /// User's preferred data directory base. RocksDB lives at
     /// `<data_dir>/rocksdb/`. The embedding cache defaults to
     /// `<data_dir>/embeddings/` but can be relocated independently via
@@ -556,6 +587,7 @@ impl Default for Settings {
             mcp_index_wait_secs: default_mcp_index_wait_secs(),
             mcp_stale_after_days: default_mcp_stale_after_days(),
             vector_resident_cap_mb: default_vector_resident_cap_mb(),
+            worker_idle_secs: default_worker_idle_secs(),
             data_dir: None,
             embeddings_dir: None,
             enabled_mcp_tools: default_enabled_mcp_tools(),
@@ -831,7 +863,62 @@ pub fn ensure_dir_and_load(home_dir: &Path) -> Result<Settings, ConfigError> {
     Ok(settings)
 }
 
-/// Ensure `settings.machine_id` is `Some(...)` and persisted on disk. Called
+/// Return the last-modified time of `settings.json`, or `None` if it can't be
+/// stat'd (missing / permission). Cheap (`fs::metadata`), used as the gate for
+/// the worker's config re-read so a hot request path doesn't re-parse the file
+/// every time — only when the router has actually rewritten it.
+pub fn settings_mtime(home_dir: &Path) -> Option<std::time::SystemTime> {
+    fs::metadata(config_path(home_dir))
+        .ok()
+        .and_then(|m| m.modified().ok())
+}
+
+/// PROCESS-PER-PROJECT config propagation (worker side).
+///
+/// The router owns `settings.json` and writes it disk-FIRST on every
+/// `PUT /api/config`. A long-lived worker process must pick up changes (a
+/// rotated Voyage key, a new rerank model) WITHOUT a restart and WITHOUT IPC —
+/// otherwise a worker that booted before a key rotation would keep querying with
+/// the dead key until it idle-exits. This is the real gap: those clients are
+/// rebuilt per-request from `Settings`, so refreshing the shared `Settings`
+/// handle before a request builds them is sufficient to cover BOTH the index
+/// path (consumer fresh-snapshot) and the query path (per-request client build).
+///
+/// `maybe_reload_settings` is the mtime-gated refresh: if `settings.json`'s
+/// mtime is newer than `last_seen`, re-load + migrate it and swap the shared
+/// handle (disk is the source of truth; the router already validated + persisted
+/// it). Returns the new mtime to store as the next `last_seen`. On any load
+/// error it leaves the in-memory settings untouched (a transient bad read must
+/// not wipe a worker's working config) and returns `last_seen` unchanged.
+///
+/// Cheap by design: a `stat` on the hot path, re-parse ONLY when the file
+/// changed. The query path is network-embed-bound, so a sub-millisecond stat is
+/// negligible.
+pub async fn maybe_reload_settings(
+    home_dir: &Path,
+    settings: &std::sync::Arc<tokio::sync::RwLock<Settings>>,
+    last_seen: Option<std::time::SystemTime>,
+) -> Option<std::time::SystemTime> {
+    let current = settings_mtime(home_dir);
+    // No change (or can't stat) → keep the in-memory settings and the prior stamp.
+    match (current, last_seen) {
+        (Some(cur), Some(prev)) if cur <= prev => return last_seen,
+        (None, _) => return last_seen,
+        _ => {}
+    }
+    // File changed (or first observation): reload + migrate from disk.
+    match ensure_dir_and_load(home_dir) {
+        Ok(fresh) => {
+            *settings.write().await = fresh;
+            current
+        }
+        Err(e) => {
+            // Transient bad read — do NOT clobber the working in-memory config.
+            tracing::warn!(error = %e, "settings reload failed; keeping in-memory config");
+            last_seen
+        }
+    }
+}
 /// once at boot, after `ensure_dir_and_load`. Mutates `settings` in place.
 ///
 /// First boot (or upgrades from a settings file written before this field
@@ -1650,6 +1737,63 @@ mod tests {
             dims,
             Some(512),
             "existing dimensions value must be preserved"
+        );
+    }
+
+    /// v11→v12: a settings file without `worker_idle_secs` loads, advances its
+    /// version, and gains an explicit `worker_idle_secs: 300` on disk. Mirrors
+    /// the v10→v11 additive-field migration test.
+    #[test]
+    fn test_v11_to_v12_migration_stamps_worker_idle_secs() {
+        let home = TempDir::new().expect("tempdir");
+        let path = config_path(home.path());
+        fs::create_dir_all(path.parent().expect("has parent")).expect("create dirs");
+
+        let v11 = r#"{
+            "version": 11,
+            "repos": [],
+            "embedding": {"provider":"voyage","model":"voyage-4-lite","api_keys":[],"embed_concurrency":16,"voyage_base_url":null,"dimensions":null},
+            "llm": {"provider":"google","rerank_model":"gemini-3.1-flash-lite","api_keys":[],"chat_custom_endpoints":[]},
+            "data_dir": null,
+            "embeddings_dir": null,
+            "enabled_mcp_tools": ["codebase-retrieval","file-retrieval"],
+            "custom_extensions": [],
+            "index_ignore_filenames": ["CLAUDE.md","AGENTS.md"],
+            "repo_generations": {},
+            "purchased_plans": []
+        }"#;
+        fs::write(&path, v11).expect("write v11 settings.json");
+
+        let loaded = ensure_dir_and_load(home.path()).expect("load v11");
+        assert_eq!(loaded.version, CURRENT_VERSION);
+        assert_eq!(
+            loaded.worker_idle_secs,
+            default_worker_idle_secs(),
+            "worker_idle_secs must default to 300 after v11→v12 migration"
+        );
+
+        let raw = fs::read_to_string(&path).expect("re-read");
+        let v: Value = serde_json::from_str(&raw).expect("parse re-read");
+        assert_eq!(
+            v.get("version").and_then(|x| x.as_u64()),
+            Some(CURRENT_VERSION as u64)
+        );
+        assert_eq!(
+            v.get("worker_idle_secs").and_then(|x| x.as_u64()),
+            Some(300),
+            "on-disk worker_idle_secs should be explicit 300 after migration"
+        );
+    }
+
+    /// v11→v12 is idempotent: an already-set `worker_idle_secs` is preserved.
+    #[test]
+    fn test_v11_to_v12_migration_preserves_existing_idle() {
+        let value: Value = serde_json::from_str(r#"{"worker_idle_secs": 30}"#).expect("parse");
+        let migrated = migrate_v11_to_v12(value).expect("migrate");
+        assert_eq!(
+            migrated.get("worker_idle_secs").and_then(|x| x.as_u64()),
+            Some(30),
+            "existing worker_idle_secs must be preserved, not reset to default"
         );
     }
 

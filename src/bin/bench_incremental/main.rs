@@ -241,6 +241,7 @@ async fn run() -> i32 {
         // With watchers off, the only triggers in flight are the ones this
         // harness explicitly sends — the measured run is the sole timed work.
         no_watchers: true,
+        only_repo: None,
     })
     .await
     {

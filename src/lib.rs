@@ -14,6 +14,7 @@ pub mod mcp_setup;
 pub mod parsing;
 pub mod prompts;
 pub mod query;
+pub mod router;
 pub mod server;
 pub mod store;
 pub mod vector;

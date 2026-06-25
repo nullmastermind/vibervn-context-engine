@@ -59,6 +59,20 @@ pub struct BootOptions {
     /// race the measured run for the single per-repo connection — exactly the
     /// contamination that made the 10-file number meaningless.
     pub no_watchers: bool,
+
+    /// Restrict this boot to a SINGLE repo (process-per-project worker mode).
+    ///
+    /// `None` (router/standalone mode): boot every repo in `settings.repos`,
+    /// exactly as before. `Some(repo)`: a worker process spawned by the router
+    /// for ONE repo — `settings.repos` is filtered to just that repo (normalized)
+    /// before `IndexEngine::start`, so this process opens exactly one RocksDB
+    /// handle, spawns exactly one watcher, and seeds exactly one status. Every
+    /// other repo is invisible to this process, which is what keeps a worker's
+    /// resident footprint bounded to its one project and lets the router run many
+    /// workers on one host. If `repo` is not already in `settings.repos` it is
+    /// still booted (the router validates membership before spawning; a worker
+    /// trusts its launch argument).
+    pub only_repo: Option<String>,
 }
 
 /// Pin bounded RocksDB memory settings unless the operator has overridden them.
@@ -186,7 +200,21 @@ pub async fn boot_engine(opts: BootOptions) -> Result<BootedEngine> {
 
     // Take one owned boot snapshot — the read guard drops at the end of this
     // statement, so it is NOT held across the IndexEngine::start(...).await below.
-    let boot_settings = settings_handle.read().await.clone();
+    let mut boot_settings = settings_handle.read().await.clone();
+
+    // Worker mode (process-per-project): filter the repo set down to the single
+    // repo this process was spawned for. This is the mechanism that bounds a
+    // worker to one project — one RocksDB handle, one watcher, one status entry —
+    // so the router can run many workers on one host without each booting every
+    // configured repo. The normalize matches `IndexEngine::start`'s own keying
+    // (`normalize_repo_path`) so the worker's status map and watcher line up with
+    // what the router will proxy to. We replace the *boot snapshot's* repo list
+    // only; the shared `settings_handle` keeps the full list so config reads
+    // (keys, models) are unaffected.
+    if let Some(only) = opts.only_repo.as_deref() {
+        let normalized = store::normalize_repo_path(only);
+        boot_settings.repos = vec![normalized];
+    }
     let repo_count = boot_settings.repos.len();
 
     // Reclaim stale per-repo index generations BEFORE any RocksDB handle opens.

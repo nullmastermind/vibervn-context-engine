@@ -87,6 +87,18 @@ schemars = "1"
 tower-service = "0.3"
 async-trait = "0.1"
 
+# Windows Job Object FFI (router-side worker lifetime guarantee). When the
+# router process dies, the Job Object's kill-on-close limit terminates every
+# worker assigned to it — the belt-and-suspenders behind each worker's own
+# idle self-exit. Only pulled in on Windows.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
 [profile.dev]
 debug = 0
 

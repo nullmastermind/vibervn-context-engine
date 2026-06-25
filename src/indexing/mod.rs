@@ -417,6 +417,7 @@ pub(crate) async fn seed_statuses_from_db(
     data_dir: &std::path::Path,
     repos: &[String],
     generations: &HashMap<String, u32>,
+    settings_handle: &Arc<RwLock<crate::config::Settings>>,
 ) {
     for repo in repos {
         let repo = crate::store::normalize_repo_path(repo);
@@ -444,6 +445,54 @@ pub(crate) async fn seed_statuses_from_db(
             .flatten()
             .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
             .map(|dt| dt.with_timezone(&Utc));
+
+        // Backfill the router-readable sidecar if missing. A repo indexed by the
+        // pre-router monolith (or before sidecars existed) has data on disk but
+        // no sidecar, so the router's cold view can't show its file count. Here —
+        // where a worker has the DB open at boot and already paid the count — we
+        // write the sidecar so the next router status poll shows the real count
+        // instead of just "indexed (count pending)". Best-effort; only write when
+        // absent so we never clobber a fresher sidecar from a completed run.
+        if crate::router::sidecar::read_sidecar(data_dir, &repo).is_none() {
+            let (embedding_model, embedding_dim) = {
+                let cfg = settings_handle.read().await;
+                (
+                    cfg.embedding.model.clone(),
+                    cfg.embedding.dimensions.unwrap_or(0) as u64,
+                )
+            };
+            let meta = crate::router::sidecar::RepoSidecar {
+                file_count: indexed,
+                last_indexed_at: last_indexed_at.map(|dt| dt.to_rfc3339()),
+                state: "indexed".to_string(),
+                embedding_model,
+                embedding_dim,
+                schema: crate::router::sidecar::SIDECAR_SCHEMA,
+            };
+            if let Err(e) = crate::router::sidecar::write_sidecar(data_dir, &repo, &meta) {
+                warn!(repo = %repo, error = %format!("{e:#}"), "failed to backfill sidecar at boot");
+            }
+        }
+
+        // Backfill the AUX sidecars (graph + files) too if missing, so a repo
+        // indexed before these caches existed shows its detail view (graph +
+        // file list) on detail-open without a spawn. The worker already has the
+        // DB open here. Guarded by `indexed > 0` (we're past the count==0 early
+        // continue above). Best-effort.
+        if crate::router::sidecar::read_aux_json::<crate::store::ops::CallGraph>(
+            data_dir, &repo, "graph",
+        )
+        .is_none()
+            && let Ok(graph) = crate::store::ops::compute_and_cache_graph(&db).await
+        {
+            let _ = crate::router::sidecar::write_aux_json(data_dir, &repo, "graph", &graph);
+        }
+        if crate::router::sidecar::read_aux_json::<serde_json::Value>(data_dir, &repo, "files")
+            .is_none()
+            && let Ok(files) = crate::store::ops::files_page(&db, &repo, 2000, None).await
+        {
+            let _ = crate::router::sidecar::write_aux_json(data_dir, &repo, "files", &files);
+        }
 
         let mut map = statuses.write().await;
         let s = map.entry(repo.clone()).or_default();
@@ -537,6 +586,7 @@ impl IndexEngine {
         // open DB handles regardless of how many repos are configured.
         {
             let statuses_bg = Arc::clone(&engine.statuses);
+            let settings_bg = settings_handle.clone();
             tokio::spawn(async move {
                 seed_statuses_from_db(
                     &statuses_bg,
@@ -544,6 +594,7 @@ impl IndexEngine {
                     &data_dir_bg,
                     &repos_bg,
                     &generations_bg,
+                    &settings_bg,
                 )
                 .await;
             });
@@ -1334,6 +1385,66 @@ async fn run_consumer(
                 // NOT affect the run. The handle's `Surreal<Db>` clone is
                 // Arc-backed (shares the one cached per-repo connection).
                 engine_ref.note_index_completion(&repo, db.clone());
+
+                // PROCESS-PER-PROJECT: write the router-readable sidecar so the
+                // router can render this repo's count / last-indexed / model in
+                // its list and cold `/index-stats` WITHOUT opening this RocksDB
+                // (which would defeat scale-to-zero) or spawning a worker just to
+                // display it. Light + fixed-shape (no graph/stats copy). Atomic
+                // write; best-effort — a failure must not fail the index run, the
+                // router just falls back to its cold placeholder.
+                {
+                    let (embedding_model, embedding_dim) = {
+                        let s = engine_ref.settings_handle.read().await;
+                        (
+                            s.embedding.model.clone(),
+                            s.embedding.dimensions.unwrap_or(0) as u64,
+                        )
+                    };
+                    let meta = crate::router::sidecar::RepoSidecar {
+                        file_count: stats.indexed_files,
+                        last_indexed_at: Some(Utc::now().to_rfc3339()),
+                        state: "indexed".to_string(),
+                        embedding_model,
+                        embedding_dim,
+                        schema: crate::router::sidecar::SIDECAR_SCHEMA,
+                    };
+                    if let Err(e) =
+                        crate::router::sidecar::write_sidecar(&engine_ref.data_dir, &repo, &meta)
+                    {
+                        warn!(repo = %repo, error = %format!("{e:#}"), "failed to write sidecar (router will use cold placeholder)");
+                    }
+
+                    // Also persist the AUX sidecars (graph + files list) so the
+                    // router can serve the Index-Explorer detail view (graph +
+                    // file list) on detail-open WITHOUT spawning a worker. Stale
+                    // between indexes is accepted (router prefers a live worker
+                    // when one exists). Best-effort; failure just means the cold
+                    // view falls back to empty until the next index. The graph is
+                    // the SAME bounded payload `/graph` serves (compute_and_cache_
+                    // graph reads it from the just-refreshed cache or recomputes).
+                    if let Ok(graph) = crate::store::ops::compute_and_cache_graph(&db).await
+                        && let Err(e) = crate::router::sidecar::write_aux_json(
+                            &engine_ref.data_dir,
+                            &repo,
+                            "graph",
+                            &graph,
+                        )
+                    {
+                        warn!(repo = %repo, error = %format!("{e:#}"), "failed to write graph sidecar");
+                    }
+                    // Files list: same bound the /files endpoint uses (2000).
+                    if let Ok(files) = crate::store::ops::files_page(&db, &repo, 2000, None).await
+                        && let Err(e) = crate::router::sidecar::write_aux_json(
+                            &engine_ref.data_dir,
+                            &repo,
+                            "files",
+                            &files,
+                        )
+                    {
+                        warn!(repo = %repo, error = %format!("{e:#}"), "failed to write files sidecar");
+                    }
+                }
             }
             Err(e) => {
                 let is_cancelled = e
@@ -1478,6 +1589,7 @@ mod load_repos_tests {
             home.path(),
             &[indexed_raw, empty_raw],
             &HashMap::new(),
+            &Arc::new(RwLock::new(crate::config::Settings::default())),
         )
         .await;
 
@@ -1521,6 +1633,7 @@ mod load_repos_tests {
             home.path(),
             &[repo_raw],
             &HashMap::new(),
+            &Arc::new(RwLock::new(crate::config::Settings::default())),
         )
         .await;
 

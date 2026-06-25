@@ -1295,6 +1295,8 @@ const STR = {
   'repo.removeRepo':   { en: `Remove Repo`, vi: `Xóa repo`, zh: `移除仓库` },
   'repo.removeOptions': { en: `Remove options`, vi: `Tùy chọn xóa`, zh: `移除选项` },
   'repo.notIndexed':   { en: `Not indexed`, vi: `Chưa index`, zh: `未索引` },
+  'worker.warming':    { en: `Starting worker…`, vi: `Đang khởi động worker…`, zh: `正在启动 worker…` },
+  'worker.error':      { en: `Could not connect to worker — retry`, vi: `Không kết nối được worker — thử lại`, zh: `无法连接 worker — 重试` },
   'repo.error':        { en: `Error`, vi: `Lỗi`, zh: `错误` },
   'repo.files':        { en: `{n} files`, vi: `{n} file`, zh: `{n} 个文件` },
   'repo.removeIndexFail': { en: `Failed to remove indexes`, vi: `Xóa index thất bại`, zh: `移除索引失败` },
@@ -1472,6 +1474,8 @@ const STR = {
   'graph.empty':       { en: `No call relationships in the index yet.`, vi: `Index chưa có quan hệ lời gọi nào.`, zh: `索引中尚无调用关系。` },
   'graph.nodesEdges':  { en: `{nodes} nodes · {edges} edges`, vi: `{nodes} node · {edges} edge`, zh: `{nodes} 个节点 · {edges} 条边` },
   'graph.capped':      { en: ` (capped)`, vi: ` (đã giới hạn)`, zh: `（已限量）` },
+  'graph.coldEmpty':   { en: `No cached graph yet — index this repo to build it.`, vi: `Chưa có graph cache — index repo này để dựng.`, zh: `尚无缓存 graph — 索引此仓库以生成。` },
+  'graph.coldLabel':   { en: `(cached)`, vi: `(cache)`, zh: `（缓存）` },
   'graph.loadFail':    { en: `Failed to load: {msg}`, vi: `Tải thất bại: {msg}`, zh: `加载失败：{msg}` },
   'graph.other':       { en: `Other`, vi: `Khác`, zh: `其他` },
 
@@ -1860,6 +1864,19 @@ function hideError() {
   document.getElementById('banner-error').classList.add('hidden');
 }
 
+// Process-per-project worker degrade signal. Action endpoints (search, index,
+// chat) proxy to an on-demand worker; while it spawns the router returns
+// 503 {status:"warming",retry:true}, and on a genuine spawn failure
+// 503 {status:"error",retry:false}. Classify so callers render the right state:
+// 'warming' (auto-retry skeleton), 'error' (manual-retry banner), or null (not a
+// degrade — handle as a normal response/error).
+function classifyWorkerDegrade(res, data) {
+  if (res.status !== 503 || !data || typeof data !== 'object') return null;
+  if (data.status === 'warming' || data.retry === true) return 'warming';
+  if (data.status === 'error' || data.retry === false) return 'error';
+  return null;
+}
+
 function showVersionBanner() {
   document.getElementById('main-content').classList.add('hidden');
   document.getElementById('banner-version').classList.remove('hidden');
@@ -2019,7 +2036,25 @@ function renderRepos() {
       queuedRepos.add(repo);
       updateRepoIndexUI();
       try {
-        await fetch('/api/repos/' + repoId + '/index', { method: 'POST' });
+        const res = await fetch('/api/repos/' + repoId + '/index', { method: 'POST' });
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          const degrade = classifyWorkerDegrade(res, data);
+          if (degrade === 'warming') {
+            // Worker spawning to run the index — keep the optimistic "Queued…"
+            // badge and let the poll flip to "indexing" once the worker is up.
+            if (statusEl) statusEl.innerHTML = '<span class="animate-pulse text-blue-500 dark:text-wiki-link">' + escHtml(t('worker.warming')) + '</span>';
+            await pollIndexStatus();
+            btn.disabled = false;
+            return;
+          }
+          // Genuine spawn failure (error) or other non-OK → surface as error.
+          queuedRepos.delete(repo);
+          if (statusEl) statusEl.innerHTML = '<span class="text-red-500">' + escHtml(degrade === 'error' ? t('worker.error') : t('repo.error')) + '</span>';
+          if (degrade === 'error') showToast(t('worker.error'));
+          btn.disabled = false;
+          return;
+        }
         await pollIndexStatus();
       } catch (e) {
         queuedRepos.delete(repo);
@@ -4044,6 +4079,26 @@ async function runSearch() {
     const data = await res.json();
     if (token !== searchToken) return;   // a newer search or a reset superseded this one
     if (!res.ok) {
+      // Worker is spawning (warming) vs genuinely failed to start (error).
+      const degrade = classifyWorkerDegrade(res, data);
+      if (degrade === 'warming') {
+        // Auto-retry: the worker is coming up. Show "starting…" and re-fire the
+        // SAME search after a short delay (bounded by the user navigating away /
+        // a newer search bumping the token).
+        errorEl.textContent = t('worker.warming');
+        errorEl.className = 'text-sm text-gray-500 dark:text-wiki-text-muted animate-pulse';
+        errorEl.classList.remove('hidden');
+        setTimeout(() => { if (token === searchToken) runSearch(); }, 1500);
+        return;
+      }
+      if (degrade === 'error') {
+        errorEl.textContent = t('worker.error');
+        errorEl.className = 'text-sm text-red-500 dark:text-red-400';
+        errorEl.classList.remove('hidden');
+        showToast(t('worker.error'));
+        return;
+      }
+      errorEl.className = 'text-sm text-red-500 dark:text-red-400';
       errorEl.textContent = data.error || t('err.searchFail', { status: res.status });
       errorEl.classList.remove('hidden');
       return;
@@ -4763,8 +4818,23 @@ async function loadExplorerGraph(token) {
     if (loadingEl) loadingEl.classList.add('hidden');
     if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
     graphData = { nodes: data.nodes || [], edges: data.edges || [] };
+    // Empty graph: distinguish "indexed, genuinely no call edges" from "not
+    // indexed yet / no cached graph" so the box never reads as a blank/broken
+    // panel (the original cold-graph UX complaint). `data.cold` is set by the
+    // router when it served from the sidecar cache (or had none).
+    if (graphData.nodes.length === 0) {
+      if (emptyEl) {
+        emptyEl.textContent = data.cold ? t('graph.coldEmpty') : t('graph.empty');
+        emptyEl.classList.remove('hidden');
+      }
+      metaEl.textContent = data.cold ? t('graph.coldLabel') : '';
+      renderGraph();
+      renderGraphLegend();
+      return;
+    }
     metaEl.textContent = t('graph.nodesEdges', { nodes: graphData.nodes.length, edges: graphData.edges.length }) +
-      (data.truncated ? t('graph.capped') : '');
+      (data.truncated ? t('graph.capped') : '') +
+      (data.cold ? ' ' + t('graph.coldLabel') : '');
     renderGraph();
     renderGraphLegend();
   } catch (e) {

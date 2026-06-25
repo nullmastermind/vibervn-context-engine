@@ -147,6 +147,7 @@ async fn run() -> i32 {
         // bench-query is read-only — it never mutates files, so a boot watcher
         // has nothing to race. Keep the production default.
         no_watchers: false,
+        only_repo: None,
     })
     .await
     {
