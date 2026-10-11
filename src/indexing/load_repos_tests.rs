@@ -840,3 +840,90 @@ async fn mutation_fence_writer_boundary_normalizes_repo_spelling() {
     );
     assert!(!engine.repo_is_mutating(&canonical).await);
 }
+
+/// S10/D9: a persisted shard file whose CURRENT pointer survived a later run
+/// (the best-effort delete failed — e.g. Defender holding the file on Windows) and
+/// whose chunk count still matches must NOT be mmap'd: the index epoch bumped by
+/// that run invalidates it.
+#[tokio::test]
+async fn stale_persisted_shard_with_same_chunk_count_is_not_mmapped() {
+    let home = TempDir::new().expect("tempdir");
+    let repo = "/proj/stale-same-count".to_string();
+    let repo_dbs: RepoDbMap = Arc::new(RwLock::new(HashMap::new()));
+    seed_repo(&repo_dbs, home.path(), &repo, 1).await;
+    let identity = test_identity();
+    let vector_index = Arc::new(RwLock::new(ShardedVectorIndex::new(1024 * 1024 * 1024)));
+
+    // First warm builds from DB and persists generation 0 with f0.rs.
+    warm_repo_shard(
+        &vector_index,
+        &repo_dbs,
+        home.path(),
+        &repo,
+        0,
+        &identity,
+        &[],
+    )
+    .await
+    .expect("first warm");
+    vector_index.write().await.evict_repo(&repo);
+
+    // A later run replaced f0.rs with f1.rs (same chunk count) and bumped the
+    // epoch, but its CURRENT delete "failed": the old file is still CURRENT.
+    let db = store::get_or_open(&repo_dbs, home.path(), &repo, 0)
+        .await
+        .expect("open");
+    store::ops::bump_index_epoch(&db).await.expect("bump epoch");
+    db.query(format!(
+        "DELETE FROM chunk; CREATE chunk SET file = '{repo}/f1.rs', line_start = 1, \
+         line_end = 2, content = 'y', embedding = [0.1, 0.2, 0.3, 0.4], symbol_ref = NONE;"
+    ))
+    .await
+    .expect("replace chunk");
+
+    warm_repo_shard(
+        &vector_index,
+        &repo_dbs,
+        home.path(),
+        &repo,
+        0,
+        &identity,
+        &[],
+    )
+    .await
+    .expect("second warm");
+    let files: Vec<String> = vector_index
+        .read()
+        .await
+        .search(
+            &PROBE_EMBEDDING,
+            10,
+            Some(&repo),
+            std::slice::from_ref(&repo),
+        )
+        .results
+        .into_iter()
+        .map(|r| r.chunk_id.file)
+        .collect();
+    assert_eq!(
+        files,
+        vec![format!("{repo}/f1.rs")],
+        "warm must rebuild from DB, not mmap the stale same-count file"
+    );
+}
+
+/// S16/D18: a run holding the repo lock (no HTTP request attached) is activity
+/// for the idle watchdog.
+#[tokio::test]
+async fn index_run_counts_as_busy_for_idle_watchdog() {
+    let home = TempDir::new().expect("tempdir");
+    let repo = crate::store::normalize_repo_path("/proj/busy");
+    let repo_dbs: RepoDbMap = Arc::new(RwLock::new(HashMap::new()));
+    let engine = start_test_engine(home.path(), &repo_dbs, &repo).await;
+    assert!(!engine.is_index_busy(&repo).await);
+    let lock = engine.get_repo_lock_public(&repo).await;
+    let guard = lock.lock().await;
+    assert!(engine.is_index_busy(&repo).await, "a held run lock is busy");
+    drop(guard);
+    assert!(!engine.is_index_busy(&repo).await);
+}

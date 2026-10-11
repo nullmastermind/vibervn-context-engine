@@ -2401,7 +2401,7 @@ function mdInline(text) {
   const codes = [];
   let s = text.replace(/`([^`]+)`/g, (m, c) => {
     codes.push(escHtml(c));
-    return ' ' + (codes.length - 1) + ' ';
+    return '\u0000' + (codes.length - 1) + '\u0000';
   });
   s = escHtml(s);
   // Restore <br> tags the model emits for line breaks inside table cells (and
@@ -2421,7 +2421,7 @@ function mdInline(text) {
   s = s.replace(/__([^_]+)__/g, '<strong>$1</strong>');
   s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
   s = s.replace(/(^|[^_\w])_([^_\n]+)_/g, '$1<em>$2</em>');
-  s = s.replace(/ (\d+) /g, (m, i) => codes[+i] !== undefined ? '<code>' + codes[+i] + '</code>' : m);
+  s = s.replace(/\u0000(\d+)\u0000/g, (m, i) => codes[+i] !== undefined ? '<code>' + codes[+i] + '</code>' : m);
   return s;
 }
 

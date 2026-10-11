@@ -27,7 +27,13 @@ use crate::store::schema::SCHEMA_DDL;
 ///      graph-adjacency writes on every edge (~44% of Phase-2 write time on the
 ///      kernel). The migration clears old RELATION rows so they re-resolve as
 ///      plain rows. Output (call-graph nodes/edges) is byte-identical.
-pub const DB_SCHEMA_VERSION: u32 = 6;
+/// v7 = call-graph heal. Builds before v7 kept full-rebuild raw edges RAM-only, so
+///      `raw_edge` is partial and a later no-change run could replay Phase 2 from
+///      it, truncating `calls` while stamping `edges_resolved`. The migration
+///      clears both edge markers so the pipeline's edge heal (re-parse, no
+///      embedding) rebuilds raw_edge + calls on the next trigger. Also adds the
+///      `pending_retry` table (SCHEMA_DDL).
+pub const DB_SCHEMA_VERSION: u32 = 7;
 
 /// key in index_meta for the DB schema version.
 pub const DB_SCHEMA_VERSION_KEY: &str = "db_schema_version";
@@ -105,6 +111,35 @@ pub async fn read_db_schema_version(db: &Surreal<Db>) -> u32 {
         Ok(Some(v)) => v.parse::<u32>().unwrap_or(1),
         _ => 1,
     }
+}
+
+/// Return the DB's schema version, first stamping a brand-new (empty, unversioned)
+/// DB with [`DB_SCHEMA_VERSION`].
+///
+/// WHY: an unversioned DB reads as v1, so a fresh repo used to spawn the whole
+/// v1→current migration chain in the background while its first index ran —
+/// rewriting/deleting rows the pipeline was writing at the same time. An empty DB
+/// has nothing to migrate. A DB with data but no version key is a genuine pre-v2
+/// DB and still migrates.
+pub async fn stamp_if_fresh(db: &Surreal<Db>) -> Result<u32> {
+    if ops::get_meta(db, DB_SCHEMA_VERSION_KEY).await?.is_some() {
+        return Ok(read_db_schema_version(db).await);
+    }
+    let mut res = db
+        .query(
+            "SELECT VALUE type::string(id) FROM file_meta LIMIT 1;              SELECT VALUE type::string(id) FROM chunk LIMIT 1;",
+        )
+        .await
+        .context("stamp_if_fresh: probe tables")?;
+    let metas: Vec<String> = res.take(0)?;
+    let chunks: Vec<String> = res.take(1)?;
+    if metas.is_empty() && chunks.is_empty() {
+        ops::set_meta(db, DB_SCHEMA_VERSION_KEY, &DB_SCHEMA_VERSION.to_string())
+            .await
+            .context("stamp_if_fresh: stamp version")?;
+        return Ok(DB_SCHEMA_VERSION);
+    }
+    Ok(1)
 }
 
 /// Open (or create) a SurrealDB database for the given repo.
@@ -246,6 +281,9 @@ pub fn maybe_spawn_migration(repo_dbs: RepoDbMap, repo: String, stored_version: 
             }
             if stored_version < 6 {
                 run_migration_v5_to_v6(&db).await.context("v5→v6")?;
+            }
+            if stored_version < 7 {
+                run_migration_v6_to_v7(&db).await.context("v6→v7")?;
             }
             Ok(())
         }
@@ -737,10 +775,9 @@ pub async fn run_migration_v5_to_v6(db: &Surreal<Db>) -> Result<()> {
         .await
         .context("migration v5→v6: delete calls")?;
 
-    // Clear the edges_resolved marker so Phase 2 re-runs. On the next open with no
-    // file changes, run()'s "edges_resolved marker absent" branch replays Phase 2
-    // from raw_edge (incremental DBs) or forces a full rebuild (RAM-path DBs whose
-    // raw_edge table is empty) — the same self-healing path used after a crash.
+    // Clear the edges_resolved marker so Phase 2 re-runs. NOTE: a replay from
+    // raw_edge was only safe when raw_edge was complete, which pre-v7 RAM-path DBs
+    // never were; the chained v6→v7 migration below routes them to the edge heal.
     let _ = db
         .query("DELETE FROM index_meta WHERE key = $k")
         .bind(("k", "edges_resolved"))
@@ -752,6 +789,26 @@ pub async fn run_migration_v5_to_v6(db: &Surreal<Db>) -> Result<()> {
         .context("migration v5→v6: stamp db_schema_version=6")?;
 
     info!("migration v5→v6 complete");
+    Ok(())
+}
+
+/// v6→v7: clear `edges_resolved` and `raw_edge_complete` so the next index trigger
+/// heals the call graph from source (`IndexPipeline::heal_edges`).
+///
+/// WHY not `needs_rebuild`: a damaged DB (truncated `calls` under a stamped
+/// `edges_resolved`) is indistinguishable from a healthy one, so every DB must be
+/// healed — and a full rebuild deletes everything before it embeds, so with a dead
+/// key it would empty every repo. The heal needs no embedding. Idempotent.
+pub async fn run_migration_v6_to_v7(db: &Surreal<Db>) -> Result<()> {
+    info!("migration v6→v7: clearing edge markers so the call graph heals from source");
+    db.query("DELETE FROM index_meta WHERE key IN $keys")
+        .bind(("keys", vec!["edges_resolved", "raw_edge_complete"]))
+        .await
+        .context("migration v6→v7: clear edge markers")?;
+    ops::set_meta(db, DB_SCHEMA_VERSION_KEY, "7")
+        .await
+        .context("migration v6→v7: stamp db_schema_version=7")?;
+    info!("migration v6→v7 complete");
     Ok(())
 }
 
@@ -1157,6 +1214,30 @@ pub async fn abort_migration(repo: &str) {
     }
 }
 
+/// Wait until no migration task is running for `repo`.
+///
+/// The index consumer calls this before running the pipeline: a migration runs
+/// unlocked in the background, and racing it is unsafe — v5→v6 `DELETE FROM calls`
+/// against a live Phase 2, v4→v5 `UPDATE` of chunk rows an incremental just deleted
+/// (resurrecting them), and v6→v7's marker clear must be visible to the very first
+/// run. Polls the registry (each task self-deregisters on completion), so the wait
+/// is bounded by the migration itself; aborted tasks are removed by
+/// `abort_migration`.
+pub async fn wait_migration(repo: &str) {
+    let repo = normalize_repo_path(repo);
+    loop {
+        let running = MIGRATION_TASKS
+            .lock()
+            .unwrap()
+            .get(&repo)
+            .is_some_and(|h| !h.is_finished());
+        if !running {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 /// Remove a repo's on-disk index directory, serialized against `open_db` via the
 /// same per-repo open gate `get_or_open` uses.
 ///
@@ -1327,7 +1408,7 @@ pub async fn get_or_open(
     let db = open_db(data_dir, repo, generation).await?;
 
     // Check schema version and spawn migration if needed (non-blocking).
-    let stored_version = read_db_schema_version(&db).await;
+    let stored_version = stamp_if_fresh(&db).await?;
 
     let mut map = repo_dbs.write().await;
     // Final double-check (defensive; the gate already guarantees uniqueness).

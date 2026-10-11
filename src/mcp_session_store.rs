@@ -712,10 +712,8 @@ mod tests {
         let allowed = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
         let file_sid = std::ptr::addr_of!(allowed.SidStart) as windows_sys::Win32::Security::PSID;
 
-        let current = current_user_sid_buf().inspect_err(|_| {
-            unsafe {
-                LocalFree(sd as _);
-            }
+        let current = current_user_sid_buf().inspect_err(|_| unsafe {
+            LocalFree(sd as _);
         })?;
         let token_user = unsafe { &*(current.as_ptr() as *const TOKEN_USER) };
         let same = unsafe { EqualSid(file_sid, token_user.User.Sid) } != 0;

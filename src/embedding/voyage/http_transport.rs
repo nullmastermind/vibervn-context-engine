@@ -22,8 +22,49 @@ struct EmbedResponse {
 }
 
 #[derive(Deserialize)]
-struct EmbedData {
-    embedding: Vec<f32>,
+pub(super) struct EmbedData {
+    pub(super) embedding: Vec<f32>,
+    /// Position of the input this vector belongs to. Both Voyage and OpenAI send
+    /// it; absent → the list order is trusted.
+    #[serde(default)]
+    pub(super) index: Option<usize>,
+}
+
+/// Put a response's vectors back into input order and refuse anything that does
+/// not map one-to-one onto the `n_inputs` inputs.
+///
+/// WHY: the vectors used to be taken in list order with no count check. A short
+/// reply left the trailing chunks with empty embeddings — the pipeline padded
+/// them, committed file_meta, and `VectorIndex::insert` silently skipped them, so
+/// those chunks were permanently unsearchable — and a reordered reply attached
+/// vectors to the wrong chunks. Treated as transient (retried like a decode
+/// error); a persistent mismatch ends up skipped and retried later rather than
+/// stored wrong.
+pub(super) fn order_embeddings(
+    mut data: Vec<EmbedData>,
+    n_inputs: usize,
+) -> Result<Vec<Vec<f32>>, EmbedError> {
+    if data.len() != n_inputs {
+        return Err(EmbedError::Transient(anyhow::anyhow!(
+            "embedding response has {} vectors for {} inputs",
+            data.len(),
+            n_inputs
+        )));
+    }
+    if data.iter().all(|d| d.index.is_some()) {
+        data.sort_by_key(|d| d.index);
+        if data.iter().enumerate().any(|(pos, d)| d.index != Some(pos)) {
+            return Err(EmbedError::Transient(anyhow::anyhow!(
+                "embedding response indexes are not a permutation of 0..{n_inputs}"
+            )));
+        }
+    }
+    if data.iter().any(|d| d.embedding.is_empty()) {
+        return Err(EmbedError::Transient(anyhow::anyhow!(
+            "embedding response contains an empty vector"
+        )));
+    }
+    Ok(data.into_iter().map(|d| d.embedding).collect())
 }
 
 impl VoyageClient {
@@ -93,11 +134,7 @@ impl VoyageClient {
             .json()
             .await
             .map_err(|error| EmbedError::Transient(error.into()))?;
-        Ok(response
-            .data
-            .into_iter()
-            .map(|item| item.embedding)
-            .collect())
+        order_embeddings(response.data, texts.len())
     }
 }
 

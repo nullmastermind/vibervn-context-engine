@@ -3,6 +3,7 @@ pub mod frameworks;
 pub mod import_resolver;
 pub mod pipeline;
 pub mod rebuild_guard;
+pub mod retry_backoff;
 pub mod tracker;
 pub mod walker;
 pub mod watcher;
@@ -296,6 +297,9 @@ pub struct IndexEngine {
     recompute_slots: Arc<std::sync::Mutex<HashMap<String, RecomputeSlot>>>,
     /// Coalesces automatic identity-mismatch rebuild triggers per repo.
     identity_rebuild: IdentityRebuildGuard,
+    /// Per-repo automatic retry after a failed run or one that left files in
+    /// `pending_retry` (see [`retry_backoff`]).
+    retry_backoff: Arc<retry_backoff::RetryBackoff>,
 }
 
 #[derive(Debug)]
@@ -332,6 +336,13 @@ pub(crate) async fn warm_repo_shard(
     current: &EmbeddingIdentity,
     active: &[String],
 ) -> anyhow::Result<WarmResult> {
+    // Capture the mutation epoch BEFORE any DB read. The guard is dropped at the
+    // end of the statement (never held across an await, never nested inside
+    // repo_dbs). Every install below requires it unchanged: an update that begins
+    // and publishes while the scan runs leaves `is_mutating` false again, so only
+    // the epoch reveals that this snapshot predates it.
+    let scan_epoch = vector_index.read().await.mutation_epoch(repo);
+
     let db = store::get_or_open(repo_dbs, data_dir, repo, generation).await?;
 
     // DB reads happen with NO vector-index lock held. Fail closed: inability to
@@ -355,7 +366,8 @@ pub(crate) async fn warm_repo_shard(
         return Ok(WarmResult::IdentityMismatch);
     }
 
-    let stamp = current.content_stamp(chunk_count);
+    let index_epoch = crate::store::ops::get_index_epoch(&db).await?;
+    let stamp = current.content_stamp(chunk_count, index_epoch);
 
     // Fast path: a valid, current persisted shard file → mmap it (near-instant,
     // no SELECT + decode). The identity is already validated against DB above;
@@ -365,7 +377,13 @@ pub(crate) async fn warm_repo_shard(
             let count = shard.len();
             if count > 0 {
                 let mut vi = vector_index.write().await;
-                if !vi.install_shard_if_not_mutating(repo, shard, current_key.clone(), active) {
+                if !vi.install_shard_if_not_mutating(
+                    repo,
+                    shard,
+                    current_key.clone(),
+                    active,
+                    scan_epoch,
+                ) {
                     return Ok(WarmResult::MutationInProgress);
                 }
                 crate::vector::shard_file::reap_stale_generations(
@@ -391,8 +409,10 @@ pub(crate) async fn warm_repo_shard(
         return Ok(WarmResult::Installed(0));
     }
     {
+        // Never persist a snapshot that an update overlapped: it would become the
+        // CURRENT file other warms mmap.
         let vi = vector_index.read().await;
-        if vi.is_mutating(repo) {
+        if vi.is_mutating(repo) || vi.mutation_epoch(repo) != scan_epoch {
             return Ok(WarmResult::MutationInProgress);
         }
     }
@@ -411,7 +431,7 @@ pub(crate) async fn warm_repo_shard(
         && let Ok(Some((mmap_shard, _))) =
             crate::vector::shard_file::open_current(data_dir, repo, shard.dim(), stamp)
     {
-        if !vi.install_shard_if_not_mutating(repo, mmap_shard, current_key, active) {
+        if !vi.install_shard_if_not_mutating(repo, mmap_shard, current_key, active, scan_epoch) {
             drop(vi);
             crate::vector::shard_file::invalidate_current_if_generation(data_dir, repo, Some(g));
             return Ok(WarmResult::MutationInProgress);
@@ -419,7 +439,7 @@ pub(crate) async fn warm_repo_shard(
         crate::vector::shard_file::reap_stale_generations(data_dir, repo, &[g]);
         info!(repo = %repo, count, generation = g, "warm: built from DB, persisted + mmap'd shard");
     } else {
-        if !vi.install_shard_if_not_mutating(repo, shard, current_key, active) {
+        if !vi.install_shard_if_not_mutating(repo, shard, current_key, active, scan_epoch) {
             return Ok(WarmResult::MutationInProgress);
         }
         info!(repo = %repo, count, "warm: installed in-RAM shard (persist/mmap unavailable)");
@@ -587,6 +607,7 @@ impl IndexEngine {
             settings_handle: settings_handle.clone(),
             recompute_slots: Arc::new(std::sync::Mutex::new(HashMap::new())),
             identity_rebuild: IdentityRebuildGuard::default(),
+            retry_backoff: Arc::new(retry_backoff::RetryBackoff::default()),
         });
 
         // Initialise status entries.
@@ -870,6 +891,23 @@ impl IndexEngine {
         self.get_repo_lock(repo).await
     }
 
+    /// True while an index run holds `repo`'s run lock or its status reads
+    /// Indexing. The worker idle watchdog treats this as activity: it used to
+    /// count only HTTP requests, so a watcher- or catch-up-driven run with no
+    /// client attached was cancelled when the idle window elapsed (forcing a
+    /// full rebuild on the next spawn).
+    pub async fn is_index_busy(&self, repo: &str) -> bool {
+        let repo = crate::store::normalize_repo_path(repo);
+        if self.get_repo_lock(&repo).await.try_lock().is_err() {
+            return true;
+        }
+        self.statuses
+            .read()
+            .await
+            .get(&repo)
+            .is_some_and(|s| s.state == IndexState::Indexing)
+    }
+
     /// Search the resident vector shards for the top-k most similar chunks.
     ///
     /// Fan-out over resident shards + bounded global top-k merge (scores are
@@ -1102,6 +1140,29 @@ impl IndexEngine {
     /// it cannot keep the engine alive beyond a bounded window. It always retires
     /// (clears `scheduled`) once the burst settles — at most one in-flight task
     /// plus at most one queued pass per repo, so no unbounded timer-task growth.
+    /// Schedule one delayed full-scan retry for `repo` (exponential backoff,
+    /// at most one pending per repo). See [`retry_backoff`].
+    fn schedule_retry(&self, repo: &str, reason: &'static str) {
+        let Some(delay) = self.retry_backoff.schedule(repo) else {
+            return;
+        };
+        info!(repo = %repo, reason, delay_secs = delay.as_secs(), "scheduling automatic index retry");
+        let tx = self.trigger_tx.clone();
+        let backoff = self.retry_backoff.clone();
+        let repo = repo.to_owned();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            backoff.fired(&repo);
+            let _ = tx
+                .send(IndexTrigger {
+                    repo,
+                    changes: None,
+                    rebuild: false,
+                })
+                .await;
+        });
+    }
+
     fn note_index_completion(&self, repo: &str, db: Surreal<Db>) {
         let mut slots = match self.recompute_slots.lock() {
             Ok(g) => g,
@@ -1345,6 +1406,10 @@ async fn run_consumer(
             }
         };
 
+        // Never run the pipeline concurrently with a background schema migration
+        // for this repo (see `store::wait_migration`).
+        store::wait_migration(&repo).await;
+
         // Read per-repo ignored paths from index_meta (fresh each run).
         let per_repo_ignored_paths = store::ops::get_ignored_paths(&db).await.unwrap_or_default();
 
@@ -1456,6 +1521,15 @@ async fn run_consumer(
                     total_files: stats.total_files,
                     elapsed_ms,
                 });
+                // Files skipped for a transient reason are queued in pending_retry;
+                // retry them automatically instead of waiting for an unrelated
+                // trigger. A clean run resets the backoff.
+                match store::ops::get_pending_retry(&db).await {
+                    Ok(pending) if !pending.is_empty() => {
+                        engine_ref.schedule_retry(&repo, "files queued in pending_retry");
+                    }
+                    _ => engine_ref.retry_backoff.reset(&repo),
+                }
                 // Clear needs_rebuild flag after successful rebuild.
                 if force_rebuild {
                     let _ = db
@@ -1592,6 +1666,13 @@ async fn run_consumer(
                         repo: repo.clone(),
                         error: err_str,
                     });
+                    drop(statuses);
+                    // Retry transient failures automatically (the repo is
+                    // fail-closed until a run succeeds). Fatal embedding errors
+                    // (auth/config) wait for a natural trigger instead.
+                    if !retry_backoff::is_fatal_index_error(&e) {
+                        engine_ref.schedule_retry(&repo, "index run failed");
+                    }
                 }
             }
         }

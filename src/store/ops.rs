@@ -70,8 +70,10 @@ where
         where
             E: serde::de::Error,
         {
-            Ok(v.chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            Ok(v.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect())
         }
 
@@ -586,6 +588,78 @@ pub async fn set_meta(db: &Surreal<Db>, key: &str, value: &str) -> Result<()> {
         .await
         .context("set index_meta")?;
     Ok(())
+}
+
+/// Queue `paths` for retry by the next incremental run (see the `pending_retry`
+/// table). Idempotent per path.
+pub async fn add_pending_retry(db: &Surreal<Db>, paths: &[String]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    db.query("FOR $p IN $paths { UPSERT pending_retry SET path = $p WHERE path = $p; };")
+        .bind(("paths", paths.to_vec()))
+        .await
+        .context("add pending_retry")?
+        .check()
+        .context("add pending_retry statement")?;
+    Ok(())
+}
+
+/// All queued retry paths.
+pub async fn get_pending_retry(db: &Surreal<Db>) -> Result<Vec<String>> {
+    let paths: Vec<String> = db
+        .query("SELECT VALUE path FROM pending_retry")
+        .await
+        .context("get pending_retry")?
+        .take(0)?;
+    Ok(paths)
+}
+
+/// Drop `paths` from the retry queue (committed, deleted, or gone).
+pub async fn remove_pending_retry(db: &Surreal<Db>, paths: &[String]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    // Per-path equality (point seek on idx_pending_retry_path), batched in one
+    // round-trip, rather than `path IN $list`.
+    db.query("FOR $p IN $paths { DELETE pending_retry WHERE path = $p; };")
+        .bind(("paths", paths.to_vec()))
+        .await
+        .context("remove pending_retry")?
+        .check()
+        .context("remove pending_retry statement")?;
+    Ok(())
+}
+
+/// Empty the retry queue (a full rebuild re-derives it).
+pub async fn clear_pending_retry(db: &Surreal<Db>) -> Result<()> {
+    db.query("DELETE FROM pending_retry")
+        .await
+        .context("clear pending_retry")?;
+    Ok(())
+}
+
+/// index_meta key of the durable index epoch: bumped by every run that changes a
+/// repo's chunk rows, before its first delete.
+pub const INDEX_EPOCH_KEY: &str = "index_epoch";
+
+/// Read the durable index epoch (0 when never bumped).
+pub async fn get_index_epoch(db: &Surreal<Db>) -> Result<u64> {
+    Ok(get_meta(db, INDEX_EPOCH_KEY)
+        .await?
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0))
+}
+
+/// Bump the durable index epoch. It is folded into the persisted vector shard's
+/// content stamp, so a shard file written before ANY later chunk change can never
+/// validate again — even when deleting its CURRENT pointer failed (best-effort on
+/// Windows) and the chunk count happens to match. Callers hold the per-repo index
+/// lock, so the read-modify-write cannot race another writer.
+pub async fn bump_index_epoch(db: &Surreal<Db>) -> Result<u64> {
+    let next = get_index_epoch(db).await?.wrapping_add(1);
+    set_meta(db, INDEX_EPOCH_KEY, &next.to_string()).await?;
+    Ok(next)
 }
 
 /// Get per-repo ignored paths (forward-slash-normalized relative paths).

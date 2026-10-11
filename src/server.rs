@@ -286,6 +286,9 @@ fn decode_repo_id(repo_id: &str) -> Result<String, Response> {
 /// renders an empty state instead of erroring (and without materializing a
 /// phantom DB directory as a side effect of a read). Delegates to
 /// [`store::open_if_indexed`].
+// An axum `Response` is the idiomatic early-return error for a handler helper;
+// boxing it would only add an allocation on the error path.
+#[allow(clippy::result_large_err)]
 async fn acquire_repo_db_if_indexed(
     state: &AppState,
     repo: &str,
@@ -813,6 +816,11 @@ async fn post_ignore_file(
             .into_response();
     }
 
+    // Chunk rows changed → no persisted shard written before this may validate.
+    if let Err(e) = store::ops::bump_index_epoch(&db).await {
+        tracing::warn!(repo = %repo, error = %e, "ignore path: bump index_epoch failed");
+    }
+
     // 2. Evict vectors from the in-memory shard.
     {
         let mut vi = state.index_engine.vector_index.write().await;
@@ -976,6 +984,11 @@ async fn post_ignore_files(
                 Json(json!({ "error": format!("delete: {e}"), "count": total })),
             )
                 .into_response();
+        }
+
+        // Chunk rows changed → no persisted shard written before this may validate.
+        if let Err(e) = store::ops::bump_index_epoch(&db).await {
+            tracing::warn!(repo = %repo, error = %e, "ignore paths: bump index_epoch failed");
         }
 
         // 3. Evict this page's vectors from the in-memory shard.
@@ -1866,6 +1879,9 @@ fn plan_http_client() -> reqwest::Client {
 /// Read the persisted machine_id from the live settings handle. Boot guarantees
 /// `Some(...)` after `ensure_machine_id`; `None`/empty would only occur if a
 /// caller mutated the field at runtime. Returns the value or a 500 response.
+// An axum `Response` is the idiomatic early-return error for a handler helper;
+// boxing it would only add an allocation on the error path.
+#[allow(clippy::result_large_err)]
 async fn machine_id_from_settings(state: &AppState) -> Result<String, Response> {
     let id = state
         .settings

@@ -33,10 +33,6 @@ use sha2::{Digest, Sha256};
 /// Written only after a full index run's data (chunks + edges) is durable.
 pub const EMBEDDING_IDENTITY_KEY: &str = "embedding_identity";
 
-/// FNV-1a 64-bit prime, used to fold the identity hash into a shard's
-/// content-stamp so a model change makes the persisted shard self-invalidate.
-const IDENTITY_STAMP_MIX_PRIME: u64 = 0x0000_0100_0000_01B3;
-
 /// Describes the embedding vector space: `(provider, model, dimensions)`.
 ///
 /// Two stores are query-compatible iff their identities are equal. This is a
@@ -75,19 +71,19 @@ impl EmbeddingIdentity {
         )
     }
 
-    /// Fold this identity into a chunk-count stamp so the persisted shard file's
-    /// `content_stamp` changes whenever the identity changes, even at an
-    /// unchanged chunk count — a second-line defense behind the DB identity check.
-    pub fn content_stamp(&self, chunk_count: u64) -> u64 {
-        chunk_count
-            .wrapping_mul(IDENTITY_STAMP_MIX_PRIME)
-            .wrapping_add(self.identity_hash())
-    }
-
-    /// Stable 64-bit hash of the canonical key string (first 8 bytes of SHA-256).
-    fn identity_hash(&self) -> u64 {
+    /// Fold this identity and the durable index epoch into a chunk-count stamp so
+    /// the persisted shard file's `content_stamp` changes whenever the identity
+    /// changes, even at an unchanged chunk count — a second-line defense behind the
+    /// DB identity check — and whenever ANY index run changed chunk rows since the
+    /// file was written (`index_epoch`, see `store::ops::bump_index_epoch`).
+    /// Count + identity alone let a same-count edit revalidate a stale file.
+    /// Hashed rather than linearly mixed so distinct (count, epoch) pairs cannot
+    /// cancel out to the same stamp.
+    pub fn content_stamp(&self, chunk_count: u64, index_epoch: u64) -> u64 {
         let mut hasher = Sha256::new();
         hasher.update(self.as_key_string().as_bytes());
+        hasher.update(chunk_count.to_le_bytes());
+        hasher.update(index_epoch.to_le_bytes());
         let digest = hasher.finalize();
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&digest[0..8]);

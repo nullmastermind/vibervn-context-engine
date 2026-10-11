@@ -214,6 +214,11 @@ pub fn spawn_idle_watchdog(
             if tracker.idle_for() < window {
                 continue;
             }
+            if index_engine.is_index_busy(&repo).await {
+                // An index run with no client attached (watcher, boot catch-up,
+                // scheduled retry) is activity too: exiting would cancel it.
+                continue;
+            }
 
             // Idle long enough with nothing in flight → graceful self-exit.
             info!(

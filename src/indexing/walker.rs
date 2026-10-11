@@ -297,6 +297,64 @@ impl ChangeFilter {
             Match::Ignore(_)
         )
     }
+
+    /// True if directory `dir` is a place indexed files can live: not itself (or
+    /// under) a dot-dir or SKIP_DIRS entry, not gitignored, not a per-repo ignored
+    /// path. Used to decide whether a vanished path could have been a directory
+    /// holding indexed files — `.git/` lock churn and editor temp dirs must not
+    /// trigger a scan of every stored path.
+    pub fn could_contain_indexed(&self, dir: &Path) -> bool {
+        // The helpers only inspect PARENT components; probe a child so `dir`
+        // itself is checked too.
+        let probe = dir.join("_");
+        if is_under_hidden_dir(&self.repo_root, &probe)
+            || is_under_skip_dir(&self.repo_root, &probe)
+        {
+            return false;
+        }
+        if !self.ignore_paths.is_empty()
+            && let Ok(rel) = dir.strip_prefix(&self.repo_root)
+            && let Some(rel_str) = rel.to_str()
+            && self.ignore_paths.contains(&rel_str.replace('\\', "/"))
+        {
+            return false;
+        }
+        !matches!(
+            self.gitignore.matched_path_or_any_parents(dir, true),
+            Match::Ignore(_)
+        )
+    }
+}
+
+/// Walk only the subtree `subdir` of the repo at `repo_root`, returning exactly
+/// the files the full `walk_repo_with` would return for that subtree.
+///
+/// Used when a whole directory appears in one watcher event (created, or moved
+/// into the repo): the directory's files never get individual events. The inner
+/// walk prunes like the full walker; the repo-root-relative rules (dot-dirs and
+/// SKIP_DIRS above `subdir`, the root ignore files, per-repo ignored paths) are
+/// re-applied with [`ChangeFilter`], since the inner walk is rooted at `subdir`.
+/// Cost is O(subtree), never O(repo).
+pub fn walk_subtree_with(
+    repo_root: &str,
+    subdir: &str,
+    extra_extensions: &[String],
+    ignore_filenames: &HashSet<String>,
+    ignore_paths: &HashSet<String>,
+) -> Vec<String> {
+    let filter = ChangeFilter::new_complete(
+        Path::new(repo_root),
+        extra_extensions.to_vec(),
+        ignore_filenames.clone(),
+        ignore_paths.clone(),
+    );
+    if !filter.could_contain_indexed(Path::new(subdir)) {
+        return Vec::new();
+    }
+    walk_repo_with(subdir, extra_extensions, ignore_filenames, &HashSet::new())
+        .into_iter()
+        .filter(|p| filter.allows(Path::new(p)))
+        .collect()
 }
 
 /// Walk a repository directory and return all indexable file paths.

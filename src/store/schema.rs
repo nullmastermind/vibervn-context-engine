@@ -144,4 +144,13 @@ DEFINE FIELD OVERWRITE kind         ON raw_edge TYPE string;
 DEFINE FIELD OVERWRITE line         ON raw_edge TYPE int;
 DEFINE FIELD OVERWRITE import_path  ON raw_edge TYPE option<string>;
 DEFINE INDEX IF NOT EXISTS idx_raw_edge_from_file ON raw_edge FIELDS from_file;
+
+-- pending_retry: files skipped for a TRANSIENT reason (embed retries exhausted,
+-- file locked / unreadable mid-save) after their old rows were already deleted.
+-- Every incremental run folds these paths back into its change set, so a skipped
+-- file is retried even when no walk runs (watcher-path triggers). Bounded by the
+-- repo's file count; rows are removed when the file commits or disappears.
+DEFINE TABLE IF NOT EXISTS pending_retry SCHEMAFULL;
+DEFINE FIELD OVERWRITE path ON pending_retry TYPE string;
+DEFINE INDEX IF NOT EXISTS idx_pending_retry_path ON pending_retry FIELDS path UNIQUE;
 "#;

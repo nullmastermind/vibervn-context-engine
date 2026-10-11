@@ -107,6 +107,13 @@ pub struct ShardedVectorIndex {
     /// vectors can be re-used when the delta publishes. Full rebuilds do not retain
     /// an old shard.
     pending_incremental: HashMap<String, Shard>,
+    /// Per-repo mutation epoch, bumped whenever a repo's vectors change (update
+    /// begin/publish/abort, direct removals). A warm captures it before its DB scan
+    /// and installs only if it is unchanged: `mutating_repos` alone cannot catch an
+    /// update that began AND published while the scan was running, which would
+    /// otherwise install (and persist) the pre-update snapshot. Bounded by repo
+    /// count.
+    epochs: HashMap<String, u64>,
     /// Monotonic logical clock. Each touch fetch-adds 1 and stamps the shard, so a
     /// higher stamp == more recently used. Eviction picks the lowest stamp (LRU).
     clock: AtomicU64,
@@ -124,6 +131,7 @@ impl ShardedVectorIndex {
             shards: HashMap::new(),
             mutating_repos: HashSet::new(),
             pending_incremental: HashMap::new(),
+            epochs: HashMap::new(),
             clock: AtomicU64::new(0),
             cap_bytes,
         }
@@ -185,11 +193,22 @@ impl ShardedVectorIndex {
         self.mutating_repos.contains(&Self::repo_key(repo))
     }
 
+    /// Current mutation epoch for `repo` (see the `epochs` field). Capture it
+    /// before a warm's DB scan; pass it to [`Self::install_shard_if_not_mutating`].
+    pub fn mutation_epoch(&self, repo: &str) -> u64 {
+        self.epochs.get(&Self::repo_key(repo)).copied().unwrap_or(0)
+    }
+
+    fn bump_epoch(&mut self, repo_key: &str) {
+        *self.epochs.entry(repo_key.to_owned()).or_insert(0) += 1;
+    }
+
     /// Begin a full rebuild before `delete_all_data` runs. The old shard becomes
     /// immediately unsearchable and is dropped; warm cannot install a replacement
     /// until the pipeline publishes successfully.
     pub fn begin_full_update(&mut self, repo: &str) {
         let repo = Self::repo_key(repo);
+        self.bump_epoch(&repo);
         self.shards.remove(&repo);
         self.pending_incremental.remove(&repo);
         self.mutating_repos.insert(repo);
@@ -200,6 +219,7 @@ impl ShardedVectorIndex {
     /// can be re-used at publish time without an O(repo) DB reload.
     pub fn begin_incremental_update(&mut self, repo: &str) {
         let repo = Self::repo_key(repo);
+        self.bump_epoch(&repo);
         self.pending_incremental.remove(&repo);
         if let Some(shard) = self.shards.remove(&repo) {
             self.pending_incremental.insert(repo.clone(), shard);
@@ -207,17 +227,20 @@ impl ShardedVectorIndex {
         self.mutating_repos.insert(repo);
     }
 
-    /// Install a warm-built shard only if no destructive run owns publication.
-    /// Returns false when the scan raced an index run; the caller must discard it.
+    /// Install a warm-built shard only if no destructive run owns publication AND
+    /// no update happened since the warm captured `scan_epoch` (before its DB
+    /// scan). Returns false when the scan raced an index run; the caller must
+    /// discard it.
     pub fn install_shard_if_not_mutating(
         &mut self,
         repo: &str,
         shard: VectorIndex,
         identity: String,
         active: &[String],
+        scan_epoch: u64,
     ) -> bool {
         let repo = Self::repo_key(repo);
-        if self.mutating_repos.contains(&repo) {
+        if self.mutating_repos.contains(&repo) || self.mutation_epoch(&repo) != scan_epoch {
             return false;
         }
         self.install_shard(&repo, shard, identity, active);
@@ -233,6 +256,7 @@ impl ShardedVectorIndex {
         active: &[String],
     ) {
         let repo = Self::repo_key(repo);
+        self.bump_epoch(&repo);
         self.pending_incremental.remove(&repo);
         self.replace_repo(&repo, new_vectors, identity, active);
         self.mutating_repos.remove(&repo);
@@ -249,10 +273,17 @@ impl ShardedVectorIndex {
         active: &[String],
     ) {
         let repo = Self::repo_key(repo);
+        // Only a shard that was resident when the update began can absorb the
+        // delta. A cold repo stays cold: building a shard from `new_vectors`
+        // alone would publish just the changed files as if they were the whole
+        // repo (it looks resident + identity-matching, so nothing re-warms it).
+        // The persisted shard file was invalidated at begin, so the next query
+        // warms the complete shard from the DB.
         if let Some(shard) = self.pending_incremental.remove(&repo) {
             self.shards.insert(repo.clone(), shard);
+            self.apply_incremental(&repo, removed_files, new_vectors, identity, active);
         }
-        self.apply_incremental(&repo, removed_files, new_vectors, identity, active);
+        self.bump_epoch(&repo);
         self.mutating_repos.remove(&repo);
     }
 
@@ -260,6 +291,7 @@ impl ShardedVectorIndex {
     /// shard. A later successful full rebuild releases the mutation fence.
     pub fn abort_update_fail_closed(&mut self, repo: &str) {
         let repo = Self::repo_key(repo);
+        self.bump_epoch(&repo);
         self.shards.remove(&repo);
         self.pending_incremental.remove(&repo);
         self.mutating_repos.insert(repo);
@@ -348,9 +380,12 @@ impl ShardedVectorIndex {
 
     // ── Incremental write helpers (used by the pipeline) ─────────────────────
 
-    /// Apply incremental changes to a repo's shard: remove vectors for
-    /// `removed_files`, then insert `new_vectors`. Touches recency and re-checks
-    /// the cap. If the repo has no resident shard yet, one is created.
+    /// Apply incremental changes to a RESIDENT repo shard: remove vectors for
+    /// `removed_files` (one pass), then insert `new_vectors`. Touches recency and
+    /// re-checks the cap. A cold repo is left cold — a shard is never created from
+    /// a delta, since it would masquerade as the whole repo; the next warm loads
+    /// the complete shard from the DB. Bumps the mutation epoch either way, so a
+    /// warm scan that overlapped this change cannot install its stale snapshot.
     pub fn apply_incremental(
         &mut self,
         repo: &str,
@@ -360,15 +395,14 @@ impl ShardedVectorIndex {
         active: &[String],
     ) {
         let repo = Self::repo_key(repo);
+        self.bump_epoch(&repo);
         let stamp = self.next_stamp();
-        let shard = self
-            .shards
-            .entry(repo.clone())
-            .or_insert_with(|| Shard::new(VectorIndex::new(), identity.clone(), stamp));
+        let Some(shard) = self.shards.get_mut(&repo) else {
+            return;
+        };
         shard.identity = identity;
-        for file in removed_files {
-            shard.index.remove_file(file);
-        }
+        let removed: HashSet<&str> = removed_files.iter().map(String::as_str).collect();
+        shard.index.remove_files(&removed);
         shard.index.insert(new_vectors);
         shard.last_touched.store(stamp, Ordering::Relaxed);
         // An emptied shard is dropped to free its (now-zero) slot.
@@ -911,6 +945,7 @@ mod tests {
                 shard_from_gids(repo, &[99]),
                 "id".to_owned(),
                 &[],
+                idx.mutation_epoch(repo),
             ),
             "warm install must be rejected while full rebuild owns publication"
         );
@@ -970,5 +1005,75 @@ mod tests {
             "unaffected vector retained off-path must survive incremental publish"
         );
         assert!(!idx.is_mutating(repo));
+    }
+
+    /// Primary defect 2: an incremental that starts while the repo is cold (worker
+    /// boot catch-up, post-eviction edit) must NOT publish a shard holding only
+    /// the changed files — that shard looked resident + identity-matching, so the
+    /// query path never warmed the full shard from the DB.
+    #[test]
+    fn cold_incremental_publish_leaves_repo_cold() {
+        let repo = "/r/cold";
+        let mut idx = ShardedVectorIndex::new(0);
+        idx.begin_incremental_update(repo);
+        let changed = vec![(
+            ChunkId {
+                file: format!("{repo}/changed.rs"),
+                line_start: 1,
+                line_end: 2,
+            },
+            vec_for_gid(1),
+        )];
+        idx.publish_incremental_update(
+            repo,
+            &[format!("{repo}/changed.rs")],
+            &changed,
+            "id".to_owned(),
+            &[],
+        );
+        assert!(!idx.is_mutating(repo), "fence released");
+        assert!(
+            !idx.is_resident(repo),
+            "a cold repo must stay cold so the next query warms ALL vectors from DB"
+        );
+        assert!(matches!(
+            idx.search_scoped(&vec_for_gid(1), 10, repo, "id"),
+            ScopedSearch::Cold
+        ));
+    }
+
+    /// S9/D8: a warm whose DB scan began before an update began AND published
+    /// must not install its (now stale) snapshot, even though the repo is no
+    /// longer mutating by the time it tries.
+    #[test]
+    fn warm_snapshot_from_before_a_published_update_is_rejected() {
+        let repo = "/r/race";
+        let mut idx = ShardedVectorIndex::new(0);
+        idx.install_shard(repo, shard_from_gids(repo, &[1]), "id".to_owned(), &[]);
+        idx.evict_repo(&ShardedVectorIndex::repo_key(repo));
+        let epoch_at_scan_start = idx.mutation_epoch(repo);
+
+        idx.begin_incremental_update(repo);
+        idx.publish_incremental_update(repo, &[], &[], "id".to_owned(), &[]);
+        assert!(!idx.is_mutating(repo));
+
+        assert!(
+            !idx.install_shard_if_not_mutating(
+                repo,
+                shard_from_gids(repo, &[1]),
+                "id".to_owned(),
+                &[],
+                epoch_at_scan_start,
+            ),
+            "stale warm snapshot must be rejected"
+        );
+        let fresh_epoch = idx.mutation_epoch(repo);
+        assert!(idx.install_shard_if_not_mutating(
+            repo,
+            shard_from_gids(repo, &[1]),
+            "id".to_owned(),
+            &[],
+            fresh_epoch,
+        ));
     }
 }

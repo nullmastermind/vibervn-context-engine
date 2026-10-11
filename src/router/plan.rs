@@ -38,6 +38,9 @@ fn plan_http_client() -> reqwest::Client {
 /// Read the persisted machine_id from settings.json (router has no AppState, so
 /// it loads the file). Boot of any process guarantees `Some(...)`; a missing id
 /// surfaces as a 500 so a checkout can't proceed without per-machine dedup.
+// An axum `Response` is the idiomatic early-return error for a handler helper;
+// boxing it would only add an allocation on the error path.
+#[allow(clippy::result_large_err)]
 async fn machine_id(state: &RouterState) -> Result<String, Response> {
     let home = state.home_dir.clone();
     let settings = match tokio::task::spawn_blocking(move || ensure_dir_and_load(&home)).await {

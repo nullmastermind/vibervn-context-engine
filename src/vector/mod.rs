@@ -159,6 +159,41 @@ impl VectorIndex {
         }
     }
 
+    /// Remove every embedding whose `file` is in `files`, in ONE pass over the
+    /// shard: O(shard) per call instead of O(shard × files) for a per-file loop,
+    /// which a branch switch touching thousands of files turned into a multi-minute
+    /// stall at kernel scale. Stable compaction (row order is irrelevant to
+    /// search). An mmap-backed shard is only materialized when something actually
+    /// matches.
+    pub fn remove_files(&mut self, files: &std::collections::HashSet<&str>) {
+        if files.is_empty()
+            || !self
+                .chunk_ids
+                .iter()
+                .any(|c| files.contains(c.file.as_str()))
+        {
+            return;
+        }
+        let dim = self.dim;
+        let emb = self.store.ram_mut();
+        let mut write = 0usize;
+        for read in 0..self.chunk_ids.len() {
+            if files.contains(self.chunk_ids[read].file.as_str()) {
+                continue;
+            }
+            if write != read {
+                emb.copy_within(read * dim..(read + 1) * dim, write * dim);
+                self.chunk_ids.swap(write, read);
+            }
+            write += 1;
+        }
+        self.chunk_ids.truncate(write);
+        emb.truncate(write * dim);
+        if self.chunk_ids.is_empty() {
+            self.dim = 0;
+        }
+    }
+
     /// Remove all embeddings whose `file` field matches `file`.
     ///
     /// Uses swap-remove to avoid O(n) shifts; moves whole `dim`-sized rows.
@@ -817,5 +852,57 @@ mod tests {
         for r in &results {
             assert_ne!(r.chunk_id.file, "/a/f1.rs");
         }
+    }
+
+    /// D10: batched removal keeps exactly the rows a per-file loop keeps, with
+    /// each surviving id still paired with its own vector.
+    #[test]
+    fn remove_files_matches_per_file_removal() {
+        let dim = 4;
+        let mut batched = VectorIndex::new();
+        let rows: Vec<(ChunkId, Vec<f32>)> = (0..12)
+            .map(|i| {
+                let mut v = vec![0.0f32; dim];
+                v[i % dim] = 1.0 + i as f32;
+                (
+                    chunk(&format!("/r/f{}.rs", i % 5), i as u32, i as u32 + 1),
+                    v,
+                )
+            })
+            .collect();
+        batched.insert(&rows);
+        let mut looped = VectorIndex::new();
+        looped.insert(&rows);
+
+        let gone = ["/r/f0.rs", "/r/f3.rs", "/r/missing.rs"];
+        batched.remove_files(&gone.iter().copied().collect());
+        for f in gone {
+            looped.remove_file(f);
+        }
+
+        let key = |ix: &VectorIndex| {
+            let mut v: Vec<(String, u32, Vec<u32>)> = ix
+                .chunk_ids
+                .iter()
+                .enumerate()
+                .map(|(row, c)| {
+                    let vec = ix.store.as_slice()[row * dim..(row + 1) * dim]
+                        .iter()
+                        .map(|x| x.to_bits())
+                        .collect();
+                    (c.file.clone(), c.line_start, vec)
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(key(&batched), key(&looped));
+        assert!(
+            batched
+                .chunk_ids
+                .iter()
+                .all(|c| !gone.contains(&c.file.as_str()))
+        );
+        assert_eq!(batched.store.as_slice().len(), batched.len() * dim);
     }
 }

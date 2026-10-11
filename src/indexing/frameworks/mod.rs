@@ -95,8 +95,18 @@ impl FrameworkRegistry {
         edges
     }
 
-    /// Names of active frameworks (for diagnostics/logging).
-    #[allow(dead_code)]
+    /// Additionally activate resolvers by name (a set persisted by an earlier
+    /// whole-repo detection). Unknown names are ignored; marks detection as done.
+    pub fn activate_names<S: AsRef<str>>(&mut self, names: &[S]) {
+        for (i, resolver) in self.resolvers.iter().enumerate() {
+            if !self.active.contains(&i) && names.iter().any(|n| n.as_ref() == resolver.name()) {
+                self.active.push(i);
+            }
+        }
+        self.detected = true;
+    }
+
+    /// Names of active frameworks (persisted so incremental runs keep them).
     pub fn active_names(&self) -> Vec<&str> {
         self.active
             .iter()
