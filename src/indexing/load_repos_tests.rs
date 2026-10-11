@@ -519,6 +519,58 @@ async fn vector_search_resident_empty_is_not_warming() {
     );
 }
 
+/// A scoped search on a RESIDENT shard that has no rows of the requested class is
+/// a genuine empty (warming=false), which is exactly the signal the code↔docs
+/// fallback keys on — while the other class on the same shard still hits. Seeded
+/// files are all `.rs`, so `docs` is the empty class here.
+#[tokio::test(flavor = "multi_thread")]
+async fn scoped_vector_search_empty_class_is_genuine_empty_not_warming() {
+    use crate::vector::{Scope, ScopeFilter};
+
+    let home = TempDir::new().expect("tempdir");
+    let repo = "/proj/scoped".to_string();
+    let repo_dbs: RepoDbMap = Arc::new(RwLock::new(HashMap::new()));
+    seed_repo(&repo_dbs, home.path(), &repo, 3).await;
+    let settings = crate::config::Settings {
+        repos: vec![repo.clone()],
+        ..Default::default()
+    };
+    let settings_handle = Arc::new(RwLock::new(settings.clone()));
+    let engine = IndexEngine::start(
+        home.path().to_path_buf(),
+        home.path().join("embeddings"),
+        &settings,
+        repo_dbs.clone(),
+        settings_handle,
+        false,
+    )
+    .await;
+    let identity = test_identity();
+    engine
+        .warm_repo_blocking(repo.clone(), identity.clone())
+        .await;
+
+    let q = vec![1.0f32, 0.0, 0.0, 0.0];
+    let wait = std::time::Duration::from_secs(10);
+    let docs = ScopeFilter::new(Scope::Docs, ["md"]);
+    let code = ScopeFilter::new(Scope::Code, ["md"]);
+
+    let none_found = engine
+        .vector_search_with(&q, 10, Some(&repo), wait, &identity, Some(&docs))
+        .await;
+    assert!(none_found.results.is_empty());
+    assert!(
+        !none_found.warming,
+        "an empty class on a resident shard is a real empty, not 'retry'"
+    );
+
+    let found = engine
+        .vector_search_with(&q, 10, Some(&repo), wait, &identity, Some(&code))
+        .await;
+    assert_eq!(found.results.len(), 3);
+    assert!(!found.warming);
+}
+
 /// Harness for the full-rebuild window: delete_all_data removes every chunk
 /// while the old resident shard is still installed. This must be fail-closed:
 /// no vector result may survive without its DB content.

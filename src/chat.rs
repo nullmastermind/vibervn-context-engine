@@ -378,6 +378,11 @@ fn tool_defs() -> Vec<ToolDef> {
                         "type": "string",
                         "description": "A detailed natural-language description of what you \
                             need to find (e.g. 'how is the vector index sharded per repo')."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["code", "docs"],
+                        "description": crate::prompts::MCP_SCOPE_PARAM.trim()
                     }
                 },
                 "required": ["information_request"]
@@ -508,6 +513,20 @@ async fn run_tool(
             if req.trim().is_empty() {
                 return ("Error: information_request is required.".to_owned(), false);
             }
+            // Omitted → `code`; a present-but-invalid value is an error the model
+            // can correct, never a silent fallback to the default.
+            let scope = match args.get("scope") {
+                None | Some(serde_json::Value::Null) => crate::vector::Scope::default(),
+                Some(v) => match v.as_str().and_then(crate::vector::Scope::parse) {
+                    Some(s) => s,
+                    None => {
+                        return (
+                            "Error: scope must be \"code\" or \"docs\".".to_owned(),
+                            false,
+                        );
+                    }
+                },
+            };
             let out = crate::mcp::run_codebase_retrieval(
                 &deps.home_dir,
                 &deps.data_dir,
@@ -516,6 +535,7 @@ async fn run_tool(
                 &deps.settings,
                 req,
                 repo,
+                scope,
             )
             .await;
             let ok = !out.starts_with("Error:");

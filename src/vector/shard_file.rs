@@ -329,6 +329,50 @@ mod tests {
         }
     }
 
+    /// The code/docs classification is NOT persisted in the shard file; a shard
+    /// cold-warmed from disk (the production path at scale) must re-derive it from
+    /// the chunk paths, and scoped search over the mmap-backed shard must honor it.
+    #[test]
+    fn mmap_opened_shard_classifies_rows_by_scope() {
+        use crate::vector::{Scope, ScopeFilter};
+
+        let tmp = TempDir::new().unwrap();
+        let repo = "/proj/scoped";
+        let mut ram = VectorIndex::new();
+        let rows: Vec<(ChunkId, Vec<f32>)> = ["a.rs", "README.md", "b.py", "GUIDE.MD", "c.json"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                (
+                    ChunkId {
+                        file: format!("/r/{name}"),
+                        line_start: i as u32,
+                        line_end: i as u32 + 1,
+                    },
+                    vec![1.0, 0.1 * i as f32, 0.0, 0.0],
+                )
+            })
+            .collect();
+        ram.insert(&rows);
+        write_new_generation(tmp.path(), repo, &ram, 5).unwrap();
+        let (mapped, _) = open_current(tmp.path(), repo, 4, 5).unwrap().unwrap();
+        assert!(mapped.is_mmap());
+
+        let q = [1.0, 0.0, 0.0, 0.0];
+        let files = |scope: Scope| -> Vec<String> {
+            let f = ScopeFilter::new(scope, ["md"]);
+            let mut v: Vec<String> = mapped
+                .search_filtered(&q, 10, Some(&f))
+                .into_iter()
+                .map(|r| r.chunk_id.file)
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(files(Scope::Docs), vec!["/r/GUIDE.MD", "/r/README.md"]);
+        assert_eq!(files(Scope::Code), vec!["/r/a.rs", "/r/b.py", "/r/c.json"]);
+    }
+
     /// mmap shard byte_size excludes the f32 payload (page-cache-resident); only
     /// the small chunk-id sidecar counts against the heap cap.
     #[test]

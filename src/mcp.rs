@@ -26,7 +26,7 @@ mod progress;
 pub(crate) mod query_gate;
 pub(crate) mod readiness;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use progress::{MCP_PROGRESS_HEARTBEAT, with_progress_heartbeat};
 
@@ -294,6 +294,9 @@ pub struct CodebaseRetrievalArgs {
     /// Optional: filter results to files matching this path substring.
     #[serde(default)]
     pub filter_path: Option<String>,
+    #[doc = include_str!("prompts/mcp_scope_param.txt")]
+    #[serde(default)]
+    pub scope: Option<crate::vector::Scope>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -383,6 +386,7 @@ impl McpHandler {
                 &settings,
                 &augmented_query,
                 &args.workspace_full_path,
+                args.scope.unwrap_or_default(),
             ),
         )
         .await;
@@ -434,6 +438,9 @@ impl ServerHandler for McpHandler {
 pub struct RepoCodebaseRetrievalArgs {
     /// Natural-language description of the code or information you are looking for.
     pub information_request: String,
+    #[doc = include_str!("prompts/mcp_scope_param.txt")]
+    #[serde(default)]
+    pub scope: Option<crate::vector::Scope>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -508,6 +515,7 @@ impl RepoMcpHandler {
                 &settings,
                 &args.information_request,
                 &self.repo_path,
+                args.scope.unwrap_or_default(),
             ),
         )
         .await;
@@ -596,6 +604,10 @@ fn select_empty_or_warming_message(
     format!("No results found for: {information_request}")
 }
 
+/// `scope` is REQUIRED here (not an `Option`) so that every entry surface must
+/// decide it explicitly — each passes `args.scope.unwrap_or_default()`, i.e.
+/// `code` when the caller omitted it — and none can silently skip the default.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_codebase_retrieval(
     home_dir: &Path,
     data_dir: &Path,
@@ -604,6 +616,7 @@ pub async fn run_codebase_retrieval(
     settings: &Settings,
     information_request: &str,
     workspace_full_path: &str,
+    scope: crate::vector::Scope,
 ) -> String {
     // 1. Validate workspace_full_path.
     let repo = workspace_full_path.trim();
@@ -686,13 +699,49 @@ pub async fn run_codebase_retrieval(
         index_engine,
         repo_dbs,
         settings,
-        information_request,
+        &scoped_request(information_request, scope),
         repo,
         query_graph_mode,
         query_warm_wait,
     )
     .await;
     format!("{output_prefix}{output}")
+}
+
+/// Prefix the request with the structured scope as an inline `scope:` filter (the
+/// same channel `filter_lang` uses). It goes FIRST and the parser keeps the first
+/// valid `scope:`, so the tool parameter beats one typed inside the free text.
+fn scoped_request(information_request: &str, scope: crate::vector::Scope) -> String {
+    format!("scope:{} {}", scope.as_str(), information_request)
+}
+
+/// Banner for results served from the OTHER scope after the requested one was
+/// empty — the agent must know it did not get what it asked for.
+fn scope_fallback_notice(requested: crate::vector::Scope, served: crate::vector::Scope) -> String {
+    crate::prompts::render(
+        crate::prompts::MCP_SCOPE_FALLBACK,
+        &[
+            ("requested", requested.as_str()),
+            ("served", served.as_str()),
+        ],
+    )
+}
+
+/// A genuine empty for a scoped query means BOTH scopes were searched (the
+/// fallback ran and also found nothing). Say so, but only when that is true:
+/// not while warming (retry wording must stay intact) and not when candidates
+/// existed and the reranker rejected them.
+fn note_both_scopes_searched(
+    message: String,
+    scoped: bool,
+    no_candidates: bool,
+    warming: bool,
+) -> String {
+    if scoped && no_candidates && !warming {
+        format!("{message} (searched both code and docs)")
+    } else {
+        message
+    }
 }
 
 /// Build an augmented query string that prepends structured filter params as inline
@@ -819,7 +868,12 @@ async fn do_query(
         settings.llm.agentic_rag_max_turns,
         settings.llm.agentic_rag_max_chunk_chars,
         settings.llm.agentic_rag_grep_read,
-        None,
+        // The live docs-extensions setting rides in on the filters, read from the
+        // per-request settings snapshot (workers reload settings.json per request).
+        Some(crate::query::filters::QueryFilters {
+            docs_extensions: Some(settings.docs_extensions.clone()),
+            ..Default::default()
+        }),
         graph_mode,
     )
     .await
@@ -837,10 +891,17 @@ async fn do_query(
                 let rerank_rejected = result.rerank.as_ref().is_some_and(|r| {
                     !r.fallback_used && r.skip_reason.is_none() && !r.raw_response.is_empty()
                 });
-                return select_empty_or_warming_message(
+                return note_both_scopes_searched(
+                    select_empty_or_warming_message(
+                        result.warming,
+                        rerank_rejected,
+                        information_request,
+                    ),
+                    result.scope.is_some(),
+                    // The engine's early-return paths (no candidates survived)
+                    // are the only ones without rerank info.
+                    result.rerank.is_none(),
                     result.warming,
-                    rerank_rejected,
-                    information_request,
                 );
             }
             let blocks: Vec<OutputBlock> = result
@@ -875,7 +936,18 @@ async fn do_query(
                 .partition(|b| !crate::parsing::generated::is_generated_file(&b.file));
             let mut blocks = hand_written;
             blocks.extend(generated);
-            let assembled = assemble_with_budget(&blocks);
+            let mut assembled = assemble_with_budget(&blocks);
+            if result.scope_fallback
+                && let Some(served) = result
+                    .scope
+                    .as_deref()
+                    .and_then(crate::vector::Scope::parse)
+            {
+                assembled = format!(
+                    "{}{assembled}",
+                    scope_fallback_notice(served.opposite(), served)
+                );
+            }
             if result.warming {
                 format!("{MCP_PARTIAL_RESULTS_PREFIX}{assembled}")
             } else {

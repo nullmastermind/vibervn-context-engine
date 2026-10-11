@@ -34,6 +34,7 @@ mod tests {
             bind: "127.0.0.1".to_string(),
             home_dir: None,
             worker_exe: None,
+            listen_port: None,
         };
 
         assert_eq!(

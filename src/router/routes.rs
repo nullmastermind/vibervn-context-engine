@@ -3,6 +3,7 @@ fn build_http_routes() -> Router<RouterState> {
         .route("/", get(crate::assets::serve_index))
         .route("/assets/fonts/:name", get(crate::assets::serve_font))
         .route("/api/config", get(get_config).put(put_config))
+        .route("/api/server-info", get(get_server_info))
         .route("/api/repos", get(list_repos))
         .route("/api/embedding-cache", delete(delete_embedding_cache))
         .route("/api/defender-status", get(get_defender_status))

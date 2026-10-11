@@ -822,6 +822,26 @@
         </form>
       </section>
 
+      <!-- Docs Extensions (scope: "docs" vs "code" in codebase-retrieval) -->
+      <section class="mb-8 pt-6 border-t border-gray-200 dark:border-wiki-border">
+        <h2 data-i18n="settings.docsExt" class="font-wiki text-xl dark:text-wiki-heading text-gray-900 border-b border-gray-200 dark:border-wiki-border pb-2 mb-4">Docs Extensions</h2>
+        <p data-i18n="settings.docsExtHelp" class="text-sm text-gray-600 dark:text-wiki-text-muted mb-3">
+          Extensions treated as docs by the scope "docs" search; every other indexed file is code. Enter without the leading dot. Applies on the next query, no re-index. An extension must also be indexed (built-in list or Custom Extensions) to appear in results.
+        </p>
+        <div id="docs-extensions-list" class="space-y-2 mb-2"></div>
+        <form id="form-add-docs-ext" class="flex gap-2" onsubmit="return false;">
+          <input id="input-docs-ext" type="text" placeholder="e.g. adoc" data-i18n-ph="settings.docsExtPlaceholder"
+                 class="flex-1 border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface text-gray-900 dark:text-wiki-text rounded px-3 py-2 text-sm font-mono
+                        placeholder:text-gray-400 dark:placeholder:text-wiki-text-muted
+                        focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active" />
+          <button type="submit" data-i18n="action.add"
+                  class="px-4 py-2 bg-blue-600 dark:bg-wiki-border-active/20 dark:border dark:border-wiki-border-active text-white dark:text-wiki-link text-sm rounded
+                         hover:bg-blue-700 dark:hover:bg-wiki-border-active/30 focus:outline-none focus:ring-2 focus:ring-blue-400">
+            Add
+          </button>
+        </form>
+      </section>
+
       <!-- Index Ignore List -->
       <section class="mb-8 pt-6 border-t border-gray-200 dark:border-wiki-border">
         <h2 data-i18n="settings.ignoreList" class="font-wiki text-xl dark:text-wiki-heading text-gray-900 border-b border-gray-200 dark:border-wiki-border pb-2 mb-4">Index Ignore List</h2>
@@ -1273,11 +1293,38 @@ function exampleRepoPath() {
 // (d:\…): the row's status badge never binds, and the index poll's "unknown
 // repo" heuristic misfires every tick. Windows → backslashes + lowercase;
 // elsewhere → forward slashes. Both trim trailing separators.
+//
+// The branch is chosen from the SHAPE OF THE PATH (drive letter / UNC → the
+// server is Windows), NOT from the browser's OS (isWindowsOS). The browser and
+// the server can differ — e.g. a Windows browser managing a Linux/Docker server.
+// Keying off the browser lowercased "/home/User/Proj" into "\home\user\proj",
+// which the case-sensitive Linux filesystem can't find, so indexing failed.
 function normalizeRepoPath(repo) {
-  let s = isWindowsOS()
+  const isWindowsPath = /^[A-Za-z]:[\\/]/.test(repo) || repo.startsWith('\\\\');
+  let s = isWindowsPath
     ? repo.replace(/\//g, '\\').toLowerCase()
     : repo.replace(/\\/g, '/');
   return s.replace(/[\\/]+$/, '');
+}
+
+// MCP endpoints are for MCP clients on the machine the engine runs on, so the
+// host is ALWAYS localhost and the port is the backend's real listen port
+// (GET /api/server-info) — never window.location. The page origin is wrong
+// whenever the UI is embedded in an iframe, behind a reverse proxy, or opened
+// from another host. location.port is only a last-resort fallback for the
+// moments before /api/server-info answers (or if it fails).
+let serverListenPort = null;
+async function loadServerInfo() {
+  try {
+    const res = await fetch('/api/server-info');
+    if (!res.ok) return;
+    const info = await res.json();
+    if (Number.isInteger(info.port)) serverListenPort = info.port;
+  } catch (_) { /* keep the fallback */ }
+}
+function mcpEndpointBase() {
+  const port = serverListenPort ?? (window.location.port || null);
+  return 'http://localhost' + (port ? ':' + port : '');
 }
 
 // Hand-built inline SVG flags (no emoji — Windows renders flag emoji as letter
@@ -1538,6 +1585,10 @@ const STR = {
   'settings.extensions':   { en: `Custom Extensions`, vi: `Extension tùy chỉnh`, zh: `自定义扩展名` },
   'settings.extensionsHelp': { en: `Add file extensions to index beyond the built-in list. Enter without the leading dot.`, vi: `Thêm extension để index ngoài danh sách mặc định. Nhập không cần dấu chấm đầu.`, zh: `添加内置列表之外的文件扩展名。输入时无需前导点。` },
   'settings.extPlaceholder': { en: `e.g. prisma`, vi: `vd. prisma`, zh: `例如 prisma` },
+  'settings.docsExt':         { en: `Docs Extensions`, vi: `Docs Extensions`, zh: `文档扩展名` },
+  'settings.docsExtHelp':     { en: `Extensions treated as docs by the scope "docs" search; every other indexed file is code. Enter without the leading dot. Applies on the next query, no re-index. An extension must also be indexed (built-in list or Custom Extensions) to appear in results.`, vi: `Các extension được xem là docs khi tìm với scope "docs"; mọi file đã index còn lại là code. Nhập không cần dấu chấm đầu. Áp dụng ở query kế tiếp, không cần re-index. Extension cũng phải được index (danh sách mặc định hoặc Custom Extensions) thì mới xuất hiện trong kết quả.`, zh: `scope 为 "docs" 的搜索将这些扩展名视为文档；其余已索引的文件均视为 code。输入时无需前导点。下次查询即生效，无需重新索引。扩展名还必须被索引（内置列表或 Custom Extensions）才会出现在结果中。` },
+  'settings.docsExtInvalid': { en: `Not a valid docs extension: use a plain extension (no spaces or slashes, at most 32 characters, at most 64 entries).`, vi: `Docs extension không hợp lệ: dùng extension thuần (không có khoảng trắng hay dấu gạch chéo, tối đa 32 ký tự, tối đa 64 mục).`, zh: `无效的 docs 扩展名：请使用纯扩展名（不含空格或斜杠，最多 32 个字符，最多 64 项）。` },
+  'settings.docsExtPlaceholder': { en: `e.g. adoc`, vi: `vd. adoc`, zh: `例如 adoc` },
   'settings.extDuplicate': { en: `Extension already added`, vi: `Extension đã được thêm`, zh: `扩展名已添加` },
 
   // Settings — Index Ignore List
@@ -1563,6 +1614,7 @@ const STR = {
                          vi: `Thêm nội dung sau vào <code class="font-mono text-xs px-1 py-0.5 rounded bg-gray-100 dark:bg-wiki-surface">CLAUDE.md</code> của dự án để Claude ưu tiên dùng context engine khi khám phá codebase.`,
                          zh: `将以下内容添加到项目的 <code class="font-mono text-xs px-1 py-0.5 rounded bg-gray-100 dark:bg-wiki-surface">CLAUDE.md</code>，让 Claude 在探索代码库时优先使用 context engine。` },
   'mcp.testDesc':      { en: `Send a request directly to the MCP tool and see the raw output.`, vi: `Gửi request trực tiếp đến MCP tool và xem output thô.`, zh: `直接向 MCP 工具发送请求并查看原始输出。` },
+  'mcp.testScopeHelp': { en: `Exactly one scope is searched. Default is code. If it returns nothing, the other scope is searched once and the output says so.`, vi: `Chỉ tìm đúng một scope. Mặc định là code. Nếu không có kết quả, scope còn lại được tìm một lần và output sẽ ghi rõ.`, zh: `每次只搜索一个 scope，默认是 code。若无结果，会再搜索另一个 scope 一次，并在输出中注明。` },
   'mcp.testQueryPlaceholder': { en: `e.g. Where is authentication handled?`, vi: `vd. Xác thực được xử lý ở đâu?`, zh: `例如：身份验证在哪里处理？` },
   'mcp.running':       { en: `Running…`, vi: `Đang chạy…`, zh: `运行中…` },
   'mcp.autoSetup':     { en: `Auto Setup`, vi: `Auto Setup`, zh: `自动设置` },
@@ -2384,6 +2436,8 @@ function renderAll() {
   document.getElementById('mcp-tool-file-retrieval').checked = enabledTools.includes('file-retrieval');
   // Custom extensions
   renderExtensionList();
+  // Docs extensions (scope "docs")
+  renderDocsExtList();
   // Index ignore list
   renderIgnoreList();
 }
@@ -2693,6 +2747,59 @@ function handleAddExtension() {
 document.getElementById('form-add-extension').addEventListener('submit', handleAddExtension);
 document.getElementById('input-extension').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); handleAddExtension(); }
+});
+
+// Docs extensions: the same tag-list pattern as Custom Extensions. The server
+// re-normalizes on PUT (trim / strip dot / lowercase / dedupe), so this only needs
+// to avoid obvious duplicates; an empty list is legal ("nothing is docs").
+function renderDocsExtList() {
+  const container = document.getElementById('docs-extensions-list');
+  container.innerHTML = '';
+  const exts = cfg.docs_extensions || [];
+  exts.forEach((ext, idx) => {
+    const row = document.createElement('div');
+    row.className = 'flex items-center gap-2 border border-gray-200 dark:border-wiki-border rounded px-3 py-2 text-sm bg-white dark:bg-wiki-surface';
+    const display = document.createElement('span');
+    display.className = 'font-mono text-gray-800 dark:text-wiki-text flex-1';
+    display.textContent = '.' + ext;
+    const removeBtn = document.createElement('button');
+    removeBtn.textContent = t('action.remove');
+    removeBtn.className = 'text-xs text-gray-400 dark:text-wiki-text-muted hover:text-red-500 dark:hover:text-red-400 focus:outline-none focus:ring-2 focus:ring-red-300 rounded px-2 py-1';
+    removeBtn.addEventListener('click', () => {
+      cfg.docs_extensions.splice(idx, 1);
+      renderDocsExtList();
+      saveNow();
+    });
+    row.appendChild(display);
+    row.appendChild(removeBtn);
+    container.appendChild(row);
+  });
+}
+
+function handleAddDocsExt() {
+  const input = document.getElementById('input-docs-ext');
+  const val = input.value.trim().toLowerCase().replace(/^\.+/, '');
+  if (!val) return;
+  if (!cfg.docs_extensions) cfg.docs_extensions = [];
+  if (cfg.docs_extensions.includes(val)) {
+    input.value = '';
+    return;
+  }
+  // Mirror the server's limits (config::normalize_docs_extensions). The whole cfg
+  // is PUT on every save, so one entry the server rejects would stay in `cfg` and
+  // make EVERY later save of ANY setting fail with 400 — never let it in.
+  if (/[\s/\\]/.test(val) || val.length > 32 || cfg.docs_extensions.length >= 64) {
+    showError(t('settings.docsExtInvalid'));
+    return;
+  }
+  cfg.docs_extensions.push(val);
+  input.value = '';
+  renderDocsExtList();
+  saveNow();
+}
+document.getElementById('form-add-docs-ext').addEventListener('submit', handleAddDocsExt);
+document.getElementById('input-docs-ext').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); handleAddDocsExt(); }
 });
 
 function renderIgnoreList() {
@@ -3939,9 +4046,8 @@ function renderRepoMcpComponent(root, options) {
     return;
   }
   const prefix = options.prefix;
-  const origin = window.location.origin;
   const repoName = sanitizeRepoName(repo);
-  const endpointUrl = origin + '/mcp-repo/' + repoName;
+  const endpointUrl = mcpEndpointBase() + '/mcp-repo/' + repoName;
   const cmd = 'claude mcp add --scope project --transport http codebase-retrieval ' + endpointUrl;
   const tabHtml = REPO_MCP_TABS.map((tab, i) => {
     const tabId = repoMcpId(prefix, 'tab', tab.key);
@@ -4048,6 +4154,16 @@ function renderRepoMcpComponent(root, options) {
                         text-gray-900 dark:text-wiki-text placeholder:text-gray-400 dark:placeholder:text-wiki-text-muted
                         focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400 dark:focus:border-wiki-border-active" />
         </div>
+        <div data-mcp-test-scope-group>
+          <label for="${repoMcpId(prefix, 'test', 'scope')}" class="block text-xs text-gray-500 dark:text-wiki-text-muted mb-1">scope</label>
+          <select id="${repoMcpId(prefix, 'test', 'scope')}" data-mcp-test-scope
+                  class="w-full border border-gray-200 dark:border-wiki-border bg-white dark:bg-wiki-surface rounded px-3 py-2 text-sm
+                         text-gray-900 dark:text-wiki-text focus:outline-none focus:ring-2 focus:ring-blue-400">
+            <option value="code" selected>code</option>
+            <option value="docs">docs</option>
+          </select>
+          <p class="mt-1 text-xs text-gray-500 dark:text-wiki-text-muted">${escHtml(t('mcp.testScopeHelp'))}</p>
+        </div>
       </div>
       <button type="button" data-mcp-action="run-test"
               class="mt-3 px-4 py-2 bg-blue-600 dark:bg-wiki-border-active/20 dark:border dark:border-wiki-border-active text-white dark:text-wiki-link text-sm rounded
@@ -4093,9 +4209,13 @@ function bindRepoMcpComponent(root, options) {
 
   const toolSelect = root.querySelector('[data-mcp-test-tool]');
   const filePathGroup = root.querySelector('[data-mcp-test-file-path-group]');
+  // `scope` only exists on codebase-retrieval; file-retrieval searches one file.
+  const scopeGroup = root.querySelector('[data-mcp-test-scope-group]');
   if (toolSelect && filePathGroup) {
     toolSelect.addEventListener('change', () => {
-      filePathGroup.classList.toggle('hidden', toolSelect.value !== 'file-retrieval');
+      const isFile = toolSelect.value === 'file-retrieval';
+      filePathGroup.classList.toggle('hidden', !isFile);
+      if (scopeGroup) scopeGroup.classList.toggle('hidden', isFile);
     });
   }
 
@@ -4124,9 +4244,9 @@ async function runRepoMcpAutoSetup(root, getRepo, target) {
   const statusEl = root.querySelector(`[data-mcp-setup-status="${target}"]`);
   if (!btn || !statusEl) return;
 
-  // Build the endpoint URL from the browser origin — that carries the live
-  // listen port (the server's port isn't in AppState). Backend re-validates it.
-  const endpointUrl = window.location.origin + '/mcp-repo/' + sanitizeRepoName(repo);
+  // localhost + the backend's listen port (see mcpEndpointBase). The backend
+  // re-validates the path suffix.
+  const endpointUrl = mcpEndpointBase() + '/mcp-repo/' + sanitizeRepoName(repo);
 
   const origLabel = btn.textContent;
   btn.disabled = true;
@@ -4203,6 +4323,8 @@ async function runRepoMcpTest(root, getRepo) {
     if (tool === 'file-retrieval') {
       body.file_path = root.querySelector('[data-mcp-test-file-path]').value.trim();
       if (!body.file_path) { btn.disabled = false; btn.textContent = t('action.run'); return; }
+    } else {
+      body.scope = root.querySelector('[data-mcp-test-scope]').value;
     }
     const endpoint = tool === 'file-retrieval' ? '/api/mcp-tool/file-retrieval' : '/api/mcp-tool';
     const res = await fetch(endpoint, {
@@ -5327,6 +5449,7 @@ function watchIndexingThenReload() {
 
 // ─── Init ─────────────────────────────────────────────────────────────────
 initI18n();        // resolve locale (+ first-run picker) before data renders
+loadServerInfo();  // listen port for MCP endpoint URLs (see mcpEndpointBase)
 loadConfig();
 startIndexPolling();
 checkDefenderStatus();

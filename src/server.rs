@@ -381,6 +381,15 @@ async fn put_config(State(state): State<AppState>, body: axum::body::Bytes) -> R
         return (StatusCode::BAD_REQUEST, Json(body)).into_response();
     }
 
+    // Normalize + bound the docs extension list BEFORE the disk write, so a bad
+    // value is rejected with settings untouched (same rule as the checks above).
+    match crate::config::normalize_docs_extensions(&settings.docs_extensions) {
+        Ok(list) => settings.docs_extensions = list,
+        Err(msg) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response();
+        }
+    }
+
     // Normalize repo paths to OS-native separators so D:/foo and D:\foo unify.
     settings.repos = settings
         .repos
@@ -1303,6 +1312,9 @@ async fn post_query(State(state): State<AppState>, Json(req): Json<QueryRequest>
 struct McpToolRequest {
     information_request: String,
     workspace_full_path: String,
+    /// `code` (default when omitted) or `docs`; anything else is rejected by serde.
+    #[serde(default)]
+    scope: Option<crate::vector::Scope>,
 }
 
 /// POST /api/mcp-tool — call the shared MCP tool funnel over HTTP.
@@ -1321,6 +1333,7 @@ async fn post_mcp_tool(State(state): State<AppState>, Json(req): Json<McpToolReq
         &settings,
         &req.information_request,
         &req.workspace_full_path,
+        req.scope.unwrap_or_default(),
     )
     .await;
     Json(json!({ "result": result })).into_response()

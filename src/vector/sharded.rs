@@ -27,7 +27,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::vector::{SearchResult, VectorIndex};
+use crate::vector::{ScopeFilter, SearchResult, VectorIndex};
 
 /// A resident repo shard plus its LRU recency stamp.
 ///
@@ -491,13 +491,26 @@ impl ShardedVectorIndex {
         repo: &str,
         expected_identity: &str,
     ) -> ScopedSearch {
+        self.search_scoped_with(query, top_k, repo, expected_identity, None)
+    }
+
+    /// [`search_scoped`](Self::search_scoped) restricted to a code/docs scope,
+    /// applied inside the shard scan (see `VectorIndex::search_filtered`).
+    pub fn search_scoped_with(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        repo: &str,
+        expected_identity: &str,
+        scope: Option<&ScopeFilter>,
+    ) -> ScopedSearch {
         let repo = Self::repo_key(repo);
         match self.shard_match(&repo, expected_identity) {
             ShardMatch::Cold => ScopedSearch::Cold,
             ShardMatch::Mismatch(identity) => ScopedSearch::IdentityMismatch(identity),
             ShardMatch::Hit => {
                 let shard = self.shards.get(&repo).expect("matched shard exists");
-                let results = shard.index.search(query, top_k);
+                let results = shard.index.search_filtered(query, top_k, scope);
                 self.touch(&repo);
                 ScopedSearch::Hit(ShardedSearch {
                     results,
@@ -516,6 +529,19 @@ impl ShardedVectorIndex {
         scope: &[String],
         expected_identity: &str,
     ) -> ScopedAll {
+        self.search_all_scoped_with(query, top_k, scope, expected_identity, None)
+    }
+
+    /// [`search_all_scoped`](Self::search_all_scoped) restricted to one code/docs
+    /// class. (`scope` here is the repo list; `class` is the code/docs filter.)
+    pub fn search_all_scoped_with(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        scope: &[String],
+        expected_identity: &str,
+        class: Option<&ScopeFilter>,
+    ) -> ScopedAll {
         let mut out = ScopedAll::default();
         for repo in scope {
             let key = Self::repo_key(repo);
@@ -526,7 +552,8 @@ impl ShardedVectorIndex {
                 }
                 ShardMatch::Hit => {
                     let shard = self.shards.get(&key).expect("matched shard exists");
-                    out.results.extend(shard.index.search(query, top_k));
+                    out.results
+                        .extend(shard.index.search_filtered(query, top_k, class));
                     self.touch(&key);
                 }
             }

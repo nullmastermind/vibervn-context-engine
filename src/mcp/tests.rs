@@ -636,3 +636,197 @@ fn genuine_empty_resident_shard_keeps_existing_wording() {
         "genuine empty must not mention warming"
     );
 }
+
+// ─── scope parameter (code | docs) ───────────────────────────────────────
+
+fn scope_property<T: schemars::JsonSchema>() -> serde_json::Value {
+    let schema = serde_json::to_value(schemars::schema_for!(T)).expect("schema serializes");
+    schema["properties"]["scope"].clone()
+}
+
+/// Agents read this schema, and some MCP clients reject `$ref` / `anyOf`, so the
+/// `scope` property must be a flat string enum carrying the shared description —
+/// identical on every surface that exposes `codebase-retrieval`.
+#[test]
+fn scope_param_schema_is_flat_and_identical_on_every_mcp_surface() {
+    let surfaces = [
+        (
+            "CodebaseRetrievalArgs",
+            scope_property::<CodebaseRetrievalArgs>(),
+        ),
+        (
+            "RepoCodebaseRetrievalArgs",
+            scope_property::<RepoCodebaseRetrievalArgs>(),
+        ),
+        (
+            "ProxyCodebaseRetrievalArgs",
+            scope_property::<crate::router::mcp_proxy::ProxyCodebaseRetrievalArgs>(),
+        ),
+    ];
+    for (name, prop) in surfaces {
+        assert!(!prop.is_null(), "{name} must expose a `scope` property");
+        assert_eq!(
+            prop["description"].as_str().map(str::trim),
+            Some(crate::prompts::MCP_SCOPE_PARAM.trim()),
+            "{name} scope description must be the shared text"
+        );
+        let text = prop.to_string();
+        for banned in ["$ref", "anyOf", "oneOf", "allOf"] {
+            assert!(
+                !text.contains(banned),
+                "{name} scope schema has {banned}: {text}"
+            );
+        }
+        let values: Vec<&str> = prop["enum"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{name} scope must be an enum: {text}"))
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(values, ["code", "docs"], "{name}: no `all` value");
+    }
+}
+
+#[test]
+fn scope_param_is_optional_on_every_surface() {
+    for (name, schema) in [
+        (
+            "CodebaseRetrievalArgs",
+            serde_json::to_value(schemars::schema_for!(CodebaseRetrievalArgs)).unwrap(),
+        ),
+        (
+            "RepoCodebaseRetrievalArgs",
+            serde_json::to_value(schemars::schema_for!(RepoCodebaseRetrievalArgs)).unwrap(),
+        ),
+        (
+            "ProxyCodebaseRetrievalArgs",
+            serde_json::to_value(schemars::schema_for!(
+                crate::router::mcp_proxy::ProxyCodebaseRetrievalArgs
+            ))
+            .unwrap(),
+        ),
+    ] {
+        let required = schema["required"].as_array().cloned().unwrap_or_default();
+        assert!(
+            !required.iter().any(|r| r == "scope"),
+            "{name}: scope must stay optional (defaults to code)"
+        );
+    }
+}
+
+/// The structured scope is prepended, so it beats a `scope:` typed in the text,
+/// and the funnel's default is `code`.
+#[test]
+fn scoped_request_prepends_structured_scope_and_wins_over_text() {
+    use crate::query::filters::parse_query_filters;
+    use crate::vector::Scope;
+
+    assert_eq!(
+        scoped_request("how does sharding work", Scope::Docs),
+        "scope:docs how does sharding work"
+    );
+    let (clean, filters) = parse_query_filters(&scoped_request("scope:docs how x", Scope::Code));
+    assert_eq!(filters.scope, Some(Scope::Code));
+    assert_eq!(clean, "how x");
+}
+
+#[test]
+fn scope_fallback_notice_names_both_scopes() {
+    use crate::vector::Scope;
+    let note = scope_fallback_notice(Scope::Code, Scope::Docs);
+    assert!(note.starts_with("[scope fallback]"));
+    assert!(note.contains(r#"requested scope "code""#));
+    assert!(note.contains(r#"scope "docs" instead"#));
+    assert!(note.ends_with("\n\n"), "must separate from the results");
+}
+
+#[test]
+fn both_scopes_empty_note_only_for_a_genuine_scoped_empty() {
+    let base = "No results found for: q".to_string();
+    // Scoped, nothing found anywhere, index ready → say both were searched.
+    assert_eq!(
+        note_both_scopes_searched(base.clone(), true, true, false),
+        "No results found for: q (searched both code and docs)"
+    );
+    // Warming must keep its retry wording untouched.
+    assert_eq!(
+        note_both_scopes_searched(base.clone(), true, true, true),
+        base
+    );
+    // Candidates existed (rerank rejected them): not an empty-scope situation.
+    assert_eq!(
+        note_both_scopes_searched(base.clone(), true, false, false),
+        base
+    );
+    // Unscoped query: nothing to add.
+    assert_eq!(
+        note_both_scopes_searched(base.clone(), false, true, false),
+        base
+    );
+}
+
+/// The schema a client actually receives from `tools/list` for each
+/// `codebase-retrieval` surface — rmcp builds it with its own settings, which can
+/// differ from a bare `schemars::schema_for!`, so assert on THAT.
+fn served_scope_property(router: &ToolRouter<impl Send + Sync + 'static>) -> serde_json::Value {
+    let tool = router
+        .list_all()
+        .into_iter()
+        .find(|t| t.name == "codebase-retrieval")
+        .expect("codebase-retrieval is registered");
+    serde_json::Value::Object((*tool.input_schema).clone())["properties"]["scope"].clone()
+}
+
+pub(crate) fn assert_served_scope_schema(surface: &str, prop: serde_json::Value) {
+    assert!(!prop.is_null(), "{surface}: tools/list must expose `scope`");
+    assert_eq!(
+        prop["description"].as_str().map(str::trim),
+        Some(crate::prompts::MCP_SCOPE_PARAM.trim()),
+        "{surface}: served description must be the shared text"
+    );
+    let text = prop.to_string();
+    for banned in ["$ref", "anyOf", "oneOf", "allOf"] {
+        assert!(
+            !text.contains(banned),
+            "{surface}: served scope has {banned}: {text}"
+        );
+    }
+    let values: Vec<&str> = prop["enum"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{surface}: served scope must be an enum: {text}"))
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(values, ["code", "docs"], "{surface}: no `all` value");
+}
+
+#[test]
+fn served_tool_schema_exposes_flat_shared_scope_on_global_and_repo_mcp() {
+    assert_served_scope_schema(
+        "McpHandler",
+        served_scope_property(&McpHandler::tool_router()),
+    );
+    assert_served_scope_schema(
+        "RepoMcpHandler",
+        served_scope_property(&RepoMcpHandler::tool_router()),
+    );
+}
+
+/// `scope` must stay optional in the served schema too: an agent that omits it
+/// gets the `code` default rather than a validation error.
+fn served_scope_is_required(router: &ToolRouter<impl Send + Sync + 'static>) -> bool {
+    let tool = router
+        .list_all()
+        .into_iter()
+        .find(|t| t.name == "codebase-retrieval")
+        .expect("registered");
+    let schema = serde_json::Value::Object((*tool.input_schema).clone());
+    let required = schema["required"].as_array().cloned().unwrap_or_default();
+    required.iter().any(|r| r == "scope")
+}
+
+#[test]
+fn served_tool_schema_keeps_scope_optional() {
+    assert!(!served_scope_is_required(&McpHandler::tool_router()));
+    assert!(!served_scope_is_required(&RepoMcpHandler::tool_router()));
+}

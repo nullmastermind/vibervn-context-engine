@@ -8,6 +8,8 @@
 //! predicates. Fuzzy name matching (bounded edit distance) triggers when exact
 //! matches yield zero results.
 
+use crate::vector::{Scope, ScopeFilter};
+
 /// Parsed structured filters extracted from a query string.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct QueryFilters {
@@ -19,10 +21,18 @@ pub struct QueryFilters {
     pub path_filters: Vec<String>,
     /// Symbol name filters (exact first, fuzzy fallback)
     pub name_filters: Vec<String>,
+    /// Code/docs class to search. NOT a post-filter: it is pushed down into the
+    /// vector scan (pre-top-k) so the requested class is never starved by the
+    /// other. Deliberately ignored by [`is_empty`](Self::is_empty).
+    pub scope: Option<Scope>,
+    /// Which extensions count as docs, from the live settings snapshot. `None`
+    /// means "use the default list" (callers that have no settings at hand).
+    pub docs_extensions: Option<Vec<String>>,
 }
 
 impl QueryFilters {
-    /// Returns true if no filters are active.
+    /// Returns true if no POST-filters are active (`scope` / `docs_extensions`
+    /// are applied inside the vector scan, not by `apply_query_filters`).
     pub fn is_empty(&self) -> bool {
         self.kinds.is_empty()
             && self.languages.is_empty()
@@ -30,12 +40,31 @@ impl QueryFilters {
             && self.name_filters.is_empty()
     }
 
-    /// Merge another set of filters into this one (union semantics).
+    /// Merge another set of filters into this one: list filters are unioned;
+    /// `scope` / `docs_extensions` are single-valued, so a value carried by
+    /// `other` (the structured, tool-param side) overrides, and an absent one
+    /// never erases what is already set.
     pub fn merge(&mut self, other: QueryFilters) {
         self.kinds.extend(other.kinds);
         self.languages.extend(other.languages);
         self.path_filters.extend(other.path_filters);
         self.name_filters.extend(other.name_filters);
+        if other.scope.is_some() {
+            self.scope = other.scope;
+        }
+        if other.docs_extensions.is_some() {
+            self.docs_extensions = other.docs_extensions;
+        }
+    }
+
+    /// The scope request resolved against the docs-extensions setting, ready for
+    /// the vector scan. `None` when no scope was requested.
+    pub fn scope_filter(&self) -> Option<ScopeFilter> {
+        let scope = self.scope?;
+        Some(match &self.docs_extensions {
+            Some(list) => ScopeFilter::new(scope, list),
+            None => ScopeFilter::new(scope, crate::config::default_docs_extensions()),
+        })
     }
 }
 
@@ -44,7 +73,12 @@ impl QueryFilters {
 /// Returns `(clean_query, filters)` where `clean_query` has filter tokens removed
 /// and is suitable for embedding. Supports quoted values: `kind:"async function"`.
 ///
-/// Recognized prefixes: `kind:`, `lang:`, `language:`, `path:`, `name:`
+/// Recognized prefixes: `kind:`, `lang:`, `language:`, `path:`, `name:`, `scope:`
+///
+/// `scope:` is only a filter when its value is exactly `code` or `docs`; any other
+/// value (`scope:foo`, `scope::resolve`) is ordinary query text and is left in the
+/// returned clean query. If several valid `scope:` tokens appear the FIRST wins
+/// (the tool prepends its structured value, so it beats one typed in the text).
 pub fn parse_query_filters(query: &str) -> (String, QueryFilters) {
     let mut filters = QueryFilters::default();
     let mut clean_parts: Vec<&str> = Vec::new();
@@ -64,12 +98,24 @@ pub fn parse_query_filters(query: &str) -> (String, QueryFilters) {
         if let Some((prefix_len, filter_type)) = match_filter_prefix(remaining) {
             let value_start = i + prefix_len;
             let (value, end_pos) = extract_value(query, &chars, value_start);
-            if !value.is_empty() {
+            if let FilterType::Scope = filter_type {
+                match Scope::parse(&value) {
+                    // First valid scope wins; later ones are still stripped.
+                    Some(scope) => {
+                        filters.scope.get_or_insert(scope);
+                    }
+                    // Not a scope filter after all: keep the raw token as query text.
+                    None => {
+                        clean_parts.push(&query[byte_offset(query, i)..byte_offset(query, end_pos)])
+                    }
+                }
+            } else if !value.is_empty() {
                 match filter_type {
                     FilterType::Kind => filters.kinds.push(value.to_lowercase()),
                     FilterType::Lang => filters.languages.push(value.to_lowercase()),
                     FilterType::Path => filters.path_filters.push(value),
                     FilterType::Name => filters.name_filters.push(value),
+                    FilterType::Scope => unreachable!("handled above"),
                 }
             }
             i = end_pos;
@@ -151,6 +197,7 @@ enum FilterType {
     Lang,
     Path,
     Name,
+    Scope,
 }
 
 /// Match a filter prefix at the start of `s`. Returns (char_count_consumed, type).
@@ -166,6 +213,8 @@ fn match_filter_prefix(s: &str) -> Option<(usize, FilterType)> {
         Some((5, FilterType::Path))
     } else if lower.starts_with("name:") {
         Some((5, FilterType::Name))
+    } else if lower.starts_with("scope:") {
+        Some((6, FilterType::Scope))
     } else {
         None
     }
@@ -320,6 +369,76 @@ mod tests {
         f1.merge(f2);
         assert_eq!(f1.kinds, vec!["function", "class"]);
         assert_eq!(f1.languages, vec!["rust"]);
+    }
+
+    // --- scope: ---
+
+    use crate::vector::Scope;
+
+    #[test]
+    fn scope_is_extracted_and_stripped_from_the_embed_text() {
+        let (clean, filters) = parse_query_filters("scope:docs how does sharding work");
+        assert_eq!(clean, "how does sharding work");
+        assert_eq!(filters.scope, Some(Scope::Docs));
+    }
+
+    #[test]
+    fn scope_prefix_and_value_are_case_insensitive_and_may_be_quoted() {
+        let (clean, filters) = parse_query_filters("SCOPE:Code foo");
+        assert_eq!(clean, "foo");
+        assert_eq!(filters.scope, Some(Scope::Code));
+        let (clean, filters) = parse_query_filters("scope:\"docs\" foo");
+        assert_eq!(clean, "foo");
+        assert_eq!(filters.scope, Some(Scope::Docs));
+    }
+
+    /// The tool prepends its structured `scope:` to the free text, so when the
+    /// text carries its own `scope:` the structured one (first) must win.
+    #[test]
+    fn first_scope_wins_and_later_ones_are_still_stripped() {
+        let (clean, filters) = parse_query_filters("scope:code scope:docs foo");
+        assert_eq!(clean, "foo");
+        assert_eq!(filters.scope, Some(Scope::Code));
+    }
+
+    /// `scope:foo` may be real query text (`scope::resolve`, a CSS `scope:` rule),
+    /// so an unrecognized value is NOT a filter and stays in the embedded text.
+    #[test]
+    fn unrecognized_scope_value_is_left_in_the_query() {
+        let (clean, filters) = parse_query_filters("scope:foo bar");
+        assert_eq!(clean, "scope:foo bar");
+        assert_eq!(filters.scope, None);
+        let (clean, filters) = parse_query_filters("scope: bar");
+        assert_eq!(clean, "scope: bar");
+        assert_eq!(filters.scope, None);
+    }
+
+    /// `scope` is handled inside the vector scan, not by `apply_query_filters`,
+    /// so a scope-only query must still count as "no post-filters".
+    #[test]
+    fn scope_alone_does_not_activate_post_filters() {
+        let (_, filters) = parse_query_filters("scope:docs foo");
+        assert!(filters.is_empty());
+    }
+
+    #[test]
+    fn merge_lets_the_structured_scope_override_the_parsed_one() {
+        let mut parsed = QueryFilters {
+            scope: Some(Scope::Docs),
+            ..Default::default()
+        };
+        parsed.merge(QueryFilters {
+            scope: Some(Scope::Code),
+            docs_extensions: Some(vec!["md".into()]),
+            ..Default::default()
+        });
+        assert_eq!(parsed.scope, Some(Scope::Code));
+        assert_eq!(parsed.docs_extensions, Some(vec!["md".to_string()]));
+
+        // A merge that carries no scope must not erase an existing one.
+        parsed.merge(QueryFilters::default());
+        assert_eq!(parsed.scope, Some(Scope::Code));
+        assert_eq!(parsed.docs_extensions, Some(vec!["md".to_string()]));
     }
 
     // --- bounded_edit_distance ---

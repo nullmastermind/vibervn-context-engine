@@ -17,6 +17,8 @@ use crate::query::find_db_for_file;
 use crate::query::graph_expand::graph_expand;
 use crate::query::merger::{MergeChunk, merge_chunks};
 use crate::query::reranker;
+use crate::query::scope_fallback::{Gathered, gather_with_fallback};
+use crate::vector::ScopeFilter;
 
 // ─── Output types ─────────────────────────────────────────────────────────
 
@@ -96,6 +98,16 @@ pub struct QueryResult {
     /// pipeline actually did.
     #[serde(default)]
     pub graph_pending: bool,
+    /// The code/docs scope the returned candidates were searched in (`"code"` /
+    /// `"docs"`); `None` for an unscoped query. Differs from the requested scope
+    /// exactly when `scope_fallback` is set.
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// True when the requested scope had no candidates at all and the OTHER scope
+    /// was searched and served instead (see `query::scope_fallback`). Callers must
+    /// tell the user/agent, who otherwise believes they got what they asked for.
+    #[serde(default)]
+    pub scope_fallback: bool,
 }
 
 // ─── DB row types ─────────────────────────────────────────────────────────
@@ -229,25 +241,35 @@ pub(crate) async fn run_query_with_filters_and_mode(
         bail!("embed_query returned an empty vector");
     }
 
-    // ── Step 2: Vector search ─────────────────────────────────────────────
-    let search_start = Instant::now();
-    // Search for 2× top_k so graph expansion has candidates to work with.
+    // ── Steps 2–3.5: Vector search → hydrate → post-filters, per scope ────
+    // The scope (code/docs) is pushed into the vector scan itself. If the
+    // requested scope yields nothing at all (and the index is not merely warming)
+    // the OTHER scope is searched once — see `query::scope_fallback`.
     let current_identity = EmbeddingIdentity::from_client(voyage_client);
-    let crate::indexing::VectorSearchOutcome {
-        results: raw_results,
-        mut warming,
-    } = index_engine
-        .vector_search(
+    let served = gather_with_fallback(filters.scope_filter(), |class| {
+        gather_candidates(
             &embedding,
-            top_k * 2,
+            top_k,
             repo_filter,
             warm_wait,
+            index_engine,
+            repo_dbs,
             &current_identity,
+            &filters,
+            class,
         )
-        .await;
-    let search_ms = search_start.elapsed().as_millis() as u64;
+    })
+    .await;
+    let scope_fallback = served.fallback;
+    let served_scope = served.scope;
+    let Gathered {
+        base_chunks,
+        mut warming,
+        search_ms,
+        db_map,
+    } = served.gathered;
 
-    if raw_results.is_empty() {
+    if base_chunks.is_empty() {
         return Ok(QueryResult {
             results: vec![],
             pre_rerank_results: vec![],
@@ -262,56 +284,9 @@ pub(crate) async fn run_query_with_filters_and_mode(
             rerank: None,
             warming,
             graph_pending: matches!(graph_mode, QueryGraphMode::VectorOnly),
+            scope: served_scope.as_ref().map(|s| s.scope().as_str().to_owned()),
+            scope_fallback,
         });
-    }
-
-    // Apply repo filter.
-    let filtered: Vec<_> = if let Some(repo) = repo_filter {
-        raw_results
-            .into_iter()
-            .filter(|r| path_in_repo(&r.chunk_id.file, repo))
-            .collect()
-    } else {
-        raw_results
-    };
-
-    // ── Step 3: Fetch stored content for base chunks ──────────────────────
-    // Clone DB handles (Arc-wrapped, cheap) and release the RwLock immediately.
-    // This prevents holding the lock across graph expansion await points.
-    let db_map: HashMap<String, Surreal<Db>> = {
-        let guard = repo_dbs.read().await;
-        guard.clone()
-    }; // read lock dropped HERE — before any async DB queries
-
-    let fenced = hydrate_candidates(&db_map, &filtered).await;
-    if fenced.dropped > 0 {
-        // A vector candidate without a durable chunk row is an index publication
-        // race, never a valid empty result. Preserve resolved partial results but
-        // surface retry/incomplete state to the caller.
-        warming = true;
-    }
-    let mut base_chunks = fenced.kept;
-    if base_chunks.is_empty() && fenced.dropped > 0 {
-        return Ok(QueryResult {
-            results: vec![],
-            pre_rerank_results: vec![],
-            timing: QueryTiming {
-                embed_ms,
-                search_ms,
-                graph_ms: 0,
-                merge_ms: 0,
-                rerank_ms: 0,
-                total_ms: total_start.elapsed().as_millis() as u64,
-            },
-            rerank: None,
-            warming: true,
-            graph_pending: matches!(graph_mode, QueryGraphMode::VectorOnly),
-        });
-    }
-
-    // ── Step 3.5: Apply query filters ────────────────────────────────────
-    if !filters.is_empty() {
-        base_chunks = apply_query_filters(base_chunks, &filters);
     }
 
     // ── Step 4: Optional graph expansion ──────────────────────────────────
@@ -401,6 +376,8 @@ pub(crate) async fn run_query_with_filters_and_mode(
                 repo_dbs,
                 warm_wait,
                 graph_mode,
+                // Sub-queries stay in the scope actually served (incl. a fallback).
+                served_scope.clone(),
             )
             .await;
             (out, Some(pool))
@@ -556,7 +533,98 @@ pub(crate) async fn run_query_with_filters_and_mode(
         rerank: Some(rerank_info),
         warming,
         graph_pending: matches!(graph_mode, QueryGraphMode::VectorOnly),
+        scope: served_scope.as_ref().map(|s| s.scope().as_str().to_owned()),
+        scope_fallback,
     })
+}
+
+/// One scan of one scope: vector search (top_k×2 so graph expansion has
+/// candidates to work with) → repo-prefix guard → hydrate from the DB → query
+/// post-filters. Returns an empty `base_chunks` with `warming` distinguishing
+/// "retry shortly" from a genuine empty.
+#[allow(clippy::too_many_arguments)]
+async fn gather_candidates(
+    embedding: &[f32],
+    top_k: usize,
+    repo_filter: Option<&str>,
+    warm_wait: std::time::Duration,
+    index_engine: &Arc<IndexEngine>,
+    repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
+    identity: &EmbeddingIdentity,
+    filters: &crate::query::filters::QueryFilters,
+    class: Option<ScopeFilter>,
+) -> Gathered {
+    let search_start = Instant::now();
+    let crate::indexing::VectorSearchOutcome {
+        results: raw_results,
+        mut warming,
+    } = index_engine
+        .vector_search_with(
+            embedding,
+            top_k * 2,
+            repo_filter,
+            warm_wait,
+            identity,
+            class.as_ref(),
+        )
+        .await;
+    let search_ms = search_start.elapsed().as_millis() as u64;
+
+    if raw_results.is_empty() {
+        return Gathered {
+            base_chunks: Vec::new(),
+            warming,
+            search_ms,
+            db_map: HashMap::new(),
+        };
+    }
+
+    // Apply repo filter.
+    let filtered: Vec<_> = if let Some(repo) = repo_filter {
+        raw_results
+            .into_iter()
+            .filter(|r| path_in_repo(&r.chunk_id.file, repo))
+            .collect()
+    } else {
+        raw_results
+    };
+
+    // ── Fetch stored content for base chunks ──────────────────────────────
+    // Clone DB handles (Arc-wrapped, cheap) and release the RwLock immediately.
+    // This prevents holding the lock across graph expansion await points.
+    let db_map: HashMap<String, Surreal<Db>> = {
+        let guard = repo_dbs.read().await;
+        guard.clone()
+    }; // read lock dropped HERE — before any async DB queries
+
+    let fenced = hydrate_candidates(&db_map, &filtered).await;
+    if fenced.dropped > 0 {
+        // A vector candidate without a durable chunk row is an index publication
+        // race, never a valid empty result. Preserve resolved partial results but
+        // surface retry/incomplete state to the caller.
+        warming = true;
+    }
+    let mut base_chunks = fenced.kept;
+    if base_chunks.is_empty() && fenced.dropped > 0 {
+        return Gathered {
+            base_chunks,
+            warming: true,
+            search_ms,
+            db_map,
+        };
+    }
+
+    // ── Apply query filters ───────────────────────────────────────────────
+    if !filters.is_empty() {
+        base_chunks = apply_query_filters(base_chunks, filters);
+    }
+
+    Gathered {
+        base_chunks,
+        warming,
+        search_ms,
+        db_map,
+    }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -574,6 +642,7 @@ pub(crate) async fn run_sub_query(
     repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
     warm_wait: std::time::Duration,
     graph_mode: QueryGraphMode,
+    class: Option<ScopeFilter>,
 ) -> Result<Vec<MergeChunk>> {
     let embedding = voyage_client.embed_query(query).await?;
     if embedding.is_empty() {
@@ -585,12 +654,13 @@ pub(crate) async fn run_sub_query(
         results: raw_results,
         ..
     } = index_engine
-        .vector_search(
+        .vector_search_with(
             &embedding,
             top_k * 2,
             Some(repo_filter),
             warm_wait,
             &current_identity,
+            class.as_ref(),
         )
         .await;
     if raw_results.is_empty() {

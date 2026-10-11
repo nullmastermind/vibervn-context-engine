@@ -211,7 +211,12 @@ pub async fn run_query_op(
         settings.llm.agentic_rag_max_turns,
         settings.llm.agentic_rag_max_chunk_chars,
         settings.llm.agentic_rag_grep_read,
-        None,
+        // No structured scope on this surface (an inline `scope:` in the query text
+        // still works), but a typed `scope:docs` must honor the live docs setting.
+        Some(crate::query::filters::QueryFilters {
+            docs_extensions: Some(settings.docs_extensions.clone()),
+            ..Default::default()
+        }),
         graph_mode,
     )
     .await

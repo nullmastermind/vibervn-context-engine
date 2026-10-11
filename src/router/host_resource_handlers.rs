@@ -30,6 +30,14 @@ async fn delete_embedding_cache(
     }
 }
 
+/// GET /api/server-info — the router's real listen port (`null` when unknown).
+/// The UI builds MCP endpoint URLs as `http://localhost:<port>/…` from this; the
+/// browser's own origin can't be trusted (iframe embed, reverse proxy, remote
+/// browser), while MCP clients always reach the engine on the host it runs on.
+async fn get_server_info(State(state): State<RouterState>) -> Response {
+    Json(json!({ "port": state.listen_port })).into_response()
+}
+
 async fn get_defender_status(State(state): State<RouterState>) -> Response {
     let data_dir = state.data_dir.to_string_lossy().to_string();
     match tokio::task::spawn_blocking(move || crate::defender::check_status(&data_dir)).await {

@@ -45,6 +45,14 @@ async fn put_config(State(state): State<RouterState>, body: axum::body::Bytes) -
         }
     };
     settings.version = crate::config::CURRENT_VERSION;
+    // Same normalize + bound as the monolith `put_config`, rejected before the
+    // disk write so settings.json is untouched on a bad value.
+    match crate::config::normalize_docs_extensions(&settings.docs_extensions) {
+        Ok(list) => settings.docs_extensions = list,
+        Err(msg) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response();
+        }
+    }
     settings.repos = settings
         .repos
         .iter()

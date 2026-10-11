@@ -41,6 +41,9 @@ pub struct ProxyCodebaseRetrievalArgs {
     /// Full path to the workspace/repository to search. Selects which worker
     /// handles the call.
     pub workspace_full_path: String,
+    #[doc = include_str!("../prompts/mcp_scope_param.txt")]
+    #[serde(default)]
+    pub scope: Option<crate::vector::Scope>,
 }
 
 /// Args for the proxied global `file-retrieval` tool.
@@ -95,10 +98,7 @@ impl ProxyMcpHandler {
         }
         // Forward to the worker's /api/mcp-tool — the SAME funnel run_codebase_
         // retrieval the monolith MCP tool uses, so output is byte-identical.
-        let body = json!({
-            "information_request": args.information_request,
-            "workspace_full_path": args.workspace_full_path,
-        });
+        let body = codebase_worker_body(&args);
         let text = forward_json_to_worker(&self.proxy, &repo, "/api/mcp-tool", body)
             .await
             .unwrap_or_else(|e| format!("Error: {e}"));
@@ -139,6 +139,18 @@ impl ServerHandler for ProxyMcpHandler {
     }
 }
 
+/// JSON body forwarded to a worker's `/api/mcp-tool`. `scope` is always sent
+/// explicitly (an omitted one resolves to the default `code` HERE), so it can
+/// never be dropped on the router → worker hop: a proxy that lost it would make
+/// `docs` unreachable for every client that goes through the router.
+fn codebase_worker_body(args: &ProxyCodebaseRetrievalArgs) -> serde_json::Value {
+    json!({
+        "information_request": args.information_request,
+        "workspace_full_path": args.workspace_full_path,
+        "scope": args.scope.unwrap_or_default(),
+    })
+}
+
 /// Extract the `result` string the worker's `/api/mcp-tool` REST handlers wrap
 /// their funnel output in (`{"result": "..."}`). Falls back to the raw body for
 /// any other shape so an error surface is never swallowed.
@@ -147,4 +159,54 @@ pub fn unwrap_mcp_tool_result(raw: &str) -> String {
         .ok()
         .and_then(|v| v.get("result").and_then(|r| r.as_str()).map(String::from))
         .unwrap_or_else(|| raw.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vector::Scope;
+
+    fn args(scope: Option<Scope>) -> ProxyCodebaseRetrievalArgs {
+        ProxyCodebaseRetrievalArgs {
+            information_request: "where is auth".to_string(),
+            workspace_full_path: "/repo".to_string(),
+            scope,
+        }
+    }
+
+    #[test]
+    fn worker_body_forwards_the_chosen_scope() {
+        let body = codebase_worker_body(&args(Some(Scope::Docs)));
+        assert_eq!(body["scope"], "docs");
+        assert_eq!(body["information_request"], "where is auth");
+        assert_eq!(body["workspace_full_path"], "/repo");
+    }
+
+    #[test]
+    fn worker_body_defaults_an_omitted_scope_to_code() {
+        assert_eq!(codebase_worker_body(&args(None))["scope"], "code");
+    }
+}
+
+#[cfg(test)]
+mod served_schema_tests {
+    use super::*;
+
+    /// What a client sees from the router-mode `tools/list`: the same flat,
+    /// shared-description `scope` enum as the in-process surfaces.
+    #[test]
+    fn proxy_served_tool_schema_exposes_flat_shared_scope() {
+        let tool = ProxyMcpHandler::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "codebase-retrieval")
+            .expect("registered");
+        let schema = serde_json::Value::Object((*tool.input_schema).clone());
+        crate::mcp::tests::assert_served_scope_schema(
+            "ProxyMcpHandler",
+            schema["properties"]["scope"].clone(),
+        );
+        let required = schema["required"].as_array().cloned().unwrap_or_default();
+        assert!(!required.iter().any(|r| r == "scope"));
+    }
 }

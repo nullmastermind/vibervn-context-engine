@@ -33,7 +33,9 @@ use crate::indexing::tracker::FileChange;
 use crate::indexing::watcher::start_watcher;
 use crate::store::ops::set_meta;
 use crate::store::{self, RepoDbMap};
-use crate::vector::{ScopedAll, ScopedSearch, SearchResult, ShardedVectorIndex, VectorIndex};
+use crate::vector::{
+    ScopeFilter, ScopedAll, ScopedSearch, SearchResult, ShardedVectorIndex, VectorIndex,
+};
 
 use surrealdb::Surreal;
 use surrealdb::engine::local::Db;
@@ -934,17 +936,42 @@ impl IndexEngine {
         warm_wait: std::time::Duration,
         current: &EmbeddingIdentity,
     ) -> VectorSearchOutcome {
+        self.vector_search_with(
+            query_embedding,
+            top_k,
+            repo_filter,
+            warm_wait,
+            current,
+            None,
+        )
+        .await
+    }
+
+    /// [`vector_search`](Self::vector_search) restricted to one code/docs class.
+    /// The restriction runs inside the shard scan (pre-top-k), so it never starves
+    /// the requested class; everything else (identity fence, single-flight warm,
+    /// warming outcome) is identical.
+    pub async fn vector_search_with(
+        self: &Arc<Self>,
+        query_embedding: &[f32],
+        top_k: usize,
+        repo_filter: Option<&str>,
+        warm_wait: std::time::Duration,
+        current: &EmbeddingIdentity,
+        class: Option<&ScopeFilter>,
+    ) -> VectorSearchOutcome {
         let identity_key = current.as_key_string();
 
         if let Some(repo) = repo_filter {
             // Atomic validation + cosine search under ONE read guard. A mismatch
             // returns the observed stale identity without searching any vector.
             let first = {
-                self.vector_index.read().await.search_scoped(
+                self.vector_index.read().await.search_scoped_with(
                     query_embedding,
                     top_k,
                     repo,
                     &identity_key,
+                    class,
                 )
             };
             match first {
@@ -974,11 +1001,12 @@ impl IndexEngine {
             .await;
 
             // Cold re-check is identity-fenced too — never fall back to plain search.
-            return match self.vector_index.read().await.search_scoped(
+            return match self.vector_index.read().await.search_scoped_with(
                 query_embedding,
                 top_k,
                 repo,
                 &identity_key,
+                class,
             ) {
                 ScopedSearch::Hit(found) => VectorSearchOutcome {
                     results: found.results,
@@ -1004,11 +1032,12 @@ impl IndexEngine {
             cold_repos,
             mismatch_repos,
         } = {
-            self.vector_index.read().await.search_all_scoped(
+            self.vector_index.read().await.search_all_scoped_with(
                 query_embedding,
                 top_k,
                 &scope,
                 &identity_key,
+                class,
             )
         };
         let warming = !cold_repos.is_empty() || !mismatch_repos.is_empty();

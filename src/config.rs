@@ -9,7 +9,7 @@ use serde_json::Value;
 use tempfile::NamedTempFile;
 
 /// Bump this when a new migration is appended to MIGRATIONS.
-pub const CURRENT_VERSION: u32 = 13;
+pub const CURRENT_VERSION: u32 = 14;
 
 /// Migration function type: transforms a JSON Value from version N to version N+1.
 pub type MigrationFn = fn(Value) -> Result<Value, ConfigError>;
@@ -29,6 +29,7 @@ pub const MIGRATIONS: &[MigrationFn] = &[
     migrate_v10_to_v11,
     migrate_v11_to_v12,
     migrate_v12_to_v13,
+    migrate_v13_to_v14,
 ];
 
 /// v1→v2: introduce `data_dir` (Option<PathBuf>). The body is a no-op stamp —
@@ -200,7 +201,77 @@ fn migrate_v12_to_v13(mut value: Value) -> Result<Value, ConfigError> {
     Ok(value)
 }
 
+/// v13→v14: introduce `docs_extensions` (Vec<String>) — which indexed file
+/// extensions the `codebase-retrieval` `scope: "docs"` search treats as docs
+/// (everything else is code). `serde(default)` already covers a missing field on
+/// deserialize; we stamp the explicit default + bump the file's `version` so an
+/// older binary refuses the file (VersionTooNew) instead of dropping the field on
+/// its next save. An existing value — including a deliberately empty list — is
+/// never overwritten. Mirrors the v5→v6 additive-list migration.
+fn migrate_v13_to_v14(mut value: Value) -> Result<Value, ConfigError> {
+    if let Value::Object(ref mut obj) = value {
+        obj.entry("docs_extensions".to_string()).or_insert_with(|| {
+            Value::Array(
+                default_docs_extensions()
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            )
+        });
+    }
+    Ok(value)
+}
+
 // ─── Settings ──────────────────────────────────────────────────────────────
+
+/// Default docs set: prose formats. Config/data/markup (`json`, `yaml`, `html`,
+/// `css`, …) are deliberately NOT docs — they are what people search when asking
+/// how something is implemented.
+pub fn default_docs_extensions() -> Vec<String> {
+    ["md", "mdx", "rst", "txt"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Upper bounds on `docs_extensions`: it is rebuilt into a lookup set on every
+/// query, so it must stay small no matter what a client PUTs.
+pub const MAX_DOCS_EXTENSIONS: usize = 64;
+pub const MAX_DOCS_EXTENSION_LEN: usize = 32;
+
+/// Normalize + validate a client-supplied `docs_extensions` list: trim, drop
+/// leading dots, lowercase, drop empties, dedupe (order preserved). Rejects (never
+/// silently truncates) an over-long list or an entry that is not a plain
+/// extension. An empty result is legal — it means "nothing is docs".
+pub fn normalize_docs_extensions(raw: &[String]) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for entry in raw {
+        let ext = crate::vector::scope::normalize_ext(entry);
+        if ext.is_empty() || out.contains(&ext) {
+            continue;
+        }
+        if ext.chars().count() > MAX_DOCS_EXTENSION_LEN {
+            return Err(format!(
+                "docs_extensions entry is longer than {MAX_DOCS_EXTENSION_LEN} characters: {ext}"
+            ));
+        }
+        if ext
+            .chars()
+            .any(|c| c.is_whitespace() || c == '/' || c == '\\')
+        {
+            return Err(format!(
+                "docs_extensions entry must be a plain extension (no spaces or path separators): {ext}"
+            ));
+        }
+        out.push(ext);
+        if out.len() > MAX_DOCS_EXTENSIONS {
+            return Err(format!(
+                "docs_extensions has more than {MAX_DOCS_EXTENSIONS} entries"
+            ));
+        }
+    }
+    Ok(out)
+}
 
 fn default_index_ignore_filenames() -> Vec<String> {
     vec!["CLAUDE.md".to_string(), "AGENTS.md".to_string()]
@@ -543,6 +614,13 @@ pub struct Settings {
     /// built-in `CODE_EXTENSIONS` list. E.g. `["prisma", "zig", "nim"]`.
     #[serde(default)]
     pub custom_extensions: Vec<String>,
+    /// File extensions (without leading dot, lowercase) that the `scope: "docs"`
+    /// retrieval treats as docs; every other indexed file is code. Only classifies
+    /// files that are already indexed — an extension must also be indexable
+    /// (built-in list or `custom_extensions`) to ever appear in results. Read per
+    /// query from the settings snapshot, so edits apply with no re-index.
+    #[serde(default = "default_docs_extensions")]
+    pub docs_extensions: Vec<String>,
     /// Filenames to skip during indexing (case-sensitive, filename-only match).
     #[serde(default = "default_index_ignore_filenames")]
     pub index_ignore_filenames: Vec<String>,
@@ -609,6 +687,7 @@ impl Default for Settings {
             embeddings_dir: None,
             enabled_mcp_tools: default_enabled_mcp_tools(),
             custom_extensions: Vec::new(),
+            docs_extensions: default_docs_extensions(),
             index_ignore_filenames: default_index_ignore_filenames(),
             repo_generations: HashMap::new(),
             machine_id: None,
@@ -1861,6 +1940,85 @@ mod tests {
             !tools.iter().any(|t| t.as_str() == Some("file-retrieval")),
             "on-disk enabled_mcp_tools must not contain file-retrieval after migration"
         );
+    }
+
+    /// v13→v14: `docs_extensions` is introduced with the default docs set; a file
+    /// from before the field existed loads with it, and the stamp is persisted.
+    #[test]
+    fn test_v13_to_v14_migration_stamps_default_docs_extensions() {
+        let home = TempDir::new().expect("tempdir");
+        let path = config_path(home.path());
+        fs::create_dir_all(path.parent().expect("has parent")).expect("create dirs");
+        fs::write(
+            &path,
+            r#"{
+                "version": 13,
+                "repos": [],
+                "embedding": {"provider":"voyage","model":"voyage-4-lite","api_keys":[]},
+                "llm": {"provider":"google","rerank_model":"gemini-3.1-flash-lite","api_keys":[]},
+                "enabled_mcp_tools": ["codebase-retrieval"]
+            }"#,
+        )
+        .expect("write v13");
+
+        let loaded = ensure_dir_and_load(home.path()).expect("load v13");
+        assert_eq!(loaded.version, CURRENT_VERSION);
+        assert_eq!(loaded.docs_extensions, vec!["md", "mdx", "rst", "txt"]);
+
+        let raw = fs::read_to_string(&path).expect("re-read");
+        let v: Value = serde_json::from_str(&raw).expect("parse re-read");
+        assert_eq!(
+            v.get("docs_extensions"),
+            Some(&serde_json::json!(["md", "mdx", "rst", "txt"])),
+            "default must be stamped on disk, not only defaulted in memory"
+        );
+    }
+
+    /// The migration never overwrites a user's own list — including an empty one
+    /// ("nothing is docs" is a legal choice).
+    #[test]
+    fn test_v13_to_v14_migration_preserves_existing_docs_extensions() {
+        for existing in [serde_json::json!(["adoc"]), serde_json::json!([])] {
+            let value = serde_json::json!({ "docs_extensions": existing.clone() });
+            let migrated = migrate_v13_to_v14(value).expect("migrate");
+            assert_eq!(migrated.get("docs_extensions"), Some(&existing));
+        }
+    }
+
+    #[test]
+    fn test_normalize_docs_extensions_cleans_and_dedupes() {
+        let raw = vec![
+            ".MD".to_string(),
+            " rst ".to_string(),
+            "md".to_string(),
+            "".to_string(),
+            "..".to_string(),
+            "Txt".to_string(),
+        ];
+        assert_eq!(
+            normalize_docs_extensions(&raw).expect("valid"),
+            vec!["md", "rst", "txt"]
+        );
+    }
+
+    #[test]
+    fn test_normalize_docs_extensions_accepts_empty_list() {
+        assert_eq!(
+            normalize_docs_extensions(&[]).expect("empty is legal"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_normalize_docs_extensions_rejects_bad_input() {
+        let too_many: Vec<String> = (0..65).map(|i| format!("e{i}")).collect();
+        assert!(normalize_docs_extensions(&too_many).is_err());
+        assert!(normalize_docs_extensions(&["x".repeat(33)]).is_err());
+        assert!(normalize_docs_extensions(&["a/b".to_string()]).is_err());
+        assert!(normalize_docs_extensions(&["a b".to_string()]).is_err());
+        // The cap counts distinct normalized entries, not raw spellings.
+        let dupes: Vec<String> = (0..70).map(|_| "md".to_string()).collect();
+        assert_eq!(normalize_docs_extensions(&dupes).expect("dupes ok"), ["md"]);
     }
 
     /// v12→v13 preserves a user who had ONLY `codebase-retrieval` (never turned

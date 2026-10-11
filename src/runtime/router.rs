@@ -17,6 +17,7 @@ pub async fn run(cli: &Cli, bind: &str) {
         bind: bind.to_owned(),
         home_dir: cli.home_dir.clone(),
         worker_exe: None,
+        listen_port: Some(port),
     })
     .await
     .unwrap_or_else(|error| exit_with_error(&format!("{error:#}"), 2));

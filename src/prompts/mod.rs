@@ -47,6 +47,13 @@ pub const MCP_DEGRADE_INDEX_FAILED: &str = include_str!("mcp_degrade_index_faile
 pub const MCP_DEGRADE_INDEXING: &str = include_str!("mcp_degrade_indexing.txt");
 pub const MCP_GRAPH_PENDING: &str = include_str!("mcp_graph_pending.txt");
 pub const MCP_FILE_RETRIEVAL_HINT: &str = include_str!("mcp_file_retrieval_hint.txt");
+/// Prepended to results served from the OTHER scope after the requested one came
+/// back empty (`{{requested}}`, `{{served}}`). See `query::scope_fallback`.
+pub const MCP_SCOPE_FALLBACK: &str = include_str!("mcp_scope_fallback.txt");
+/// The `scope` tool-parameter description. Every `codebase-retrieval` surface
+/// (MCP, per-repo MCP, router proxy, chat tool) must expose this exact text;
+/// `mcp::tests` asserts they stay identical.
+pub const MCP_SCOPE_PARAM: &str = include_str!("mcp_scope_param.txt");
 
 // ─── LLM transport (llm/openai.rs) ───────────────────────────────────────
 pub const LLM_RESPOND_IN_JSON: &str = include_str!("llm_respond_in_json.txt");
@@ -104,6 +111,8 @@ mod tests {
             RERANK_SYSTEM_STRUCTURED,
             RERANK_AGENTIC_SYSTEM,
             MCP_DEGRADE_INDEXING,
+            MCP_SCOPE_FALLBACK,
+            MCP_SCOPE_PARAM,
             LLM_RESPOND_IN_JSON,
         ] {
             assert!(!p.trim().is_empty());

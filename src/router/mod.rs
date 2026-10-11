@@ -63,6 +63,12 @@ pub struct RouterBootOptions {
     /// because the test harness's own `current_exe()` is the test binary, not
     /// the context-engine binary.
     pub worker_exe: Option<PathBuf>,
+    /// The port the router's listener is bound to, surfaced via
+    /// `GET /api/server-info` so the UI can build MCP endpoint URLs from the real
+    /// listen port instead of `window.location` (which is wrong behind an iframe,
+    /// reverse proxy, or port-forward). `None` when the caller binds an ephemeral
+    /// port only after building the app (tests).
+    pub listen_port: Option<u16>,
 }
 
 /// Router-mode shared state. Deliberately small: the proxy context (client +
@@ -76,6 +82,8 @@ pub struct RouterState {
     /// host-level op on the shared content-addressed cache; no repo/worker
     /// involved).
     pub embeddings_dir: PathBuf,
+    /// See [`RouterBootOptions::listen_port`].
+    pub listen_port: Option<u16>,
     pub proxy: ProxyCtx,
 }
 
@@ -152,6 +160,7 @@ pub async fn build_router_app(opts: RouterBootOptions) -> Result<(Router, ProxyC
         home_dir,
         data_dir: data_dir.clone(),
         embeddings_dir,
+        listen_port: opts.listen_port,
         proxy: ProxyCtx::new(job, exe, worker_args),
     };
 

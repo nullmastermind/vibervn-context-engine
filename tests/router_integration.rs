@@ -41,6 +41,7 @@ async fn start_router(home: &TempDir) -> SocketAddr {
         bind: "127.0.0.1".to_string(),
         home_dir: Some(home_path),
         worker_exe: None,
+        listen_port: Some(addr.port()),
     })
     .await
     .expect("router app builds")
@@ -49,6 +50,24 @@ async fn start_router(home: &TempDir) -> SocketAddr {
         axum::serve(listener, app).await.expect("router serve");
     });
     addr
+}
+
+/// The UI builds MCP endpoint URLs from this port (always `localhost:<port>`),
+/// so it must be the router's real listen port — not whatever origin the page
+/// was loaded from (iframe / reverse proxy).
+#[tokio::test]
+async fn server_info_reports_listen_port() {
+    let home = TempDir::new().unwrap();
+    seed_settings(&home, &[]);
+    let addr = start_router(&home).await;
+    let resp = Client::new()
+        .get(format!("http://{addr}/api/server-info"))
+        .send()
+        .await
+        .expect("GET /api/server-info");
+    assert!(resp.status().is_success());
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["port"], serde_json::json!(addr.port()));
 }
 
 /// Seed a settings.json under `home` with the given repos.

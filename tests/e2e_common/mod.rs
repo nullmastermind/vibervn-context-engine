@@ -35,6 +35,7 @@ pub async fn start_router(home: &TempDir) -> SocketAddr {
         bind: "127.0.0.1".to_string(),
         home_dir: Some(home_path),
         worker_exe: Some(worker_exe()),
+        listen_port: None,
     })
     .await
     .expect("router app")

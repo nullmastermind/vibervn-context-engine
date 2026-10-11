@@ -171,6 +171,114 @@ async fn test_put_round_trips() {
     assert_eq!(get_body.version, context_engine_rs::config::CURRENT_VERSION);
 }
 
+// ─── docs_extensions: normalized on PUT, bad values rejected untouched ─────
+#[tokio::test]
+async fn test_put_normalizes_and_validates_docs_extensions() {
+    let home = TempDir::new().expect("tempdir");
+    let addr = start_server(&home).await;
+    let client = Client::builder().build().expect("client");
+
+    let base = |docs: serde_json::Value| {
+        serde_json::json!({
+            "version": 1,
+            "repos": [],
+            "embedding": { "provider": "voyage", "model": "voyage-code-3", "api_keys": [] },
+            "llm": { "provider": "google", "rerank_model": "gemini-2.0-flash", "api_keys": [] },
+            "docs_extensions": docs,
+        })
+    };
+
+    // Messy-but-valid input is cleaned before it is persisted.
+    let ok = client
+        .put(format!("http://{addr}/api/config"))
+        .json(&base(serde_json::json!([".MD", " Rst ", "md", ""])))
+        .send()
+        .await
+        .expect("PUT");
+    assert_eq!(ok.status().as_u16(), 200);
+    let saved: Settings = ok.json().await.expect("parse");
+    assert_eq!(saved.docs_extensions, vec!["md", "rst"]);
+
+    // An invalid entry is a 400 and the previously saved list is untouched.
+    let bad = client
+        .put(format!("http://{addr}/api/config"))
+        .json(&base(serde_json::json!(["a/b"])))
+        .send()
+        .await
+        .expect("PUT bad");
+    assert_eq!(bad.status().as_u16(), 400);
+    let after: Settings = client
+        .get(format!("http://{addr}/api/config"))
+        .send()
+        .await
+        .expect("GET")
+        .json()
+        .await
+        .expect("parse");
+    assert_eq!(after.docs_extensions, vec!["md", "rst"]);
+
+    // An explicitly empty list is legal ("nothing is docs").
+    let empty = client
+        .put(format!("http://{addr}/api/config"))
+        .json(&base(serde_json::json!([])))
+        .send()
+        .await
+        .expect("PUT empty");
+    assert_eq!(empty.status().as_u16(), 200);
+    let saved: Settings = empty.json().await.expect("parse");
+    assert!(saved.docs_extensions.is_empty());
+}
+
+// ─── /api/mcp-tool: `scope` is optional, `code`|`docs` only (no `all`) ─────
+#[tokio::test]
+async fn test_mcp_tool_scope_param_accepts_code_docs_and_rejects_others() {
+    let home = TempDir::new().expect("tempdir");
+    let addr = start_server(&home).await;
+    let client = Client::builder().build().expect("client");
+    let url = format!("http://{addr}/api/mcp-tool");
+    let body = |scope: Option<&str>| {
+        let mut v = serde_json::json!({
+            "information_request": "where is auth handled",
+            "workspace_full_path": home.path().join("no-such-repo").to_string_lossy(),
+        });
+        if let Some(s) = scope {
+            v["scope"] = serde_json::json!(s);
+        }
+        v
+    };
+
+    // Omitted, code and docs all reach the funnel (which answers with its own
+    // plain-text guidance for the nonexistent workspace — not a schema error).
+    for scope in [None, Some("code"), Some("docs"), Some("DOCS")] {
+        let res = client
+            .post(&url)
+            .json(&body(scope))
+            .send()
+            .await
+            .expect("POST");
+        let status = res.status().as_u16();
+        if scope == Some("DOCS") {
+            // Case matters at the REST boundary: values are exactly code|docs.
+            assert_eq!(status, 422, "scope {scope:?} must be rejected");
+        } else {
+            assert_eq!(status, 200, "scope {scope:?} must be accepted");
+            let json: serde_json::Value = res.json().await.expect("json");
+            assert!(json["result"].as_str().is_some(), "funnel returns text");
+        }
+    }
+
+    // There is deliberately no "all" / "both".
+    for bad in ["all", "both", ""] {
+        let res = client
+            .post(&url)
+            .json(&body(Some(bad)))
+            .send()
+            .await
+            .expect("POST");
+        assert_eq!(res.status().as_u16(), 422, "scope {bad:?} must be rejected");
+    }
+}
+
 // ─── Test 3 (Unix only): file mode bits should be 0o600 ───────────────────
 #[cfg(unix)]
 #[tokio::test]
