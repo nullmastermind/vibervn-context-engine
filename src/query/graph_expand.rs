@@ -24,17 +24,17 @@ pub struct ExpandedChunk {
 // ─── DB row types ──────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
-struct SymbolRow {
+pub(crate) struct SymbolRow {
     /// Full FQN from `meta::id(id)` (file::scope::name), used as the BFS seed key.
     /// Matches the stored `calls.in_name` / `out_name` form so methods resolve.
     #[serde(default)]
     fqn: String,
     file: String,
-    name: String,
-    line_start: i64,
-    line_end: i64,
+    pub(crate) name: String,
+    pub(crate) line_start: i64,
+    pub(crate) line_end: i64,
     #[serde(default)]
-    kind: Option<String>,
+    pub(crate) kind: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -220,7 +220,9 @@ fn strip_id_brackets(id: &str) -> String {
         .to_string()
 }
 
-async fn query_overlapping_symbols(
+/// Also used by the MCP grep hint to name the symbols a result block defines
+/// (`mcp::defined_symbols_for`). Seeks via `idx_symbol_file`.
+pub(crate) async fn query_overlapping_symbols(
     db: &Surreal<Db>,
     file: &str,
     chunk_start: u32,

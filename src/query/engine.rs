@@ -31,6 +31,10 @@ pub struct CodeResult {
     /// Numbered lines from filesystem, or stored content on fallback.
     pub content: String,
     pub symbol: Option<String>,
+    /// Kind of `symbol` (`function`, `module`, `impl`, ...). Lets output
+    /// consumers drop module-like symbols that are poor grep targets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_kind: Option<String>,
     /// Number of direct callers (depth-1) from the call graph. Lower bound.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub callers: Option<u32>,
@@ -439,6 +443,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
                         score: chunk.score,
                         content: slice_numbered(text, chunk.line_start, s, e),
                         symbol: chunk.symbol.clone(),
+                        symbol_kind: chunk.symbol_kind.clone(),
                         callers,
                         caller_files,
                         caller_names: caller_names.clone(),
@@ -454,6 +459,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
                 score: chunk.score,
                 content: text.to_string(),
                 symbol: chunk.symbol.clone(),
+                symbol_kind: chunk.symbol_kind.clone(),
                 callers,
                 caller_files,
                 caller_names: caller_names.clone(),
@@ -467,6 +473,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
                 score: chunk.score,
                 content: chunk.content.clone(),
                 symbol: chunk.symbol.clone(),
+                symbol_kind: chunk.symbol_kind.clone(),
                 callers,
                 caller_files,
                 caller_names: caller_names.clone(),
@@ -500,6 +507,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
             score: chunk.score,
             content,
             symbol: chunk.symbol.clone(),
+            symbol_kind: chunk.symbol_kind.clone(),
             callers,
             caller_files,
             caller_names: stats.map(|s| s.caller_names.clone()).unwrap_or_default(),

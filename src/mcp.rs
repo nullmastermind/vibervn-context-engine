@@ -57,6 +57,270 @@ struct OutputBlock {
     caller_names: Vec<String>,
     callee_names: Vec<String>,
     callees: Option<u32>,
+    symbols: Vec<String>,
+}
+
+// ─── Grep hint footer ────────────────────────────────────────────────────
+// Retrieval is top-k, not exhaustive. Handing the agent a ready-to-run literal
+// pattern for the symbols it just received beats a static "use grep" line, which
+// gives it nothing to run and tends to be ignored.
+
+const GREP_HINT_MAX_SYMBOLS: usize = 5;
+/// Shorter names (`new`, `get`, `run`) would make the grep all noise.
+const GREP_HINT_MIN_NAME_LEN: usize = 4;
+const GREP_HINT_MAX_NAME_LEN: usize = 40;
+/// Total length of the `a|b|c` pattern. It appears TWICE in the hint (once for
+/// `rg`, once for `grep`), so this bounds the hint size, not just its pattern.
+const GREP_HINT_MAX_PATTERN_CHARS: usize = 100;
+/// Upper bound on the whole rendered hint: template text (~135 chars) plus the
+/// pattern twice. Reserved out of the output budget so the hint can never push the
+/// response past `MAX_TOOL_OUTPUT_CHARS` or squeeze out the truncation footer.
+const GREP_HINT_MAX_CHARS: usize = 400;
+
+/// Identifiers only. That keeps the pattern free of regex and shell
+/// metacharacters, so quoting it in the hint is always safe (`operator==` and
+/// the like are dropped rather than escaped).
+fn is_greppable_symbol(name: &str) -> bool {
+    (GREP_HINT_MIN_NAME_LEN..=GREP_HINT_MAX_NAME_LEN).contains(&name.len())
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Repo-relative, `/`-separated view of `file`. Absolute paths MUST NOT reach the
+/// test-path check: a repo that lives under a `test/` directory would otherwise lose
+/// its hint on every query. When `file` is not under `repo` (should not happen), only
+/// the file name is kept so no directory segment can produce a false positive.
+fn repo_relative(file: &str, repo: &str) -> String {
+    let file = file.replace('\\', "/");
+    let repo = repo.replace('\\', "/");
+    let repo = repo.trim_end_matches('/');
+    if file.len() > repo.len()
+        && file.is_char_boundary(repo.len())
+        && file[..repo.len()].eq_ignore_ascii_case(repo)
+        && file.as_bytes()[repo.len()] == b'/'
+    {
+        return file[repo.len() + 1..].to_string();
+    }
+    file.rsplit('/').next().unwrap_or("").to_string()
+}
+
+/// The own symbol of a result, if it is worth grepping for. Dropped: modules,
+/// symbols from test files, and symbols from generated files. `impl_Foo` is
+/// rewritten to the type name `Foo`. A test block's CALLEES are kept elsewhere: they are the
+/// production API it exercises.
+fn hint_symbol(file: &str, repo: &str, symbol: Option<&str>, kind: Option<&str>) -> Option<String> {
+    let symbol = symbol?;
+    if kind.is_some_and(|k| k.eq_ignore_ascii_case("module")) {
+        return None;
+    }
+    // The Rust extractor names an impl block `impl_<Type>`: not itself grep-able,
+    // but the type it names is. Dropping it outright left impl-only result sets
+    // (e.g. a whole query answered by `impl Runner`/`impl Registry` chunks) with no
+    // hint at all. Generics are stripped; anything non-identifier (`&Foo`) is
+    // filtered later by `is_greppable_symbol`.
+    let symbol = if kind.is_some_and(|k| k.eq_ignore_ascii_case("impl")) {
+        symbol
+            .strip_prefix("impl_")
+            .and_then(|ty| ty.split('<').next())?
+    } else {
+        symbol
+    };
+    if crate::parsing::generated::is_generated_file(file)
+        || crate::parsing::test_paths::is_test_path(&repo_relative(file, repo))
+    {
+        return None;
+    }
+    Some(symbol.to_string())
+}
+
+/// A row of the `symbol` table overlapping a result block.
+#[derive(Debug, Clone)]
+struct DefinedSymbol {
+    name: String,
+    kind: Option<String>,
+    line_start: u32,
+    line_end: u32,
+}
+
+/// One block must not fill the whole hint on its own.
+const GREP_HINT_MAX_DEFINED_PER_BLOCK: usize = 3;
+
+/// Symbols that name a block which carries no `symbol_ref` of its own. Measured on
+/// real repos, MOST result chunks have none: `symbol_ref` is only set at index time
+/// when a chunk maps onto exactly one symbol, so a chunk that includes a doc comment,
+/// a `static` plus a `fn`, or the middle of a long function gets nothing — which is
+/// how `open_gate` (defined inside such a chunk) never reached the hint.
+///
+/// Symbols that START inside the block come first, in line order. Only when none
+/// does is the innermost enclosing symbol used (a slice from the middle of a long
+/// function is named by that function, not by its `impl` or module).
+fn pick_block_symbols(rows: &[DefinedSymbol], start: u32, end: u32) -> Vec<&DefinedSymbol> {
+    let overlapping = rows
+        .iter()
+        .filter(|s| s.line_start <= end && s.line_end >= start);
+    let mut inside: Vec<&DefinedSymbol> = overlapping
+        .clone()
+        .filter(|s| s.line_start >= start)
+        .collect();
+    if inside.is_empty() {
+        return overlapping
+            .min_by_key(|s| s.line_end.saturating_sub(s.line_start))
+            .into_iter()
+            .collect();
+    }
+    inside.sort_by_key(|s| s.line_start);
+    inside
+}
+
+/// Rust keeps unit tests inline in production files, so the test-path rule cannot
+/// see them. A block whose own text carries a test attribute must not contribute
+/// the test functions it defines.
+fn has_inline_test_marker(content: &str) -> bool {
+    ["#[test]", "#[tokio::test]", "#[cfg(test)]"]
+        .iter()
+        .any(|marker| content.contains(marker))
+}
+
+/// Whether the definition starting at `line_start` (1-based) carries a test
+/// attribute: tree-sitter starts a Rust item at its `fn`/`mod` keyword, so its
+/// `#[test]` / `#[cfg(test)]` sits on the few lines just above it.
+fn is_test_marked(source: &str, line_start: u32) -> bool {
+    let end = line_start as usize;
+    let begin = end.saturating_sub(3).max(1);
+    let window: Vec<&str> = source
+        .lines()
+        .skip(begin - 1)
+        .take(end.saturating_sub(begin) + 1)
+        .collect();
+    has_inline_test_marker(&window.join("\n"))
+}
+
+/// `symbol` rows overlapping `file:start-end`, from whichever repo DB owns the file.
+/// Empty on any failure: the hint is best-effort and must never fail a query.
+async fn defined_symbols_for(
+    db_map: &HashMap<String, Surreal<Db>>,
+    file: &str,
+    start: u32,
+    end: u32,
+) -> Vec<DefinedSymbol> {
+    let Some(db) = crate::query::find_db_for_file(db_map, file) else {
+        return Vec::new();
+    };
+    crate::query::graph_expand::query_overlapping_symbols(db, file, start, end)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| DefinedSymbol {
+            name: row.name,
+            kind: row.kind,
+            line_start: row.line_start.max(0) as u32,
+            line_end: row.line_end.max(0) as u32,
+        })
+        .collect()
+}
+
+/// The hint symbols one result contributes: its own symbol when it has a usable
+/// one, otherwise the symbols the block defines (see `pick_block_symbols`). An own
+/// symbol that was FILTERED (e.g. a `module`) does not fall back: the block is that
+/// module, and in Rust an inline module is almost always a test module.
+async fn block_hint_symbols(
+    db_map: &HashMap<String, Surreal<Db>>,
+    repo: &str,
+    r: &crate::query::engine::CodeResult,
+) -> Vec<String> {
+    if r.symbol.is_some() {
+        return hint_symbol(&r.file, repo, r.symbol.as_deref(), r.symbol_kind.as_deref())
+            .into_iter()
+            .collect();
+    }
+    if has_inline_test_marker(&r.content) {
+        return Vec::new();
+    }
+    let rows = defined_symbols_for(db_map, &r.file, r.line_start, r.line_end).await;
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    // Rust is the one language here that keeps unit tests INSIDE production files,
+    // so neither the path rule nor the block's own text (a reranker slice from the
+    // middle of a test body has no attribute in it) can see them. Read the source
+    // once and look above each definition instead. Other languages skip the read.
+    let source = if r.file.ends_with(".rs") {
+        std::fs::read_to_string(&r.file).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    // Strictly enclosing (starts before the block): a symbol whose range IS the
+    // block is a candidate, judged by the per-candidate check below.
+    let in_test_scope = rows.iter().any(|s| {
+        s.line_start < r.line_start
+            && s.line_end >= r.line_end
+            && is_test_marked(&source, s.line_start)
+    });
+    if in_test_scope {
+        return Vec::new();
+    }
+    pick_block_symbols(&rows, r.line_start, r.line_end)
+        .into_iter()
+        .filter(|s| !is_test_marked(&source, s.line_start))
+        .filter_map(|s| hint_symbol(&r.file, repo, Some(&s.name), s.kind.as_deref()))
+        .take(GREP_HINT_MAX_DEFINED_PER_BLOCK)
+        .collect()
+}
+
+/// Build the grep hint from the final, priority-ordered blocks, in two passes:
+/// first the symbols every block DEFINES (block order), then the callees of every
+/// block. Measured across five repos, defined symbols are on-topic while callees
+/// often drag in logging/util helpers (`maskUserID`, `CreatePendingLog`), so callees
+/// only fill what is left. They still matter: they come from the resolved call
+/// graph, so they always name real in-repo definitions, and for test blocks they
+/// are the production API under test.
+/// `None` when no usable symbol exists: no static fallback, nothing to grep for.
+fn build_grep_hint(blocks: &[OutputBlock]) -> Option<String> {
+    let mut names: Vec<&str> = Vec::new();
+    let mut pattern_len = 0usize;
+    let defined = blocks.iter().flat_map(|b| &b.symbols);
+    let callees = blocks.iter().flat_map(|b| &b.callee_names);
+    for symbol in defined.chain(callees) {
+        if names.len() >= GREP_HINT_MAX_SYMBOLS {
+            break;
+        }
+        let name = symbol.as_str();
+        if !is_greppable_symbol(name) || names.contains(&name) {
+            continue;
+        }
+        let added = name.len() + usize::from(!names.is_empty());
+        if pattern_len + added > GREP_HINT_MAX_PATTERN_CHARS {
+            break;
+        }
+        pattern_len += added;
+        names.push(name);
+    }
+    if names.is_empty() {
+        return None;
+    }
+    Some(render_grep_hint(
+        crate::prompts::MCP_GREP_HINT,
+        &names.join("|"),
+    ))
+}
+
+/// `core.autocrlf=true` checks the template out with CRLF on Windows and
+/// `include_str!` embeds those bytes, so line endings are normalized here rather
+/// than trusting the checkout.
+fn render_grep_hint(template: &str, pattern: &str) -> String {
+    let rendered = crate::prompts::render(template, &[("pattern", pattern)]);
+    format!("\n\n{}", rendered.replace("\r\n", "\n").trim_end())
+}
+
+/// Append the grep hint after the assembled output (and its truncation footer).
+fn with_grep_hint(mut assembled: String, blocks: &[OutputBlock]) -> String {
+    if let Some(hint) = build_grep_hint(blocks) {
+        assembled.push_str(&hint);
+    }
+    assembled
 }
 
 /// Assemble result blocks into a single string respecting `MAX_TOOL_OUTPUT_CHARS`.
@@ -65,8 +329,11 @@ struct OutputBlock {
 /// budget would be exceeded; from that point, all remaining blocks are shown as
 /// header + first line (capped at 120 chars) + elision marker.
 fn assemble_with_budget(blocks: &[OutputBlock]) -> String {
-    // Reserve space for the footer so it's never squeezed out.
-    const FOOTER_RESERVE: usize = 150;
+    // Reserve space for the truncation footer so it's never squeezed out, plus the
+    // grep hint that `with_grep_hint` appends after it: the hint is appended
+    // unconditionally, and dropping it only when it didn't fit would lose it
+    // exactly on the big, truncated responses where the agent most needs to search.
+    const FOOTER_RESERVE: usize = 150 + GREP_HINT_MAX_CHARS;
     let effective_budget = MAX_TOOL_OUTPUT_CHARS - FOOTER_RESERVE;
 
     let mut out = String::new();
@@ -208,6 +475,9 @@ fn merge_overlapping_blocks(blocks: Vec<OutputBlock>) -> Vec<OutputBlock> {
                         current.callees = next.callees;
                         current.callee_names = std::mem::take(&mut next.callee_names);
                     }
+                    // Carry the absorbed block's symbols so the grep hint can still
+                    // name them; the block itself is gone after this merge.
+                    current.symbols.append(&mut next.symbols);
                     originals.push(next.content);
                 } else {
                     let content_snapshot = next.content.clone();
@@ -904,10 +1174,23 @@ async fn do_query(
                     result.warming,
                 );
             }
+            // Snapshot the DB handles for the grep-hint symbol lookup. The read
+            // guard is dropped at the end of this block, BEFORE any DB await.
+            let db_map: HashMap<String, Surreal<Db>> = {
+                let guard = repo_dbs.read().await;
+                guard.clone()
+            };
+            // One indexed seek (`idx_symbol_file`) per result that lacks its own
+            // symbol — bounded by the result count, like graph expansion.
+            let mut hint_symbols: Vec<Vec<String>> = Vec::with_capacity(result.results.len());
+            for r in &result.results {
+                hint_symbols.push(block_hint_symbols(&db_map, repo, r).await);
+            }
             let blocks: Vec<OutputBlock> = result
                 .results
                 .iter()
-                .map(|r| {
+                .zip(hint_symbols)
+                .map(|(r, symbols)| {
                     let caller_tag =
                         format_enriched_caller_tag(r.callers, &r.caller_names, r.caller_files);
                     let callee_tag = format_enriched_callee_tag(r.callees, &r.callee_names);
@@ -925,6 +1208,7 @@ async fn do_query(
                         caller_names: r.caller_names.clone(),
                         callee_names: r.callee_names.clone(),
                         callees: r.callees,
+                        symbols,
                     }
                 })
                 .collect();
@@ -936,7 +1220,7 @@ async fn do_query(
                 .partition(|b| !crate::parsing::generated::is_generated_file(&b.file));
             let mut blocks = hand_written;
             blocks.extend(generated);
-            let mut assembled = assemble_with_budget(&blocks);
+            let mut assembled = with_grep_hint(assemble_with_budget(&blocks), &blocks);
             if result.scope_fallback
                 && let Some(served) = result
                     .scope

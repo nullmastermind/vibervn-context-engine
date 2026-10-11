@@ -50,6 +50,10 @@ pub const MCP_FILE_RETRIEVAL_HINT: &str = include_str!("mcp_file_retrieval_hint.
 /// Prepended to results served from the OTHER scope after the requested one came
 /// back empty (`{{requested}}`, `{{served}}`). See `query::scope_fallback`.
 pub const MCP_SCOPE_FALLBACK: &str = include_str!("mcp_scope_fallback.txt");
+/// Appended after retrieval results (`{{pattern}}` = `a|b|c` of the symbols just
+/// returned). Names both `rg` and `grep` because agents ship different literal-search
+/// tools; `a|b` is valid for `rg` and `grep -E` alike. See `mcp::build_grep_hint`.
+pub const MCP_GREP_HINT: &str = include_str!("mcp_grep_hint.txt");
 /// The `scope` tool-parameter description. Every `codebase-retrieval` surface
 /// (MCP, per-repo MCP, router proxy, chat tool) must expose this exact text;
 /// `mcp::tests` asserts they stay identical.
@@ -112,6 +116,7 @@ mod tests {
             RERANK_AGENTIC_SYSTEM,
             MCP_DEGRADE_INDEXING,
             MCP_SCOPE_FALLBACK,
+            MCP_GREP_HINT,
             MCP_SCOPE_PARAM,
             LLM_RESPOND_IN_JSON,
         ] {

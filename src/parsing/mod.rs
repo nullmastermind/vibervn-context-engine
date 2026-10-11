@@ -2,6 +2,7 @@ pub mod chunker;
 pub mod generated;
 pub mod relations;
 pub mod symbols;
+pub mod test_paths;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;

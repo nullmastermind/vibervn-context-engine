@@ -1,0 +1,3 @@
+---
+Results above are top-k, not exhaustive. To find every usage of a symbol, search the repo literally:
+rg '{{pattern}}'   (or: grep -rE '{{pattern}}')
