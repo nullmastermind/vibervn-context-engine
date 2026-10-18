@@ -1,13 +1,14 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use notify::{RecommendedWatcher, RecursiveMode};
-use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
+use notify_debouncer_full::{DebounceEventResult, Debouncer, NoCache, new_debouncer_opt};
 use tokio::sync::mpsc::Sender;
 use tracing::{error, info, warn};
 
 use crate::indexing::IndexTrigger;
 use crate::indexing::tracker::{ChangeKind, FileChange};
+use crate::indexing::walker::{ChangeFilter, SKIP_DIRS};
 
 /// How often a live watcher also enqueues a full (walk + stat) scan. notify 8.2
 /// on Windows never reports a ReadDirectoryChangesW buffer overflow: a zero-byte
@@ -59,11 +60,60 @@ impl RescanGate {
     }
 }
 
+/// False when `path` sits where `walk_repo` never indexes anything: under (or
+/// itself being) a dot-dir, a `SKIP_DIRS` tree, or a gitignored directory.
+///
+/// WHY in the watcher and not only in the pipeline: on a pnpm/rush monorepo
+/// (hcengineering/platform, ~7k indexed files) `node_modules` and build-output
+/// churn dwarfs real edits. Each such batch used to become a trigger carrying
+/// every path, queued behind runs that open the DB, stat every path, filter
+/// everything out, then still refresh the O(repo) sidecars.
+///
+/// Conservative: per-repo ignored paths, configured ignore filenames and custom
+/// extensions are not known here and stay the pipeline's job; this drops only
+/// what every rule set excludes. A stale entry under an excluded directory (left
+/// by an older, unfiltered watcher) is still reconciled by the safety-net scan.
+fn may_affect_index(filter: &ChangeFilter, root: &Path, path: &Path) -> bool {
+    let strictly_inside = path
+        .strip_prefix(root)
+        .is_ok_and(|rel| !rel.as_os_str().is_empty());
+    if !strictly_inside {
+        return true;
+    }
+    if path
+        .parent()
+        .is_some_and(|parent| !filter.could_contain_indexed(parent))
+    {
+        return false;
+    }
+    // No SKIP_DIRS name is an indexable file name (none has an extension), so the
+    // event is for that directory itself, whether it still exists or not.
+    if path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| SKIP_DIRS.contains(&n))
+    {
+        return false;
+    }
+    // Windows reports a Modify on a directory whenever a direct child changes, so
+    // `.git` or a gitignored `lib/` would otherwise trigger on every write in it.
+    !(path.is_dir() && !filter.could_contain_indexed(path))
+}
+
 /// Turn one debouncer callback into a trigger. Nothing is ever dropped silently:
 /// a watcher error, or a full trigger channel, becomes a coalesced full rescan.
+/// Changes that cannot affect the index are dropped (see [`may_affect_index`]).
 fn dispatch(result: DebounceEventResult, gate: &RescanGate) {
     let changes = match result {
-        Ok(events) => convert_events(events),
+        Ok(events) => {
+            let root = Path::new(&gate.repo);
+            // Built per batch, like the pipeline's: an edited ignore file applies
+            // to the next batch with no invalidation.
+            let filter = ChangeFilter::new(root);
+            let mut changes = convert_events(events);
+            changes.retain(|c| may_affect_index(&filter, root, Path::new(&c.path)));
+            changes
+        }
         Err(errors) => {
             for e in errors {
                 warn!(repo = %gate.repo, error = %e, "watcher error");
@@ -99,16 +149,31 @@ pub async fn start_watcher(repo_path: String, tx: Sender<IndexTrigger>) {
         tokio::runtime::Handle::current(),
     );
 
-    // `RecommendedCache` is a platform-conditional alias: `FileIdMap` on
-    // macOS/Windows, `NoCache` on Linux. Annotating it (rather than `FileIdMap`)
-    // is what `new_debouncer` actually returns, so this compiles on every target.
-    let watcher_result: anyhow::Result<Debouncer<RecommendedWatcher, RecommendedCache>> =
+    // `NoCache`, not `RecommendedCache` (`FileIdMap` on Windows/macOS). On
+    // `watch()` that cache walks the WHOLE root — `node_modules`, `.git`, build
+    // output — with `follow_links(true)`, and keeps one `PathBuf` → file-id entry
+    // per path for the watcher's lifetime. pnpm/rush link every dependency as a
+    // junction/symlink, so the walk re-enters shared packages once per link
+    // (40k files behind 8 links each: 133 MB and 18 s in `watch()`; reported
+    // 15 GB on a repo with ~7k indexed files). Every Remove event then runs a
+    // `retain` over that whole map under the debouncer lock, so an install or
+    // `rm -rf node_modules` stalls event intake for deletes × cached paths. The
+    // cache only stitches rename halves into `RenameMode::Both`, which
+    // `convert_events` splits back into Deleted + Added anyway; Linux has always
+    // run with `NoCache`.
+    //
+    // `follow_symlinks(false)`: the indexer's walk never follows links, so
+    // nothing behind one can be indexed. inotify/kqueue would otherwise add a
+    // watch (and a map entry) per directory reached through every link.
+    let watcher_result: anyhow::Result<Debouncer<RecommendedWatcher, NoCache>> =
         (|| -> anyhow::Result<_> {
             let gate_inner = gate.clone();
-            let debouncer = new_debouncer(
+            let debouncer = new_debouncer_opt(
                 debounce_duration,
                 None,
                 move |result: DebounceEventResult| dispatch(result, &gate_inner),
+                NoCache::new(),
+                notify::Config::default().with_follow_symlinks(false),
             )?;
             Ok(debouncer)
         })();
@@ -300,6 +365,96 @@ mod tests {
             second.changes.is_none(),
             "the dropped batch became a full rescan"
         );
+    }
+
+    /// 15 GB on a ~7k-file repo (hcengineering/platform): every `node_modules` /
+    /// build-output event reached the trigger channel and ran the pipeline, only
+    /// to be filtered there. A change in a place that can never hold indexed
+    /// files is dropped in the watcher; a batch made only of those sends nothing.
+    #[tokio::test]
+    async fn dispatch_drops_changes_that_cannot_affect_the_index() {
+        use notify::event::{CreateKind, RemoveKind};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(".gitignore"), "lib/\n").unwrap();
+        for d in ["src", "app/lib", "node_modules/a", ".git"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let p = |rel: &str| root.join(rel).to_str().unwrap().to_string();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let gate = RescanGate::new(
+            root.to_str().unwrap().to_string(),
+            tx,
+            tokio::runtime::Handle::current(),
+        );
+        let create = EventKind::Create(CreateKind::Any);
+        let modify = EventKind::Modify(ModifyKind::Any);
+        let remove = EventKind::Remove(RemoveKind::Any);
+
+        dispatch(
+            Ok(vec![
+                ev(create, &[&p("node_modules/a/index.js")]),
+                ev(modify, &[&p("node_modules/a")]),
+                // Windows reports a Modify on a directory whenever a direct child
+                // changes: `npm install` / any git command touch these constantly.
+                ev(modify, &[&p("node_modules")]),
+                ev(modify, &[&p(".git")]),
+                ev(create, &[&p(".git/index.lock")]),
+                ev(create, &[&p("pkg/node_modules/b.ts")]),
+                ev(
+                    create,
+                    &[&p("common/temp/node_modules/.pnpm/x@1/node_modules/x/y.ts")],
+                ),
+                ev(modify, &[&p("app/lib")]),
+                ev(create, &[&p("app/lib/out.ts")]),
+                // `rm -rf node_modules`: the directory is gone, its name says enough.
+                ev(remove, &[&p("dist")]),
+            ]),
+            &gate,
+        );
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "a batch of ignored-only changes must not trigger an index run"
+        );
+
+        dispatch(
+            Ok(vec![
+                ev(modify, &[&p("src/a.ts")]),
+                ev(create, &[&p("node_modules/c.js")]),
+                ev(modify, &[&p("app/.gitignore")]),
+                ev(modify, &[&p(".gitignore")]),
+                // Deleted paths are kept: they may be indexed directories.
+                ev(remove, &[&p("src/old")]),
+                ev(
+                    EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+                    &[&p("src/b.ts"), &p("node_modules/b.ts")],
+                ),
+            ]),
+            &gate,
+        );
+        let mut got: Vec<(String, String)> = recv_soon(&mut rx)
+            .await
+            .changes
+            .expect("explicit change set")
+            .into_iter()
+            .map(|c| (c.path, format!("{:?}", c.kind)))
+            .collect();
+        got.sort();
+        let mut want: Vec<(String, String)> = [
+            (p("src/a.ts"), ChangeKind::Modified),
+            (p("app/.gitignore"), ChangeKind::Modified),
+            (p(".gitignore"), ChangeKind::Modified),
+            (p("src/old"), ChangeKind::Deleted),
+            (p("src/b.ts"), ChangeKind::Deleted),
+        ]
+        .into_iter()
+        .map(|(path, kind)| (path, format!("{kind:?}")))
+        .collect();
+        want.sort();
+        assert_eq!(got, want);
     }
 
     /// S4/D12: a watcher error is a full rescan, not just a log line.
