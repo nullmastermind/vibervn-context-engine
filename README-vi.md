@@ -2,7 +2,19 @@
 
 [English](README.md) · **Tiếng Việt** · [中文](README-zh.md)
 
+![Trạng thái: Ổn định](https://img.shields.io/badge/status-stable-blue)
+
 ![Web UI](screenshot-vi.png)
+
+## Trạng thái dự án
+
+> [!IMPORTANT]
+> **Dự án đã ổn định.** Nó đã đạt đủ bộ tính năng mà nó được xây dựng để
+> làm, nên từ giờ các bản release sẽ **thưa dần**. Đây là chủ đích, không
+> phải dấu hiệu bỏ rơi: engine chuyển sang maintenance mode — bug fix và
+> bản vá bảo mật vẫn được phát hành đều đặn, còn tính năng mới chỉ thêm
+> vào khi thực sự cần thiết. Lịch release yên tĩnh nghĩa là tool đang làm
+> tốt việc của nó, chứ không phải dự án bị drop.
 
 ## Cài đặt & Chạy
 

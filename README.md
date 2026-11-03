@@ -2,7 +2,19 @@
 
 **English** · [Tiếng Việt](README-vi.md) · [中文](README-zh.md)
 
+![Status: Stable](https://img.shields.io/badge/status-stable-blue)
+
 ![Web UI](screenshot.png)
+
+## Project Status
+
+> [!IMPORTANT]
+> **This project is stable.** It has reached the feature set it was built
+> for, so new releases will become **less frequent** from here on. This is
+> intentional, not abandonment: the engine is in maintenance mode — bug
+> fixes and security patches will still ship, while new features land only
+> occasionally. A quiet release calendar means the tool is doing its job,
+> not that the project has been dropped.
 
 ## Install & Run
 

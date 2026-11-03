@@ -2,7 +2,17 @@
 
 [English](README.md) · [Tiếng Việt](README-vi.md) · **中文**
 
+![状态：稳定](https://img.shields.io/badge/status-stable-blue)
+
 ![Web UI](screenshot-zh.png)
+
+## 项目状态
+
+> [!IMPORTANT]
+> **本项目已趋于稳定。** 它已经实现了设计目标中的全部功能，因此从现在起新
+> 版本的发布频率会**逐渐降低**。这是有意为之，并非弃坑：引擎进入维护模式
+> —— bug 修复和安全补丁仍会照常发布，新功能只会在确有必要时才添加。发布
+> 日历安静下来，说明这个工具正在稳定地发挥它的作用，而不是项目被放弃。
 
 ## 安装与运行
 
